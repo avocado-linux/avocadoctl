@@ -288,7 +288,101 @@ fn check_backing_file_changed(loop_dev: &Path, expected_path: &Path) -> bool {
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(&backing_file));
 
-    expected != current
+    if expected != current {
+        return true;
+    }
+
+    // Same path is not the same image. Replacing an extension in place - a
+    // plain `>` redirect, scp, or anything that truncates and rewrites - keeps
+    // both the path and the inode, so the comparison above sees no change while
+    // the loop still exposes the image it was attached to. That is how an
+    // extension update comes out reporting success and serving the previous
+    // contents.
+    //
+    // The loop's size is fixed when it is attached, so comparing it against the
+    // file on disk catches a replacement of a different size without needing to
+    // hash anything. A same-size replacement still slips through; detecting
+    // that needs a fingerprint recorded at mount time, which is worth doing
+    // separately rather than folding into this predicate.
+    //
+    // Unreadable sysfs or metadata reports unchanged, matching how every other
+    // failure in this function behaves - the size check only ever adds
+    // detections, it never removes one.
+    let sysfs_size = format!("/sys/block/{dev_name}/size");
+    let loop_sectors = match fs::read_to_string(&sysfs_size) {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+
+    let file_bytes = match fs::metadata(expected_path) {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+
+    !loop_size_matches(loop_sectors, file_bytes)
+}
+
+/// Whether a loop device of `loop_sectors` is backed by a file of `file_bytes`.
+///
+/// `/sys/block/<dev>/size` counts 512-byte sectors regardless of the device's
+/// logical block size. Split out from `check_backing_file_changed` so the
+/// arithmetic is testable without a loop device: everything around it is gated
+/// behind `is_test_mode()` and cannot run under `cargo test`.
+fn loop_size_matches(loop_sectors: u64, file_bytes: u64) -> bool {
+    loop_sectors.saturating_mul(512) == file_bytes
+}
+
+/// Detach the persistent loop behind `mount_name`, if one is still attached.
+///
+/// `systemd-dissect -U` unmounts the mount point but deliberately leaves a
+/// `--loop-ref` loop attached - that is what makes it persistent. Every caller
+/// of `unmount` wants the extension gone, either to tear it down outright or to
+/// replace it with a remount, so a loop that outlives the unmount is never what
+/// was asked for: it keeps the old image open, and `/dev/disk/by-loop-ref/<name>`
+/// keeps pointing at it, so the next mount is skipped as already-mounted.
+///
+/// Absent loop-ref is success, not failure - it means nothing is attached.
+fn detach_loop_ref(mount_name: &str, verbose: bool) -> Result<(), SystemdError> {
+    if is_test_mode() {
+        return Ok(());
+    }
+
+    let loop_ref = PathBuf::from(format!("/dev/disk/by-loop-ref/{mount_name}"));
+
+    // canonicalize resolves the ../../loopN symlink and tells us in one step
+    // whether anything is still there.
+    let dev = match fs::canonicalize(&loop_ref) {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+
+    let output = ProcessCommand::new("losetup")
+        .args(["-d", dev.to_str().unwrap_or("")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| SystemdError::CommandFailed {
+            command: "losetup -d".to_string(),
+            source: e,
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SystemdError::CommandExitedWithError {
+            command: "losetup -d".to_string(),
+            exit_code: output.status.code(),
+            stderr: stderr.to_string(),
+        });
+    }
+
+    if verbose {
+        println!("Detached {} for {mount_name}", dev.display());
+    }
+
+    Ok(())
 }
 
 /// Check if a mount point is currently active by scanning /proc/mounts.
@@ -542,13 +636,27 @@ impl ImageAdaptor for RawAdaptor {
     }
 
     fn is_mounted(&self, mount_name: &str) -> bool {
+        // The loop-ref symlink alone is not enough. systemd-dissect -U unmounts
+        // the mount point but leaves a --loop-ref loop attached, which is what
+        // "persistent" means, so the symlink outlives the mount. Reporting
+        // mounted on the strength of the symlink makes the caller skip the
+        // remount and present an extension whose contents are not there:
+        // observed as docker.service vanishing after an unmerge/merge cycle
+        // while `avocadoctl ext status` still said merged.
+        //
+        // KabAdaptor already pairs its loop check with is_mount_active for the
+        // same reason.
         let loop_ref_path = format!("/dev/disk/by-loop-ref/{mount_name}");
-        Path::new(&loop_ref_path).exists()
+        Path::new(&loop_ref_path).exists() && is_mount_active(&extension_mount_point(mount_name))
     }
 
     fn unmount(&self, mount_name: &str, verbose: bool) -> Result<(), SystemdError> {
         let mount_point = extension_mount_point(mount_name);
         unmount_with_dissect(&mount_point, verbose)?;
+
+        // -U leaves the persistent loop attached; drop it too, or the next
+        // mount sees a live loop-ref and skips itself.
+        detach_loop_ref(mount_name, verbose)?;
 
         if verbose {
             println!("Unmounted loop for {mount_name}");
@@ -979,6 +1087,34 @@ pub fn unmount_all_persistent_mounts() -> Result<(), SystemdError> {
 mod tests {
     use super::*;
     use crate::commands::test_env::ENV_VAR_MUTEX;
+
+    #[test]
+    fn loop_size_matches_an_exactly_sized_image() {
+        // 121126912 bytes is the docker extension that exposed this: an
+        // in-place replacement kept the path, so only the size distinguished
+        // the new image from the loop's.
+        assert!(loop_size_matches(236576, 121126912));
+    }
+
+    #[test]
+    fn loop_size_detects_an_image_replaced_with_a_different_size() {
+        // The replacement was 121131008 bytes against a loop still sized for
+        // the previous 121126912. Before this check the two were
+        // indistinguishable and the stale image stayed merged.
+        assert!(!loop_size_matches(236576, 121131008));
+    }
+
+    #[test]
+    fn loop_size_treats_a_smaller_replacement_as_changed() {
+        assert!(!loop_size_matches(236576, 4096));
+    }
+
+    #[test]
+    fn loop_size_does_not_panic_on_an_absurd_sector_count() {
+        // saturating_mul rather than *: a garbage or truncated sysfs read must
+        // report "changed" instead of overflowing in release builds.
+        assert!(!loop_size_matches(u64::MAX, 121126912));
+    }
 
     #[test]
     fn test_image_type_from_manifest() {
