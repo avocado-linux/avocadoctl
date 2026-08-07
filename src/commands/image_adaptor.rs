@@ -335,6 +335,43 @@ fn loop_size_matches(loop_sectors: u64, file_bytes: u64) -> bool {
     loop_sectors.saturating_mul(512) == file_bytes
 }
 
+/// What mounting an extension should do, given what is already attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MountPlan {
+    /// Nothing is attached. Mount the file; systemd-dissect attaches a loop.
+    Fresh,
+    /// A loop is attached and still exposes this exact image. Mount that device
+    /// rather than the file, so no second loop is attached for the same content.
+    Reuse,
+    /// A loop is attached but exposes different content. Tear it down, then
+    /// mount the file.
+    Replace,
+}
+
+/// Decide how to mount, from the two facts the caller can observe.
+///
+/// This exists as a pure function because the rest of the mount path cannot be
+/// exercised under `cargo test` - `is_test_mode()` short-circuits the very
+/// `systemd-dissect` and `losetup` calls the behaviour depends on. That gap is
+/// how the previous version of this fix reached hardware with a wrong premise:
+/// 276 green tests said nothing about whether it worked.
+///
+/// `ReuseLoop` is the case that matters. `systemd-dissect -U` leaves the loop
+/// attached by design, and on an unmerge/merge cycle the kernel does not
+/// release it even after an explicit `losetup -d` - measured on an i.MX93
+/// board, where no open fd, no mount in any namespace, no overlay lowerdir and
+/// no block holder referenced the loop, and a cache drop did not free it.
+/// Mounting the file again therefore attaches a SECOND loop for identical
+/// content and strands the first: two per cycle, on a device that merges
+/// extensions on every update.
+pub(crate) fn plan_mount(loop_ref_present: bool, backing_changed: bool) -> MountPlan {
+    match (loop_ref_present, backing_changed) {
+        (false, _) => MountPlan::Fresh,
+        (true, false) => MountPlan::Reuse,
+        (true, true) => MountPlan::Replace,
+    }
+}
+
 /// Detach the persistent loop behind `mount_name`, if one is still attached.
 ///
 /// `systemd-dissect -U` unmounts the mount point but deliberately leaves a
@@ -631,7 +668,36 @@ impl ImageAdaptor for RawAdaptor {
             return Ok(PathBuf::from(mount_point));
         }
 
-        mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
+        let loop_ref = PathBuf::from(format!("/dev/disk/by-loop-ref/{mount_name}"));
+        let present = loop_ref.exists();
+        let plan = plan_mount(
+            present,
+            present && check_backing_file_changed(&loop_ref, raw_path),
+        );
+
+        match plan {
+            // Mount the loop we already have. Mounting the file instead would
+            // attach a second loop for the same image and leak the first, since
+            // the unmount left it attached and the kernel will not release it.
+            MountPlan::Reuse => {
+                if verbose {
+                    println!("Reusing attached loop for {mount_name}");
+                }
+                mount_with_dissect(mount_name, &loop_ref, &mount_point, false, verbose)?;
+            }
+            // The image behind the loop is not the one we were asked to mount,
+            // so the loop is worthless: drop it and attach a fresh one. A loop
+            // may survive this - the detach is best-effort - but only an actual
+            // image change pays that cost, not every merge.
+            MountPlan::Replace => {
+                self.unmount(mount_name, verbose)?;
+                mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
+            }
+            MountPlan::Fresh => {
+                mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
+            }
+        }
+
         Ok(PathBuf::from(mount_point))
     }
 
@@ -1107,6 +1173,37 @@ mod tests {
     #[test]
     fn loop_size_treats_a_smaller_replacement_as_changed() {
         assert!(!loop_size_matches(236576, 4096));
+    }
+
+    /// An unmerge/merge cycle on an unchanged image must not attach a loop.
+    ///
+    /// This is the whole point of the change. `unmerge --unmount` leaves the
+    /// loop attached - measured, and not fixable from here - so the merge that
+    /// follows sees `loop_ref_present` with unchanged backing. Planning a fresh
+    /// loop there is what stranded two loops per cycle on hardware.
+    #[test]
+    fn an_unchanged_image_behind_an_attached_loop_reuses_it() {
+        assert_eq!(plan_mount(true, false), MountPlan::Reuse);
+    }
+
+    /// A genuinely replaced image cannot reuse the loop: it exposes the old
+    /// content, which is the staleness this whole area exists to prevent.
+    #[test]
+    fn a_replaced_image_behind_an_attached_loop_replaces_it() {
+        assert_eq!(plan_mount(true, true), MountPlan::Replace);
+    }
+
+    /// First mount after a boot, and the only case that legitimately attaches.
+    #[test]
+    fn nothing_attached_mounts_the_file() {
+        assert_eq!(plan_mount(false, false), MountPlan::Fresh);
+    }
+
+    /// With no loop attached there is nothing to compare against, so a stale
+    /// "changed" reading must not divert into a teardown of something absent.
+    #[test]
+    fn nothing_attached_mounts_the_file_even_if_change_is_reported() {
+        assert_eq!(plan_mount(false, true), MountPlan::Fresh);
     }
 
     #[test]
