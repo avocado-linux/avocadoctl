@@ -492,20 +492,42 @@ fn verify_installed_hash(
 }
 
 /// Atomically switch the active symlink to point to the given runtime.
+///
+/// The link is staged under a temporary name and `rename`d into place. Removing
+/// the old link first would leave a window where `active` does not exist, and a
+/// crash inside that window is unrecoverable in the field: the boot path merges
+/// no extensions without it, and sshd is itself an extension.
 pub fn activate_runtime(runtime_id: &str, base_dir: &Path) -> Result<(), StagingError> {
     let runtime_dir = base_dir.join("runtimes").join(runtime_id);
     if !runtime_dir.exists() {
         return Err(StagingError::RuntimeNotFound(runtime_id.to_string()));
     }
 
-    let active_link = base_dir.join(ACTIVE_LINK_NAME);
-    let active_target = format!("runtimes/{runtime_id}");
-
-    let _ = fs::remove_file(&active_link);
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&active_target, &active_link).map_err(|e| {
-        StagingError::StagingFailed(format!("Failed to switch active runtime: {e}"))
-    })?;
+    {
+        let active_link = base_dir.join(ACTIVE_LINK_NAME);
+        let active_target = format!("runtimes/{runtime_id}");
+        let staged_link = base_dir.join(format!(".{ACTIVE_LINK_NAME}.new"));
+
+        // A staged link left by an interrupted activation is stale by
+        // definition — its target is whatever that attempt wanted, not ours.
+        let _ = fs::remove_file(&staged_link);
+
+        std::os::unix::fs::symlink(&active_target, &staged_link).map_err(|e| {
+            StagingError::StagingFailed(format!("Failed to stage active runtime link: {e}"))
+        })?;
+
+        fs::rename(&staged_link, &active_link).map_err(|e| {
+            let _ = fs::remove_file(&staged_link);
+            StagingError::StagingFailed(format!("Failed to switch active runtime: {e}"))
+        })?;
+
+        // The rename is only crash-safe once the directory entry is durable.
+        // Best-effort: a failing fsync does not invalidate the swap itself.
+        if let Ok(dir) = fs::File::open(base_dir) {
+            let _ = dir.sync_all();
+        }
+    }
 
     Ok(())
 }
@@ -637,6 +659,73 @@ mod tests {
 
         let target = fs::read_link(tmp.path().join("active")).unwrap();
         assert_eq!(target.to_str().unwrap(), "runtimes/uuid-2");
+    }
+
+    /// `active` must never be observable as missing. Rename-into-place
+    /// guarantees that; unlink-then-symlink leaves a window a concurrent reader
+    /// — or a crash — can land in, and a boot that lands in it merges nothing.
+    #[test]
+    fn test_activate_runtime_active_never_observed_missing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        for id in ["uuid-1", "uuid-2"] {
+            fs::create_dir_all(tmp.path().join("runtimes").join(id)).unwrap();
+        }
+        activate_runtime("uuid-1", tmp.path()).unwrap();
+
+        let active = tmp.path().join("active");
+        let stop = Arc::new(AtomicBool::new(false));
+        let missing = Arc::new(AtomicBool::new(false));
+
+        let reader = {
+            let (active, stop, missing) = (active.clone(), stop.clone(), missing.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if fs::read_link(&active).is_err() {
+                        missing.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        for i in 0..2000 {
+            activate_runtime(if i % 2 == 0 { "uuid-2" } else { "uuid-1" }, tmp.path()).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert!(
+            !missing.load(Ordering::Relaxed),
+            "`active` was observed missing mid-activation"
+        );
+        assert!(!tmp.path().join(".active.new").exists());
+    }
+
+    /// A staged link left by an interrupted activation must not divert the next
+    /// one to the abandoned target.
+    #[test]
+    fn test_activate_runtime_discards_stale_staged_link() {
+        let tmp = TempDir::new().unwrap();
+        for id in ["uuid-1", "uuid-2"] {
+            fs::create_dir_all(tmp.path().join("runtimes").join(id)).unwrap();
+        }
+        activate_runtime("uuid-1", tmp.path()).unwrap();
+
+        // Simulate a crash between staging the link and renaming it.
+        unix_fs::symlink("runtimes/uuid-2", tmp.path().join(".active.new")).unwrap();
+
+        activate_runtime("uuid-1", tmp.path()).unwrap();
+
+        assert_eq!(
+            fs::read_link(tmp.path().join("active"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "runtimes/uuid-1"
+        );
+        assert!(!tmp.path().join(".active.new").exists());
     }
 
     #[test]
