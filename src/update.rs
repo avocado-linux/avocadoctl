@@ -122,7 +122,7 @@ pub fn perform_update(
         targets.signed.version, inline_count
     );
     if verbose {
-        for (name, _) in targets.signed.targets.iter() {
+        for name in targets.signed.targets.keys() {
             println!("    inline target: {}", name.raw());
         }
     }
@@ -162,7 +162,7 @@ pub fn perform_update(
                 delegation.signed.targets.len()
             );
             if verbose {
-                for (name, _) in delegation.signed.targets.iter() {
+                for name in delegation.signed.targets.keys() {
                     println!("    delegated target: {}", name.raw());
                 }
             }
