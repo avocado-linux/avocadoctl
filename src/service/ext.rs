@@ -170,12 +170,7 @@ pub fn enable_extensions(
     let extensions_dir = config.get_extensions_dir();
 
     // Determine os-releases directory
-    let os_releases_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        let temp_base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{temp_base}/avocado/os-releases/{version_id}")
-    } else {
-        format!("/var/lib/avocado/os-releases/{version_id}")
-    };
+    let os_releases_dir = config.get_os_releases_dir(&version_id);
 
     // Create directory
     fs::create_dir_all(&os_releases_dir).map_err(|e| AvocadoError::ConfigurationError {
@@ -247,18 +242,14 @@ pub fn disable_extensions(
     os_release_version: Option<&str>,
     extensions: Option<&[&str]>,
     all: bool,
+    config: &Config,
 ) -> Result<DisableResult, AvocadoError> {
     let version_id = match os_release_version {
         Some(v) => v.to_string(),
         None => ext::read_os_version_id(),
     };
 
-    let os_releases_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        let temp_base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{temp_base}/avocado/os-releases/{version_id}")
-    } else {
-        format!("/var/lib/avocado/os-releases/{version_id}")
-    };
+    let os_releases_dir = config.get_os_releases_dir(&version_id);
 
     if !Path::new(&os_releases_dir).exists() {
         return Err(AvocadoError::ConfigurationError {
@@ -355,8 +346,9 @@ pub fn status_extensions(
 pub fn set_extensions_enabled(
     names: &[&str],
     enabled: bool,
+    config: &Config,
 ) -> Result<SetEnabledResult, AvocadoError> {
-    let base_dir = crate::manifest::RuntimeManifest::base_dir();
+    let base_dir = config.get_avocado_base_dir();
     let base_path = std::path::Path::new(&base_dir);
     let manifest = crate::manifest::RuntimeManifest::load_active(base_path).ok_or_else(|| {
         AvocadoError::ConfigurationError {

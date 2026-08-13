@@ -176,6 +176,24 @@ impl Config {
         })
     }
 
+    /// Per-OS-version directory holding the enable/disable symlinks for
+    /// `version_id`.
+    ///
+    /// Derived from [`Self::get_avocado_base_dir`] so relocating the base
+    /// directory moves enablement state with it. Five call sites used to
+    /// inline `/var/lib/avocado/os-releases/{version_id}` with a private
+    /// `AVOCADO_TEST_MODE` branch, which meant configuring the base
+    /// directory silently failed to move this one — the merge path read
+    /// enablement from a directory nothing else agreed on. The test-mode
+    /// redirect is preserved here so it stays in one place.
+    pub fn get_os_releases_dir(&self, version_id: &str) -> String {
+        if std::env::var("AVOCADO_TEST_MODE").is_ok() {
+            let temp_base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+            return format!("{temp_base}/avocado/os-releases/{version_id}");
+        }
+        format!("{}/os-releases/{version_id}", self.get_avocado_base_dir())
+    }
+
     /// Get the spot check size in bytes for integrity hashing during merge.
     pub fn get_spot_check_bytes(&self) -> u64 {
         self.avocado.ext.spot_check_bytes
@@ -733,5 +751,92 @@ dir = "/override/test/path"
         // Test with default path (should return default config since default doesn't exist)
         let default_config = Config::load_with_override(None).unwrap();
         assert_eq!(default_config.avocado.ext.dir, "/var/lib/avocado/images");
+    }
+
+    /// The point of the change: setting the base directory in the config
+    /// file must actually move enablement state. Before, five call sites
+    /// inlined `/var/lib/avocado/os-releases/…` and this was silently a
+    /// no-op.
+    #[test]
+    fn os_releases_dir_follows_the_configured_base_dir() {
+        let _guard = ENV_VAR_MUTEX.lock().unwrap();
+        let restore = ScopedEnv::clear(&["AVOCADO_TEST_MODE", "AVOCADO_BASE_DIR"]);
+
+        let mut config = Config::default();
+        config.avocado.runtimes_dir = Some("/mnt/state/avocado".to_string());
+        assert_eq!(
+            config.get_os_releases_dir("2026.1"),
+            "/mnt/state/avocado/os-releases/2026.1"
+        );
+
+        // Unconfigured still lands on the shipped default.
+        assert_eq!(
+            Config::default().get_os_releases_dir("2026.1"),
+            "/var/lib/avocado/os-releases/2026.1"
+        );
+        drop(restore);
+    }
+
+    #[test]
+    fn os_releases_dir_honours_the_base_dir_env_override() {
+        let _guard = ENV_VAR_MUTEX.lock().unwrap();
+        let restore = ScopedEnv::clear(&["AVOCADO_TEST_MODE"]);
+        std::env::set_var("AVOCADO_BASE_DIR", "/env/base");
+
+        let mut config = Config::default();
+        config.avocado.runtimes_dir = Some("/config/base".to_string());
+        // Env wins over config, matching get_avocado_base_dir.
+        assert_eq!(config.get_os_releases_dir("v1"), "/env/base/os-releases/v1");
+
+        std::env::remove_var("AVOCADO_BASE_DIR");
+        drop(restore);
+    }
+
+    /// Test mode redirects to TMPDIR regardless of config, and now does so
+    /// from a single place rather than five copies that could drift.
+    #[test]
+    fn test_mode_redirects_os_releases_to_tmpdir() {
+        let _guard = ENV_VAR_MUTEX.lock().unwrap();
+        let restore = ScopedEnv::clear(&[]);
+        std::env::set_var("AVOCADO_TEST_MODE", "1");
+        std::env::set_var("TMPDIR", "/scratch");
+
+        let mut config = Config::default();
+        config.avocado.runtimes_dir = Some("/mnt/state/avocado".to_string());
+        assert_eq!(
+            config.get_os_releases_dir("v1"),
+            "/scratch/avocado/os-releases/v1"
+        );
+
+        std::env::remove_var("AVOCADO_TEST_MODE");
+        drop(restore);
+    }
+
+    /// Saves and restores env vars around a test so the shared process
+    /// environment doesn't leak between them.
+    struct ScopedEnv(Vec<(String, Option<String>)>);
+
+    impl ScopedEnv {
+        fn clear(names: &[&str]) -> Self {
+            let saved: Vec<_> = ["AVOCADO_TEST_MODE", "AVOCADO_BASE_DIR", "TMPDIR"]
+                .iter()
+                .map(|n| (n.to_string(), std::env::var(n).ok()))
+                .collect();
+            for n in names {
+                std::env::remove_var(n);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 }
