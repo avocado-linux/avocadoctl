@@ -149,14 +149,14 @@ pub fn handle_command(matches: &ArgMatches, config: &Config, output: &OutputMana
                 .get_many::<String>("names")
                 .map(|vs| vs.cloned().collect())
                 .unwrap_or_default();
-            set_extensions_enabled(&names, true, output);
+            set_extensions_enabled(&names, true, config, output);
         }
         Some(("disable", sub)) => {
             let names: Vec<String> = sub
                 .get_many::<String>("names")
                 .map(|vs| vs.cloned().collect())
                 .unwrap_or_default();
-            set_extensions_enabled(&names, false, output);
+            set_extensions_enabled(&names, false, config, output);
         }
         _ => {
             println!("Use 'avocadoctl ext --help' for available extension commands");
@@ -168,9 +168,14 @@ pub fn handle_command(matches: &ArgMatches, config: &Config, output: &OutputMana
 /// formats success / failure for the terminal. Used only by the
 /// `AVOCADO_TEST_MODE` direct dispatch path — the production path goes
 /// through varlink so the daemon owns serialization across callers.
-pub fn set_extensions_enabled(names: &[String], enabled: bool, output: &OutputManager) {
+pub fn set_extensions_enabled(
+    names: &[String],
+    enabled: bool,
+    config: &Config,
+    output: &OutputManager,
+) {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    match crate::service::ext::set_extensions_enabled(&refs, enabled) {
+    match crate::service::ext::set_extensions_enabled(&refs, enabled, config) {
         Ok(result) => {
             let verb = if enabled { "enabled" } else { "disabled" };
             output.success(
@@ -195,16 +200,17 @@ pub fn set_extensions_enabled(names: &[String], enabled: bool, output: &OutputMa
 }
 
 /// List all extensions from disk images, annotating which are currently mounted/active.
-fn list_extensions(_config: &Config, output: &OutputManager) {
+fn list_extensions(config: &Config, output: &OutputManager) {
     output.info("Extension List", "Listing available extensions");
 
-    let available = match scan_extensions_from_all_sources_with_verbosity(output.is_verbose()) {
-        Ok(exts) => exts,
-        Err(e) => {
-            eprintln!("Error scanning extensions: {e}");
-            std::process::exit(1);
-        }
-    };
+    let available =
+        match scan_extensions_from_all_sources_with_verbosity(config, output.is_verbose()) {
+            Ok(exts) => exts,
+            Err(e) => {
+                eprintln!("Error scanning extensions: {e}");
+                std::process::exit(1);
+            }
+        };
 
     if available.is_empty() {
         println!("No extensions found.");
@@ -302,7 +308,7 @@ fn list_extensions(_config: &Config, output: &OutputManager) {
     // are effectively disabled. Surfaced separately so the user can see
     // them and know they exist to enable, rather than having them
     // silently vanish from `ext list`.
-    let base_dir = crate::manifest::RuntimeManifest::base_dir();
+    let base_dir = config.get_avocado_base_dir();
     let base_path = Path::new(&base_dir);
     if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
         let active_dir = base_path.join(crate::manifest::ACTIVE_LINK_NAME);
@@ -553,7 +559,7 @@ pub(crate) fn merge_extensions_internal(
     );
 
     // Prepare the environment by setting up symlinks and get the list of enabled extensions
-    let enabled_extensions = prepare_extension_environment_with_output(output)?;
+    let enabled_extensions = prepare_extension_environment_with_output(config, output)?;
 
     // Get the mutability settings from config (separate for sysext and confext)
     let sysext_mutability = match config.get_sysext_mutable() {
@@ -740,12 +746,7 @@ pub fn enable_extensions(
     let extensions_dir = config.get_extensions_dir();
 
     // Determine os-releases directory based on test mode
-    let os_releases_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        let temp_base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{temp_base}/avocado/os-releases/{version_id}")
-    } else {
-        format!("/var/lib/avocado/os-releases/{version_id}")
-    };
+    let os_releases_dir = config.get_os_releases_dir(&version_id);
 
     // Create the os-releases directory if it doesn't exist
     if let Err(e) = fs::create_dir_all(&os_releases_dir) {
@@ -901,12 +902,7 @@ pub fn disable_extensions(
     );
 
     // Determine os-releases directory based on test mode
-    let os_releases_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        let temp_base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{temp_base}/avocado/os-releases/{version_id}")
-    } else {
-        format!("/var/lib/avocado/os-releases/{version_id}")
-    };
+    let os_releases_dir = config.get_os_releases_dir(&version_id);
 
     // Check if os-releases directory exists
     if !Path::new(&os_releases_dir).exists() {
@@ -1225,7 +1221,7 @@ pub(crate) fn collect_extension_status(
         .map(|m| m.extensions.as_slice())
         .unwrap_or(&[]);
 
-    let available_extensions = scan_extensions_from_all_sources_with_verbosity(false)?;
+    let available_extensions = scan_extensions_from_all_sources_with_verbosity(config, false)?;
     let mounted_sysext = get_mounted_systemd_extensions("systemd-sysext")?;
     let mounted_confext = get_mounted_systemd_extensions("systemd-confext")?;
 
@@ -1350,7 +1346,7 @@ pub(crate) fn show_enhanced_status(
 
     // Get our view of available extensions
     let available_extensions =
-        scan_extensions_from_all_sources_with_verbosity(output.is_verbose())?;
+        scan_extensions_from_all_sources_with_verbosity(config, output.is_verbose())?;
 
     // Get systemd's view of mounted extensions
     let mounted_sysext = get_mounted_systemd_extensions("systemd-sysext")?;
@@ -1980,6 +1976,7 @@ fn format_status_output(output: &str) {
 
 /// Prepare the extension environment by setting up symlinks with output manager
 fn prepare_extension_environment_with_output(
+    config: &Config,
     output: &OutputManager,
 ) -> Result<Vec<Extension>, SystemdError> {
     output.step("Environment", "Preparing extension environment");
@@ -1988,7 +1985,7 @@ fn prepare_extension_environment_with_output(
     verify_clean_extension_environment(output)?;
 
     // Scan for available extensions from multiple sources
-    let extensions = scan_extensions_from_all_sources_with_verbosity(output.is_verbose())?;
+    let extensions = scan_extensions_from_all_sources_with_verbosity(config, output.is_verbose())?;
 
     if extensions.is_empty() {
         output.progress("No extensions found in any source location");
@@ -2212,6 +2209,7 @@ pub(crate) fn read_os_version_id() -> String {
 
 /// Scan all extension sources in priority order with verbosity control
 fn scan_extensions_from_all_sources_with_verbosity(
+    config: &Config,
     verbose: bool,
 ) -> Result<Vec<Extension>, SystemdError> {
     let mut extensions = Vec::new();
@@ -2228,9 +2226,13 @@ fn scan_extensions_from_all_sources_with_verbosity(
     // Read OS VERSION_ID for runtime-specific extensions
     let version_id = read_os_version_id();
 
-    // Fallback to the images directory where extension images are installed
-    let extensions_dir = std::env::var("AVOCADO_EXTENSIONS_PATH")
-        .unwrap_or_else(|_| "/var/lib/avocado/images".to_string());
+    // Where extension images are installed. Goes through the config
+    // accessor (which still lets AVOCADO_EXTENSIONS_PATH win) rather than
+    // reading the env var against a private hardcoded default: this is
+    // the scan that decides what actually gets merged, so reading a
+    // different directory than every other code path is the one place
+    // the inconsistency is guaranteed to be visible.
+    let extensions_dir = config.get_extensions_dir();
 
     // 1. First priority: HITL mounted extensions
     if verbose {
@@ -2251,7 +2253,7 @@ fn scan_extensions_from_all_sources_with_verbosity(
 
     // 2. Second priority: Active runtime manifest
     // If a manifest exists, use it to determine extensions and skip legacy os-releases scanning
-    let base_dir = crate::manifest::RuntimeManifest::base_dir();
+    let base_dir = config.get_avocado_base_dir();
     let base_path = Path::new(&base_dir);
     let active_manifest = crate::manifest::RuntimeManifest::load_active(base_path);
     let used_manifest = if let Some(ref manifest) = active_manifest {
@@ -2374,12 +2376,7 @@ fn scan_extensions_from_all_sources_with_verbosity(
     // Legacy extension discovery: only used when no manifest is present
     if !used_manifest {
         // 2b. Legacy: OS release-specific extensions (/var/lib/avocado/os-releases/<VERSION_ID>)
-        let os_releases_extensions_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-            let temp_base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{temp_base}/avocado/os-releases/{version_id}")
-        } else {
-            format!("/var/lib/avocado/os-releases/{version_id}")
-        };
+        let os_releases_extensions_dir = config.get_os_releases_dir(&version_id);
 
         if verbose {
             println!(

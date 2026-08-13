@@ -101,11 +101,6 @@ impl RuntimeManifest {
         })
     }
 
-    /// Resolve the avocado base directory, checking env override for testing.
-    pub fn base_dir() -> String {
-        std::env::var("AVOCADO_BASE_DIR").unwrap_or_else(|_| DEFAULT_AVOCADO_DIR.to_string())
-    }
-
     /// Load a manifest from a specific directory containing manifest.json.
     pub fn load_from(dir: &Path) -> Option<Self> {
         let manifest_path = dir.join(MANIFEST_FILENAME);

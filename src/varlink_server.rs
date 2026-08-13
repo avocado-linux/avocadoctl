@@ -184,6 +184,7 @@ impl vl_ext::VarlinkInterface for ExtensionsHandler {
             osRelease.as_deref(),
             ext_refs.as_deref(),
             all.unwrap_or(false),
+            &self.config,
         ) {
             Ok(result) => call.reply(result.disabled as i64, result.failed as i64),
             Err(e) => map_ext_error!(call, e),
@@ -204,7 +205,7 @@ impl vl_ext::VarlinkInterface for ExtensionsHandler {
         r#enabled: bool,
     ) -> varlink::Result<()> {
         let ext_refs: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
-        match service::ext::set_extensions_enabled(&ext_refs, enabled) {
+        match service::ext::set_extensions_enabled(&ext_refs, enabled, &self.config) {
             Ok(result) => call.reply(result.updated as i64, result.missing as i64),
             Err(e) => map_ext_error!(call, e),
         }
