@@ -82,6 +82,14 @@ impl From<crate::commands::ext::SystemdError> for AvocadoError {
             crate::commands::ext::SystemdError::ConfigurationError { message } => {
                 AvocadoError::ConfigurationError { message }
             }
+            crate::commands::ext::SystemdError::UnmountBatchFailed {
+                attempted,
+                failures,
+                details,
+            } => AvocadoError::UnmountFailed {
+                extension: format!("{failures} of {attempted}"),
+                reason: details,
+            },
         }
     }
 }
