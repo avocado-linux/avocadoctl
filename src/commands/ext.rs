@@ -1,6 +1,6 @@
 use crate::commands::image_adaptor::{
-    self, analyze_mounted_extension, extension_mount_point, unmount_all_persistent_mounts,
-    ImageAdaptor, ImageType, ImageTypeTag, KabAdaptor, RawAdaptor,
+    self, aggregate_failures, analyze_mounted_extension, extension_mount_point,
+    unmount_all_persistent_mounts, ImageAdaptor, ImageType, ImageTypeTag, KabAdaptor, RawAdaptor,
 };
 use crate::config::Config;
 use crate::output::OutputManager;
@@ -2673,10 +2673,12 @@ fn analyze_image_extension(
             if verbose {
                 println!("Backing file changed for {mount_name}, remounting...");
             }
+            // The remount below can still succeed after a partial teardown, so
+            // this is not fatal - but it is reported unconditionally. Hiding it
+            // behind --verbose is how a loop the kernel would not release went
+            // unnoticed until it had accumulated on the board.
             if let Err(e) = adaptor.unmount(&mount_name, verbose) {
-                if verbose {
-                    println!("Warning: failed to unmount stale {mount_name}: {e}");
-                }
+                eprintln!("Warning: failed to unmount stale {mount_name}: {e}");
             }
             adaptor.mount(&mount_name, path, verbose)?
         } else {
@@ -3043,6 +3045,12 @@ fn cleanup_stale_mounts(available_extensions: &[String]) -> Result<(), SystemdEr
         return Ok(());
     }
 
+    // Both halves of the cleanup always run and their failures are collected,
+    // so one loop the kernel refuses to release cannot abort the sweep and
+    // leave the remaining stale loops - raw and KAB alike - attached.
+    let mut attempted = 0;
+    let mut failures = Vec::new();
+
     // Clean up stale raw loop refs
     let loop_ref_dir = "/dev/disk/by-loop-ref";
     if Path::new(loop_ref_dir).exists() {
@@ -3056,7 +3064,11 @@ fn cleanup_stale_mounts(available_extensions: &[String]) -> Result<(), SystemdEr
             if let Some(loop_name) = entry.file_name().to_str() {
                 if !available_extensions.contains(&loop_name.to_string()) {
                     println!("Cleaning up stale raw loop for: {loop_name}");
-                    raw.unmount(loop_name, false)?;
+                    attempted += 1;
+                    if let Err(e) = raw.unmount(loop_name, false) {
+                        eprintln!("Warning: failed to clean up stale raw loop {loop_name}: {e}");
+                        failures.push(format!("{loop_name}: {e}"));
+                    }
                 }
             }
         }
@@ -3077,14 +3089,20 @@ fn cleanup_stale_mounts(available_extensions: &[String]) -> Result<(), SystemdEr
                 if let Some(loop_name) = entry.file_name().to_str() {
                     if !available_extensions.contains(&loop_name.to_string()) {
                         println!("Cleaning up stale KAB loop for: {loop_name}");
-                        let _ = kab.unmount(loop_name, false);
+                        attempted += 1;
+                        if let Err(e) = kab.unmount(loop_name, false) {
+                            eprintln!(
+                                "Warning: failed to clean up stale KAB loop {loop_name}: {e}"
+                            );
+                            failures.push(format!("{loop_name}: {e}"));
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok(())
+    aggregate_failures(attempted, failures)
 }
 
 /// Clean up all extension symlinks to ensure fresh state for merge

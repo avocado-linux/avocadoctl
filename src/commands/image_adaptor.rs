@@ -24,6 +24,35 @@ pub enum SystemdError {
 
     #[error("Configuration error: {message}")]
     ConfigurationError { message: String },
+
+    #[error("{failures} of {attempted} unmount operations failed: {details}")]
+    UnmountBatchFailed {
+        attempted: usize,
+        failures: usize,
+        details: String,
+    },
+}
+
+/// Fold the failures of a best-effort teardown batch into a single result.
+///
+/// A teardown loop must not stop at its first failure. One loop the kernel
+/// refuses to release would otherwise leave every later extension mounted, and
+/// where a caller runs several adaptors in sequence it would skip the remaining
+/// adaptors outright. Each entry is attempted, and what failed is reported once
+/// at the end.
+pub(crate) fn aggregate_failures(
+    attempted: usize,
+    failures: Vec<String>,
+) -> Result<(), SystemdError> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(SystemdError::UnmountBatchFailed {
+        attempted,
+        failures: failures.len(),
+        details: failures.join("; "),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +288,19 @@ fn unmount_with_dissect(mount_point: &str, verbose: bool) -> Result<(), SystemdE
 /// Check if a loop device's backing file differs from the expected path.
 /// `loop_dev` can be a symlink (e.g. `/dev/disk/by-loop-ref/name`) or a direct
 /// device path (`/dev/loopN`).
-fn check_backing_file_changed(loop_dev: &Path, expected_path: &Path) -> bool {
+///
+/// `exposed_bytes` is how large the loop should be while it is still serving
+/// the expected image, and the caller has to supply it because it is not always
+/// the backing file's length. A KAB loop is attached with
+/// `--offset`/`--sizelimit=layer.img`, so it is sized to the image inside the
+/// archive while `expected_path` is the whole `.kab`; measuring it against the
+/// archive never matches and reports a change on every call. Pass `None` when
+/// the size cannot be established - the path comparison still applies.
+fn check_backing_file_changed(
+    loop_dev: &Path,
+    expected_path: &Path,
+    exposed_bytes: Option<u64>,
+) -> bool {
     if is_test_mode() {
         return false;
     }
@@ -305,9 +346,14 @@ fn check_backing_file_changed(loop_dev: &Path, expected_path: &Path) -> bool {
     // that needs a fingerprint recorded at mount time, which is worth doing
     // separately rather than folding into this predicate.
     //
-    // Unreadable sysfs or metadata reports unchanged, matching how every other
-    // failure in this function behaves - the size check only ever adds
-    // detections, it never removes one.
+    // An unknown expected size, unreadable sysfs, or unreadable metadata
+    // reports unchanged, matching how every other failure in this function
+    // behaves - the size check only ever adds detections, it never removes one.
+    let exposed_bytes = match exposed_bytes {
+        Some(n) => n,
+        None => return false,
+    };
+
     let sysfs_size = format!("/sys/block/{dev_name}/size");
     let loop_sectors = match fs::read_to_string(&sysfs_size) {
         Ok(s) => match s.trim().parse::<u64>() {
@@ -317,22 +363,28 @@ fn check_backing_file_changed(loop_dev: &Path, expected_path: &Path) -> bool {
         Err(_) => return false,
     };
 
-    let file_bytes = match fs::metadata(expected_path) {
-        Ok(m) => m.len(),
-        Err(_) => return false,
-    };
-
-    !loop_size_matches(loop_sectors, file_bytes)
+    !loop_size_matches(loop_sectors, exposed_bytes)
 }
 
-/// Whether a loop device of `loop_sectors` is backed by a file of `file_bytes`.
+/// Bytes the loop for a raw image should be exposing: the whole file.
+fn raw_exposed_bytes(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Whether a loop of `loop_sectors` is still exposing `exposed_bytes`.
 ///
 /// `/sys/block/<dev>/size` counts 512-byte sectors regardless of the device's
-/// logical block size. Split out from `check_backing_file_changed` so the
-/// arithmetic is testable without a loop device: everything around it is gated
-/// behind `is_test_mode()` and cannot run under `cargo test`.
-fn loop_size_matches(loop_sectors: u64, file_bytes: u64) -> bool {
-    loop_sectors.saturating_mul(512) == file_bytes
+/// logical block size, and the kernel derives that count by truncating the
+/// exposed length. The comparison has to truncate the same way: measuring
+/// `loop_sectors * 512` against a length that is not a whole number of sectors
+/// never matches, which would report a change on every call for any image the
+/// kernel had to round down.
+///
+/// Split out from `check_backing_file_changed` so the arithmetic is testable
+/// without a loop device: everything around it is gated behind `is_test_mode()`
+/// and cannot run under `cargo test`.
+fn loop_size_matches(loop_sectors: u64, exposed_bytes: u64) -> bool {
+    loop_sectors == exposed_bytes / 512
 }
 
 /// What mounting an extension should do, given what is already attached.
@@ -672,7 +724,7 @@ impl ImageAdaptor for RawAdaptor {
         let present = loop_ref.exists();
         let plan = plan_mount(
             present,
-            present && check_backing_file_changed(&loop_ref, raw_path),
+            present && check_backing_file_changed(&loop_ref, raw_path, raw_exposed_bytes(raw_path)),
         );
 
         match plan {
@@ -687,10 +739,16 @@ impl ImageAdaptor for RawAdaptor {
             }
             // The image behind the loop is not the one we were asked to mount,
             // so the loop is worthless: drop it and attach a fresh one. A loop
-            // may survive this - the detach is best-effort - but only an actual
-            // image change pays that cost, not every merge.
+            // may survive this - the detach really is best-effort, so the
+            // teardown must not be propagated. Failing here would abort the
+            // merge and leave the replacement image unmounted, which is worse
+            // than the stranded loop it was trying to avoid.
             MountPlan::Replace => {
-                self.unmount(mount_name, verbose)?;
+                if let Err(e) = self.unmount(mount_name, verbose) {
+                    eprintln!(
+                        "Warning: could not fully tear down {mount_name} before replacing it: {e}"
+                    );
+                }
                 mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
             }
             MountPlan::Fresh => {
@@ -718,7 +776,17 @@ impl ImageAdaptor for RawAdaptor {
 
     fn unmount(&self, mount_name: &str, verbose: bool) -> Result<(), SystemdError> {
         let mount_point = extension_mount_point(mount_name);
-        unmount_with_dissect(&mount_point, verbose)?;
+
+        // `-U` against a mount point that is not mounted fails, and the replace
+        // path unmounts twice: once by the caller that noticed the stale image,
+        // once by mount() tearing the old loop down before attaching a new one.
+        // Making the dissect call conditional turns the second one into a no-op
+        // instead of an error that aborts the merge.
+        if is_mount_active(&mount_point) {
+            unmount_with_dissect(&mount_point, verbose)?;
+        } else if verbose {
+            println!("{mount_point} is not mounted; skipping systemd-dissect -U");
+        }
 
         // -U leaves the persistent loop attached; drop it too, or the next
         // mount sees a live loop-ref and skips itself.
@@ -741,14 +809,22 @@ impl ImageAdaptor for RawAdaptor {
             source: e,
         })?;
 
+        // Best-effort per entry, matching KabAdaptor::unmount_all: one loop the
+        // kernel will not release must not leave every later extension mounted.
+        let mut attempted = 0;
+        let mut failures = Vec::new();
         for entry in entries.flatten() {
             if let Some(loop_name) = entry.file_name().to_str() {
                 println!("Unmounting raw loop: {loop_name}");
-                self.unmount(loop_name, false)?;
+                attempted += 1;
+                if let Err(e) = self.unmount(loop_name, false) {
+                    eprintln!("Warning: failed to unmount raw loop {loop_name}: {e}");
+                    failures.push(format!("{loop_name}: {e}"));
+                }
             }
         }
 
-        Ok(())
+        aggregate_failures(attempted, failures)
     }
 
     fn needs_remount(&self, mount_name: &str, expected_path: &Path) -> bool {
@@ -756,7 +832,11 @@ impl ImageAdaptor for RawAdaptor {
             return false;
         }
         let loop_ref = format!("/dev/disk/by-loop-ref/{mount_name}");
-        check_backing_file_changed(Path::new(&loop_ref), expected_path)
+        check_backing_file_changed(
+            Path::new(&loop_ref),
+            expected_path,
+            raw_exposed_bytes(expected_path),
+        )
     }
 
     fn type_tag(&self) -> ImageTypeTag {
@@ -1104,28 +1184,37 @@ impl ImageAdaptor for KabAdaptor {
             source: e,
         })?;
 
+        // Best-effort per entry, but the failures are still reported: dropping
+        // them silently hid undetachable loops from every caller.
+        let mut attempted = 0;
+        let mut failures = Vec::new();
         for entry in entries.flatten() {
             if let Some(mount_name) = entry.file_name().to_str() {
                 println!("Unmounting KAB: {mount_name}");
-                // Best-effort: log errors but continue
+                attempted += 1;
                 if let Err(e) = self.unmount(mount_name, false) {
                     eprintln!("Warning: failed to unmount KAB {mount_name}: {e}");
+                    failures.push(format!("{mount_name}: {e}"));
                 }
             }
         }
 
-        Ok(())
+        aggregate_failures(attempted, failures)
     }
 
     fn needs_remount(&self, mount_name: &str, kab_path: &Path) -> bool {
         if is_test_mode() {
             return false;
         }
-        if let Some(loop_dev) = Self::read_loop_state(mount_name) {
-            check_backing_file_changed(&loop_dev, kab_path)
-        } else {
-            false
-        }
+        let loop_dev = match Self::read_loop_state(mount_name) {
+            Some(dev) => dev,
+            None => return false,
+        };
+
+        // The loop exposes layer.img, not the .kab backing it, so the archive's
+        // own length is the wrong yardstick - see check_backing_file_changed.
+        let exposed_bytes = Self::find_image_entry(kab_path).ok().map(|entry| entry.len);
+        check_backing_file_changed(&loop_dev, kab_path, exposed_bytes)
     }
 
     fn type_tag(&self) -> ImageTypeTag {
@@ -1139,8 +1228,18 @@ impl ImageAdaptor for KabAdaptor {
 
 pub fn unmount_all_persistent_mounts() -> Result<(), SystemdError> {
     println!("Unmounting all persistent mounts...");
-    RawAdaptor.unmount_all()?;
-    KabAdaptor.unmount_all()?;
+
+    // Both adaptors always run. Propagating the raw failure here meant a single
+    // undetachable raw loop left every KAB offset loop attached.
+    let mut failures = Vec::new();
+    if let Err(e) = RawAdaptor.unmount_all() {
+        failures.push(format!("raw: {e}"));
+    }
+    if let Err(e) = KabAdaptor.unmount_all() {
+        failures.push(format!("kab: {e}"));
+    }
+    aggregate_failures(2, failures)?;
+
     println!("All persistent mounts unmounted.");
     Ok(())
 }
@@ -1208,9 +1307,37 @@ mod tests {
 
     #[test]
     fn loop_size_does_not_panic_on_an_absurd_sector_count() {
-        // saturating_mul rather than *: a garbage or truncated sysfs read must
-        // report "changed" instead of overflowing in release builds.
+        // Dividing the byte count rather than multiplying the sector count: a
+        // garbage or truncated sysfs read must report "changed" instead of
+        // overflowing in release builds.
         assert!(!loop_size_matches(u64::MAX, 121126912));
+    }
+
+    /// A loop's sector count is its exposed length truncated to 512 bytes, so
+    /// an image that is not a whole number of sectors still matches the loop
+    /// serving it. Comparing `sectors * 512` against the length instead
+    /// reported such an image as changed on every single call.
+    #[test]
+    fn loop_size_matches_an_image_that_is_not_a_whole_number_of_sectors() {
+        assert!(loop_size_matches(8, 4097));
+    }
+
+    #[test]
+    fn a_batch_with_no_failures_succeeds() {
+        assert!(aggregate_failures(3, Vec::new()).is_ok());
+    }
+
+    /// A teardown loop that stops at its first failure leaves everything after
+    /// it mounted. Every entry is attempted and the failures are reported once.
+    #[test]
+    fn a_batch_reports_every_failure_not_just_the_first() {
+        let err = aggregate_failures(3, vec!["a: busy".to_string(), "b: busy".to_string()])
+            .expect_err("a batch that had failures must not report success");
+
+        assert_eq!(
+            err.to_string(),
+            "2 of 3 unmount operations failed: a: busy; b: busy"
+        );
     }
 
     #[test]
