@@ -2684,8 +2684,12 @@ fn analyze_image_extension(
             // this is not fatal - but it is reported unconditionally. Hiding it
             // behind --verbose is how a loop the kernel would not release went
             // unnoticed until it had accumulated on the board.
+            //
+            // Both adaptors retry the same teardown inside mount(), so one stuck
+            // loop legitimately produces two warnings. Each names its own stage
+            // so the pair does not read as the same complaint printed twice.
             if let Err(e) = adaptor.unmount(&mount_name, verbose) {
-                eprintln!("Warning: failed to unmount stale {mount_name}: {e}");
+                eprintln!("Warning: pre-remount cleanup could not unmount {mount_name}: {e}");
             }
             adaptor.mount(&mount_name, path, verbose)?
         } else {
