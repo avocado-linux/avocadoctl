@@ -3,6 +3,7 @@ use crate::gc;
 use crate::manifest::{RuntimeManifest, IMAGES_DIR_NAME};
 use crate::service::error::AvocadoError;
 use crate::service::types::{RuntimeEntry, RuntimeExtensionInfo};
+use crate::update::UpdateOutcome;
 use crate::{staging, update};
 use std::path::Path;
 use std::sync::mpsc;
@@ -60,6 +61,18 @@ pub fn list_runtimes(config: &Config) -> Result<Vec<RuntimeEntry>, AvocadoError>
 // ── Streaming service functions ──────────────────────────────────────────────
 
 /// Create a streaming handle that sends a message, triggers reboot, and completes.
+/// A streaming handle that emits one message and completes. Used where there is
+/// no work to stream, so no extensions are touched.
+fn message_streaming(message: &str) -> StreamHandle {
+    let msg = message.to_string();
+    let (tx, rx) = mpsc::sync_channel(4);
+    let handle = thread::spawn(move || {
+        let _ = tx.send(msg);
+        Ok(())
+    });
+    (rx, handle)
+}
+
 fn reboot_streaming(message: &str) -> StreamHandle {
     let msg = message.to_string();
     let (tx, rx) = mpsc::sync_channel(4);
@@ -81,7 +94,7 @@ pub fn add_from_url_streaming(
 ) -> Result<StreamHandle, AvocadoError> {
     let base_dir = config.get_avocado_base_dir();
     let base_path = Path::new(&base_dir);
-    let reboot_required = update::perform_update(
+    let outcome = update::perform_update(
         url,
         base_path,
         auth_token,
@@ -91,15 +104,23 @@ pub fn add_from_url_streaming(
         config.get_spot_check_bytes(),
     )?;
 
-    if reboot_required {
-        return Ok(reboot_streaming(
+    match outcome {
+        UpdateOutcome::RebootRequired => Ok(reboot_streaming(
             "OS update applied. Rebooting to activate new OS...",
-        ));
+        )),
+        // Nothing changed, so nothing to refresh. Refreshing here would tear down
+        // and re-merge every extension — including the one the caller is running
+        // from — for no reason.
+        UpdateOutcome::AlreadyCurrent => Ok(message_streaming(
+            "Runtime already at target version, nothing to do.",
+        )),
+        UpdateOutcome::Activated => {
+            if config.auto_gc() {
+                let _ = garbage_collect(config);
+            }
+            Ok(super::ext::refresh_extensions_streaming(config))
+        }
     }
-    if config.auto_gc() {
-        let _ = garbage_collect(config);
-    }
-    Ok(super::ext::refresh_extensions_streaming(config))
 }
 
 /// Add a runtime from a local manifest file with streaming output.
@@ -187,7 +208,7 @@ pub fn add_from_url(
 ) -> Result<Vec<String>, AvocadoError> {
     let base_dir = config.get_avocado_base_dir();
     let base_path = Path::new(&base_dir);
-    let reboot_required = update::perform_update(
+    let outcome = update::perform_update(
         url,
         base_path,
         auth_token,
@@ -197,18 +218,26 @@ pub fn add_from_url(
         config.get_spot_check_bytes(),
     )?;
 
-    if reboot_required {
-        println!("  OS update applied. Rebooting to activate new OS...");
-        let _ = std::process::Command::new("reboot").status();
-        return Ok(vec![
-            "OS update applied. Rebooting to activate new OS.".to_string()
-        ]);
+    match outcome {
+        UpdateOutcome::RebootRequired => {
+            println!("  OS update applied. Rebooting to activate new OS...");
+            let _ = std::process::Command::new("reboot").status();
+            Ok(vec![
+                "OS update applied. Rebooting to activate new OS.".to_string()
+            ])
+        }
+        // Nothing changed, so nothing to refresh. See the streaming path above.
+        UpdateOutcome::AlreadyCurrent => Ok(vec![
+            "Runtime already at target version, nothing to do.".to_string(),
+        ]),
+        UpdateOutcome::Activated => {
+            let result = super::ext::refresh_extensions(config);
+            if config.auto_gc() {
+                let _ = garbage_collect(config);
+            }
+            result
+        }
     }
-    let result = super::ext::refresh_extensions(config);
-    if config.auto_gc() {
-        let _ = garbage_collect(config);
-    }
-    result
 }
 
 /// Add a runtime from a local manifest file.
