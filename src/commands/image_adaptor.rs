@@ -757,11 +757,13 @@ impl ImageAdaptor for RawAdaptor {
             // may survive this - the detach really is best-effort, so the
             // teardown must not be propagated. Failing here would abort the
             // merge and leave the replacement image unmounted, which is worse
-            // than the stranded loop it was trying to avoid.
+            // than the stranded loop it was trying to avoid. A caller that
+            // unmounted first has already warned about this same loop, so the
+            // message names this stage rather than repeating the caller's.
             MountPlan::Replace => {
                 if let Err(e) = self.unmount(mount_name, verbose) {
                     eprintln!(
-                        "Warning: could not fully tear down {mount_name} before replacing it: {e}"
+                        "Warning: mount-time teardown retry could not release {mount_name}: {e}"
                     );
                 }
                 mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
@@ -1146,11 +1148,13 @@ impl ImageAdaptor for KabAdaptor {
         // `cleanup_stale_mounts` only ever reads the name the state file
         // currently holds, never a loop it has already been overwritten away
         // from. Best-effort, like every other teardown in this file - the
-        // merge must proceed even if the old loop is stuck.
+        // merge must proceed even if the old loop is stuck. A caller that
+        // unmounted first has already warned about this same loop, so the
+        // message names this stage rather than repeating the caller's.
         if let Some(old_loop) = Self::read_loop_state(mount_name) {
             if let Err(e) = Self::detach_offset_loop(&old_loop) {
                 eprintln!(
-                    "Warning: could not detach stale offset loop {} for {mount_name} before replacing it: {e}",
+                    "Warning: mount-time teardown retry could not detach stale offset loop {} for {mount_name}: {e}",
                     old_loop.display()
                 );
             }
