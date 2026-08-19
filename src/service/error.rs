@@ -50,6 +50,13 @@ pub enum AvocadoError {
     #[error("Unmount failed for '{extension}': {reason}")]
     UnmountFailed { extension: String, reason: String },
 
+    #[error("{failures} of {attempted} unmount operations failed: {details}")]
+    UnmountBatchFailed {
+        attempted: usize,
+        failures: usize,
+        details: String,
+    },
+
     #[error("No root authority configured")]
     NoRootAuthority,
 
@@ -86,9 +93,10 @@ impl From<crate::commands::ext::SystemdError> for AvocadoError {
                 attempted,
                 failures,
                 details,
-            } => AvocadoError::UnmountFailed {
-                extension: format!("{failures} of {attempted}"),
-                reason: details,
+            } => AvocadoError::UnmountBatchFailed {
+                attempted,
+                failures,
+                details,
             },
         }
     }
@@ -159,5 +167,44 @@ impl From<crate::config::ConfigError> for AvocadoError {
         AvocadoError::ConfigurationError {
             message: e.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A batch unmount failure must keep its `attempted`/`failures` counts in
+    /// their own fields rather than stuffed into `UnmountFailed`'s `extension`
+    /// field, which every other producer of that variant (see
+    /// `commands::hitl::HitlError::Unmount` below) fills with a real mount
+    /// point name. Reusing the field for a count broke that contract for
+    /// anything reading `AvocadoError` structurally rather than as a rendered
+    /// string.
+    #[test]
+    fn unmount_batch_failure_keeps_the_count_out_of_the_extension_field() {
+        let sys_err = crate::commands::ext::SystemdError::UnmountBatchFailed {
+            attempted: 3,
+            failures: 2,
+            details: "a: busy; b: busy".to_string(),
+        };
+
+        let avocado_err = AvocadoError::from(sys_err);
+
+        assert!(
+            matches!(
+                avocado_err,
+                AvocadoError::UnmountBatchFailed {
+                    attempted: 3,
+                    failures: 2,
+                    ..
+                }
+            ),
+            "a batch failure must not be reshaped into UnmountFailed's per-extension fields"
+        );
+        assert_eq!(
+            avocado_err.to_string(),
+            "2 of 3 unmount operations failed: a: busy; b: busy"
+        );
     }
 }
