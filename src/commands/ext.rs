@@ -2515,7 +2515,14 @@ fn scan_extensions_from_all_sources_with_verbosity(
                 }
             }
 
-            cleanup_stale_mounts(&available_loop_names)?;
+            // Cleaning up loops for extensions we are *not* about to mount must
+            // never block mounting the ones we are: this scan backs `ext list`,
+            // `ext status` and `prepare_extension_environment`, so propagating a
+            // failure here (a single loop the kernel refuses to release, for an
+            // extension that no longer exists) would abort every one of them.
+            if let Err(e) = cleanup_stale_mounts(&available_loop_names) {
+                eprintln!("Warning: stale mount cleanup incomplete: {e}");
+            }
 
             for (ext_name, ext_version, path) in raw_files {
                 match extension_map.entry(ext_name.clone()) {
