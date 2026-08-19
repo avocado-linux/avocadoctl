@@ -424,6 +424,20 @@ pub(crate) fn plan_mount(loop_ref_present: bool, backing_changed: bool) -> Mount
     }
 }
 
+/// Render a device path as UTF-8 for a `losetup` argument, or a
+/// `ConfigurationError` naming what could not be represented.
+///
+/// `unwrap_or("")` here would silently pass an empty argument to
+/// `losetup -d`, which fails and reports as though the kernel had refused to
+/// release the loop - the exact signal every other error in this file keys
+/// off, so misreporting it this way is confusing rather than merely wrong.
+fn require_utf8_path(path: &Path) -> Result<&str, SystemdError> {
+    path.to_str()
+        .ok_or_else(|| SystemdError::ConfigurationError {
+            message: format!("device path is not valid UTF-8: {}", path.display()),
+        })
+}
+
 /// Detach the persistent loop behind `mount_name`, if one is still attached.
 ///
 /// `systemd-dissect -U` unmounts the mount point but deliberately leaves a
@@ -448,8 +462,9 @@ fn detach_loop_ref(mount_name: &str, verbose: bool) -> Result<(), SystemdError> 
         Err(_) => return Ok(()),
     };
 
+    let dev_str = require_utf8_path(&dev)?;
     let output = ProcessCommand::new("losetup")
-        .args(["-d", dev.to_str().unwrap_or("")])
+        .args(["-d", dev_str])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -1123,6 +1138,24 @@ impl ImageAdaptor for KabAdaptor {
             return Ok(PathBuf::from(mount_point));
         }
 
+        // A prior unmount may have left the state file pointing at an offset
+        // loop that failed to detach - the same undetachable-loop condition
+        // `plan_mount`'s docs describe for the raw adaptor. `save_loop_state`
+        // below overwrites that entry unconditionally, so without this the old
+        // loop would have no record anywhere once the new one is saved:
+        // `cleanup_stale_mounts` only ever reads the name the state file
+        // currently holds, never a loop it has already been overwritten away
+        // from. Best-effort, like every other teardown in this file - the
+        // merge must proceed even if the old loop is stuck.
+        if let Some(old_loop) = Self::read_loop_state(mount_name) {
+            if let Err(e) = Self::detach_offset_loop(&old_loop) {
+                eprintln!(
+                    "Warning: could not detach stale offset loop {} for {mount_name} before replacing it: {e}",
+                    old_loop.display()
+                );
+            }
+        }
+
         let loop_dev = Self::setup_offset_loop(kab_path, &entry)?;
         Self::save_loop_state(mount_name, &loop_dev)?;
 
@@ -1158,8 +1191,18 @@ impl ImageAdaptor for KabAdaptor {
             return Ok(());
         }
 
-        // Phase 1: systemd-dissect unmount
-        unmount_with_dissect(&mount_point, verbose)?;
+        // Phase 1: systemd-dissect unmount. `-U` against a mount point that is
+        // not mounted fails, which would abort here and skip Phase 2 below -
+        // stranding the offset loop and its state file exactly like the raw
+        // adaptor did before the same guard was added there. A stale KAB entry
+        // (the case `cleanup_stale_mounts` calls this for) is by definition one
+        // whose extension is gone, so its mount point is usually already
+        // unmounted.
+        if is_mount_active(&mount_point) {
+            unmount_with_dissect(&mount_point, verbose)?;
+        } else if verbose {
+            println!("{mount_point} is not mounted; skipping systemd-dissect -U");
+        }
 
         // Phase 2: Detach outer offset loop
         if let Some(loop_dev) = Self::read_loop_state(mount_name) {
@@ -1226,19 +1269,70 @@ impl ImageAdaptor for KabAdaptor {
 // Convenience: unmount all persistent mounts across all adaptor types
 // ---------------------------------------------------------------------------
 
+/// Fold multiple named `unmount_all` outcomes into one combined result.
+///
+/// Passing the adaptor count as `attempted` here previously produced a
+/// self-contradicting message: the outer number counted adaptors (2) while
+/// each adaptor's own `details` string already read "N of M unmount
+/// operations failed" counting individual loops, nesting one batch summary
+/// inside another. Reading the real `attempted`/`failures` counts back out of
+/// each `UnmountBatchFailed` and summing them gives one honest total instead.
+///
+/// Pure and independent of `is_test_mode()` - unlike the adaptors' own
+/// `unmount_all`, which only reach a real device path outside tests - so this
+/// is the one part of the aggregation that `cargo test` can actually exercise.
+pub(crate) fn combine_unmount_all_results(
+    results: Vec<(&str, Result<(), SystemdError>)>,
+) -> Result<(), SystemdError> {
+    let mut attempted = 0;
+    let mut failures = 0;
+    let mut details = Vec::new();
+
+    for (label, result) in results {
+        match result {
+            Ok(()) => {}
+            // A nested `UnmountBatchFailed`'s own `details` already concatenates
+            // several individual failures, so it must not be folded into
+            // `aggregate_failures` as a single Vec entry - that would count a
+            // three-loop failure as one. Read the real counts back out and sum
+            // them instead.
+            Err(SystemdError::UnmountBatchFailed {
+                attempted: a,
+                failures: f,
+                details: d,
+            }) => {
+                attempted += a;
+                failures += f;
+                details.push(format!("{label}: {d}"));
+            }
+            Err(e) => {
+                attempted += 1;
+                failures += 1;
+                details.push(format!("{label}: {e}"));
+            }
+        }
+    }
+
+    if failures == 0 {
+        return Ok(());
+    }
+
+    Err(SystemdError::UnmountBatchFailed {
+        attempted,
+        failures,
+        details: details.join("; "),
+    })
+}
+
 pub fn unmount_all_persistent_mounts() -> Result<(), SystemdError> {
     println!("Unmounting all persistent mounts...");
 
     // Both adaptors always run. Propagating the raw failure here meant a single
     // undetachable raw loop left every KAB offset loop attached.
-    let mut failures = Vec::new();
-    if let Err(e) = RawAdaptor.unmount_all() {
-        failures.push(format!("raw: {e}"));
-    }
-    if let Err(e) = KabAdaptor.unmount_all() {
-        failures.push(format!("kab: {e}"));
-    }
-    aggregate_failures(2, failures)?;
+    combine_unmount_all_results(vec![
+        ("raw", RawAdaptor.unmount_all()),
+        ("kab", KabAdaptor.unmount_all()),
+    ])?;
 
     println!("All persistent mounts unmounted.");
     Ok(())
@@ -1337,6 +1431,77 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "2 of 3 unmount operations failed: a: busy; b: busy"
+        );
+    }
+
+    /// `losetup -d ""` (an empty argument) reports as though the kernel had
+    /// refused to release the loop, which is indistinguishable from the real
+    /// failure mode this whole file exists to handle. A non-UTF-8 path must
+    /// surface as its own distinct error instead of silently degrading to that
+    /// empty argument via `unwrap_or("")`.
+    #[test]
+    fn non_utf8_device_path_is_a_configuration_error_not_an_empty_losetup_arg() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0x80 alone is not a valid UTF-8 lead or continuation byte.
+        let bad_bytes = [b'/', b'd', b'e', b'v', b'/', 0x80, b'x'];
+        let path = Path::new(OsStr::from_bytes(&bad_bytes));
+
+        let err = require_utf8_path(path)
+            .expect_err("a non-UTF-8 path must not silently become an empty losetup argument");
+        assert!(matches!(err, SystemdError::ConfigurationError { .. }));
+    }
+
+    #[test]
+    fn combining_unmount_all_results_sums_attempted_honestly_across_adaptors() {
+        // Regression for a self-contradicting count: the caller previously
+        // passed `aggregate_failures(2, ...)` meaning "2 adaptors", while the
+        // nested `details` string already read "N of M unmount operations
+        // failed" meaning individual operations - producing output like
+        // "1 of 2 unmount operations failed: raw: 3 of 5 unmount operations
+        // failed: ...". The combined total must read as one honest count.
+        let raw_err = SystemdError::UnmountBatchFailed {
+            attempted: 5,
+            failures: 3,
+            details: "docker: busy; connect: busy; wifi: busy".to_string(),
+        };
+
+        let result = combine_unmount_all_results(vec![("raw", Err(raw_err)), ("kab", Ok(()))]);
+
+        let err = result.expect_err("a batch with a failing adaptor must not report success");
+        assert_eq!(
+            err.to_string(),
+            "3 of 5 unmount operations failed: raw: docker: busy; connect: busy; wifi: busy"
+        );
+    }
+
+    #[test]
+    fn combining_unmount_all_results_with_no_failures_succeeds() {
+        let result = combine_unmount_all_results(vec![("raw", Ok(())), ("kab", Ok(()))]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn combining_unmount_all_results_reports_both_adaptors_honestly() {
+        let raw_err = SystemdError::UnmountBatchFailed {
+            attempted: 2,
+            failures: 1,
+            details: "docker: busy".to_string(),
+        };
+        let kab_err = SystemdError::UnmountBatchFailed {
+            attempted: 1,
+            failures: 1,
+            details: "app: busy".to_string(),
+        };
+
+        let result =
+            combine_unmount_all_results(vec![("raw", Err(raw_err)), ("kab", Err(kab_err))]);
+
+        let err = result.expect_err("both adaptors failing must not report success");
+        assert_eq!(
+            err.to_string(),
+            "2 of 3 unmount operations failed: raw: docker: busy; kab: app: busy"
         );
     }
 
