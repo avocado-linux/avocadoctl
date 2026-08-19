@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::manifest::{RuntimeManifest, IMAGES_DIR_NAME};
 use crate::output::OutputManager;
+use crate::update::UpdateOutcome;
 use crate::{staging, update};
 use clap::{Arg, ArgGroup, ArgMatches, Command};
 use std::path::Path;
@@ -149,19 +150,23 @@ fn handle_add(matches: &ArgMatches, config: &Config, output: &OutputManager) {
             output.is_verbose(),
             config.get_spot_check_bytes(),
         ) {
-            Ok(reboot_required) => {
-                if reboot_required {
-                    println!();
-                    output.step(
-                        "Runtime Add",
-                        "OS update applied. Rebooting to activate new OS...",
-                    );
-                    let _ = std::process::Command::new("reboot").status();
-                } else {
-                    crate::commands::ext::refresh_extensions(config, output);
-                    println!();
-                    output.success("Runtime Add", "Runtime added successfully.");
-                }
+            Ok(UpdateOutcome::RebootRequired) => {
+                println!();
+                output.step(
+                    "Runtime Add",
+                    "OS update applied. Rebooting to activate new OS...",
+                );
+                let _ = std::process::Command::new("reboot").status();
+            }
+            // Nothing changed, so don't refresh extensions.
+            Ok(UpdateOutcome::AlreadyCurrent) => {
+                println!();
+                output.success("Runtime Add", "Runtime already at target version.");
+            }
+            Ok(UpdateOutcome::Activated) => {
+                crate::commands::ext::refresh_extensions(config, output);
+                println!();
+                output.success("Runtime Add", "Runtime added successfully.");
             }
             Err(e) => {
                 println!();

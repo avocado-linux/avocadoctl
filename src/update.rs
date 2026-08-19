@@ -32,9 +32,28 @@ pub enum UpdateError {
     MetadataError(String),
 }
 
+/// What a `perform_update` call actually did.
+///
+/// Callers must treat these differently: only `Activated` warrants an extension
+/// refresh. Returning a bare bool made `AlreadyCurrent` indistinguishable from
+/// `Activated`, so a wholly redundant update still refreshed extensions — which
+/// tears down and re-merges every sysext/confext, including the one the calling
+/// agent is running from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// An OS bundle was applied. Reboot to activate it; the runtime is staged
+    /// and will be promoted after the OS build id is verified on next boot.
+    RebootRequired,
+    /// A new runtime was staged and activated. Refresh extensions.
+    Activated,
+    /// The requested runtime is already active and intact. Nothing changed, so
+    /// callers must not refresh.
+    AlreadyCurrent,
+}
+
 /// Perform a TUF-based runtime update.
-/// Returns `Ok(true)` if an OS update was applied and a reboot is required
-/// before extensions can be merged. Returns `Ok(false)` otherwise.
+///
+/// See [`UpdateOutcome`] for what the return value obliges the caller to do.
 pub fn perform_update(
     url: &str,
     base_dir: &Path,
@@ -43,7 +62,7 @@ pub fn perform_update(
     stream_os_to_partition: bool,
     verbose: bool,
     spot_check_bytes: u64,
-) -> Result<bool, UpdateError> {
+) -> Result<UpdateOutcome, UpdateError> {
     let url = url.trim_end_matches('/');
 
     // 1. Load the local trust anchor
@@ -349,6 +368,20 @@ pub fn perform_update(
         println!("    {} {} (image: {})", ext.name, ext.version, img);
     }
 
+    // Nothing to do if this runtime is already the active one and its images are
+    // all present and hash-clean. Checked before anything is installed, the
+    // manifest is rewritten, or the active symlink is touched.
+    //
+    // `validate_manifest_images` rather than a bare existence check on purpose: a
+    // runtime can be active while an image is missing from the pool or corrupt
+    // (hand-deleted, partial GC, truncated write). That still falls through to
+    // normal staging, so this skips redundant work without skipping repair.
+    if is_already_current(&new_manifest, base_dir) {
+        println!("  Runtime already at target version ({short_id}), nothing to do.");
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Ok(UpdateOutcome::AlreadyCurrent);
+    }
+
     staging::install_images_from_staging(
         &new_manifest,
         &staging_dir,
@@ -394,9 +427,19 @@ pub fn perform_update(
     // Clean up staging directory
     let _ = fs::remove_dir_all(&staging_dir);
 
-    let reboot_required = result?;
+    let outcome = result?;
     println!("  Update staged successfully.");
-    Ok(reboot_required)
+    Ok(outcome)
+}
+
+/// True when `manifest` names the runtime that is already active and every image
+/// it lists is present and matches its recorded hash.
+fn is_already_current(manifest: &RuntimeManifest, base_dir: &Path) -> bool {
+    let active_is_same = RuntimeManifest::load_active(base_dir)
+        .map(|active| active.id == manifest.id)
+        .unwrap_or(false);
+
+    active_is_same && staging::validate_manifest_images(manifest, base_dir).is_ok()
 }
 
 /// Complete the update after the runtime has been staged.
@@ -411,7 +454,7 @@ fn finish_update(
     stream_os_to_partition: bool,
     verbose: bool,
     _os_bundle_skipped: bool,
-) -> Result<bool, UpdateError> {
+) -> Result<UpdateOutcome, UpdateError> {
     let mut reboot_required = false;
 
     // Apply OS update if bundle is present and OS is not already at target version.
@@ -482,6 +525,8 @@ fn finish_update(
             "  Staged runtime: {} {} ({short_id}) — pending OS verification on next boot",
             new_manifest.runtime.name, new_manifest.runtime.version,
         );
+
+        Ok(UpdateOutcome::RebootRequired)
     } else {
         // No OS update — activate the runtime immediately
         staging::activate_runtime(&new_manifest.id, base_dir)
@@ -492,9 +537,9 @@ fn finish_update(
             "  Activated runtime: {} {} ({short_id})",
             new_manifest.runtime.name, new_manifest.runtime.version,
         );
-    }
 
-    Ok(reboot_required)
+        Ok(UpdateOutcome::Activated)
+    }
 }
 
 /// Download a single target file, verifying hash and length.
@@ -1079,6 +1124,97 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{ManifestExtension, RuntimeInfo};
+
+    fn already_current_manifest(id: &str) -> RuntimeManifest {
+        RuntimeManifest {
+            manifest_version: 1,
+            id: id.to_string(),
+            built_at: "2026-08-17T22:08:33Z".to_string(),
+            runtime: RuntimeInfo {
+                name: "dev".to_string(),
+                version: id[..8.min(id.len())].to_string(),
+            },
+            extensions: vec![ManifestExtension {
+                name: "app".to_string(),
+                version: "0.1.0".to_string(),
+                image_id: Some("a1b2c3d4-e5f6-5789-abcd-ef0123456789".to_string()),
+                image_type: None,
+                sha256: None,
+                enabled: true,
+            }],
+            os_bundle: None,
+        }
+    }
+
+    /// Lay out `base` so `manifest` is the active runtime, optionally with its
+    /// image present in the pool.
+    fn make_active(base: &Path, manifest: &RuntimeManifest, with_image: bool) {
+        let runtime_dir = base.join("runtimes").join(&manifest.id);
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            runtime_dir.join("manifest.json"),
+            serde_json::to_string_pretty(manifest).unwrap(),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            format!("runtimes/{}", manifest.id),
+            base.join(crate::manifest::ACTIVE_LINK_NAME),
+        )
+        .unwrap();
+
+        if with_image {
+            let images = base.join(IMAGES_DIR_NAME);
+            fs::create_dir_all(&images).unwrap();
+            fs::write(
+                images.join("a1b2c3d4-e5f6-5789-abcd-ef0123456789.raw"),
+                b"image data",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn already_current_when_active_id_matches_and_images_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manifest = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
+        make_active(tmp.path(), &manifest, true);
+
+        assert!(is_already_current(&manifest, tmp.path()));
+    }
+
+    #[test]
+    fn not_already_current_when_a_different_runtime_is_active() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let active = already_current_manifest("9215192f-0000-0000-0000-000000000000");
+        make_active(tmp.path(), &active, true);
+
+        let incoming = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
+        assert!(!is_already_current(&incoming, tmp.path()));
+    }
+
+    /// The repair path: active id matches, but an image is gone from the pool
+    /// (hand-deleted, partial GC). Must fall through to normal staging rather
+    /// than reporting nothing to do.
+    #[test]
+    fn not_already_current_when_an_image_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manifest = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
+        make_active(tmp.path(), &manifest, false);
+
+        assert!(!is_already_current(&manifest, tmp.path()));
+    }
+
+    #[test]
+    fn not_already_current_when_nothing_is_active() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manifest = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
+
+        assert!(!is_already_current(&manifest, tmp.path()));
+    }
+
     fn test_keypair() -> ed25519_compact::KeyPair {
         let seed_bytes = [42u8; 32];
         ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::from(seed_bytes))
