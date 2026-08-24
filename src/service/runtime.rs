@@ -60,7 +60,6 @@ pub fn list_runtimes(config: &Config) -> Result<Vec<RuntimeEntry>, AvocadoError>
 
 // ── Streaming service functions ──────────────────────────────────────────────
 
-/// Create a streaming handle that sends a message, triggers reboot, and completes.
 /// A streaming handle that emits one message and completes. Used where there is
 /// no work to stream, so no extensions are touched.
 fn message_streaming(message: &str) -> StreamHandle {
@@ -73,6 +72,7 @@ fn message_streaming(message: &str) -> StreamHandle {
     (rx, handle)
 }
 
+/// A streaming handle that sends one message, triggers a reboot, and completes.
 fn reboot_streaming(message: &str) -> StreamHandle {
     let msg = message.to_string();
     let (tx, rx) = mpsc::sync_channel(4);
