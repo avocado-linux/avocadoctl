@@ -432,14 +432,58 @@ pub fn perform_update(
     Ok(outcome)
 }
 
-/// True when `manifest` names the runtime that is already active and every image
-/// it lists is present and matches its recorded hash.
+/// True when nothing about `manifest` requires work: the runtime side is
+/// already active and intact, and the running OS already satisfies the
+/// manifest's os_bundle (if any).
 fn is_already_current(manifest: &RuntimeManifest, base_dir: &Path) -> bool {
+    is_runtime_current(manifest, base_dir) && os_requirement_satisfied(manifest)
+}
+
+/// The active runtime matches `manifest` and every *extension* image it lists
+/// is present and hash-clean.
+///
+/// The os_bundle image is deliberately not required here. It is absent on
+/// purpose whenever the bundle download was skipped because the OS was already
+/// at the target build — requiring it would make this check permanently false
+/// for exactly those runtimes, re-staging and re-activating the same runtime on
+/// every nudge, which is the refresh loop this whole change exists to stop.
+/// Whether the OS side is satisfied is `os_requirement_satisfied`'s job, not a
+/// question the bundle file's presence can answer.
+fn is_runtime_current(manifest: &RuntimeManifest, base_dir: &Path) -> bool {
     let active_is_same = RuntimeManifest::load_active(base_dir)
         .map(|active| active.id == manifest.id)
         .unwrap_or(false);
+    if !active_is_same {
+        return false;
+    }
 
-    active_is_same && staging::validate_manifest_images(manifest, base_dir).is_ok()
+    let mut runtime_only = manifest.clone();
+    runtime_only.os_bundle = None;
+    staging::validate_manifest_images(&runtime_only, base_dir).is_ok()
+}
+
+/// Whether the running OS already satisfies the manifest's os_bundle, using the
+/// same os-release comparison `finish_update` uses to decide to skip applying
+/// it. A manifest with no bundle imposes no requirement.
+///
+/// Unverifiable — no `os_build_id`, unreadable os-release — counts as NOT
+/// satisfied, so the update falls through to `finish_update`, the path that
+/// knows how to apply a bundle. That asymmetry matters after an OS rollback:
+/// the active runtime id still matches, but the OS no longer does, and a
+/// re-nudge must repair the OS rather than report nothing to do.
+fn os_requirement_satisfied(manifest: &RuntimeManifest) -> bool {
+    let Some(ref os_bundle) = manifest.os_bundle else {
+        return true;
+    };
+
+    os_bundle.os_build_id.as_ref().is_some_and(|expected| {
+        crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
+            verify_type: "os-release".to_string(),
+            field: "AVOCADO_OS_BUILD_ID".to_string(),
+            expected: expected.clone(),
+        })
+        .unwrap_or(false)
+    })
 }
 
 /// Complete the update after the runtime has been staged.
@@ -1205,6 +1249,53 @@ mod tests {
         make_active(tmp.path(), &manifest, false);
 
         assert!(!is_already_current(&manifest, tmp.path()));
+    }
+
+    /// A bundle whose download was skipped (OS already at target build) leaves
+    /// no image in the pool on purpose. The runtime-side check must not read
+    /// that absence as damage, or the no-op guard is permanently false for
+    /// every runtime that ships an os_bundle.
+    #[test]
+    fn runtime_current_when_the_os_bundle_image_is_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut manifest = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
+        manifest.os_bundle = Some(crate::manifest::OsBundleRef {
+            image_id: "0s8undle-0000-0000-0000-000000000000".to_string(),
+            sha256: "deadbeef".to_string(),
+            os_build_id: Some("build-123".to_string()),
+            initramfs_build_id: None,
+        });
+        make_active(tmp.path(), &manifest, true);
+
+        assert!(is_runtime_current(&manifest, tmp.path()));
+    }
+
+    #[test]
+    fn no_os_bundle_imposes_no_os_requirement() {
+        let manifest = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
+        assert!(os_requirement_satisfied(&manifest));
+    }
+
+    /// An unverifiable bundle (no build id, or an os-release that does not
+    /// carry the field) must fall through to `finish_update` — after an OS
+    /// rollback that fall-through is what re-applies the bundle instead of
+    /// reporting nothing to do.
+    #[test]
+    fn os_requirement_not_satisfied_when_unverifiable() {
+        let mut manifest = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
+
+        manifest.os_bundle = Some(crate::manifest::OsBundleRef {
+            image_id: "0s8undle-0000-0000-0000-000000000000".to_string(),
+            sha256: "deadbeef".to_string(),
+            os_build_id: None,
+            initramfs_build_id: None,
+        });
+        assert!(!os_requirement_satisfied(&manifest));
+
+        // The host running the test suite is not an Avocado OS at this build.
+        manifest.os_bundle.as_mut().unwrap().os_build_id =
+            Some("a-build-id-no-real-os-release-carries".to_string());
+        assert!(!os_requirement_satisfied(&manifest));
     }
 
     #[test]
