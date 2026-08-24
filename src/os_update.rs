@@ -522,8 +522,10 @@ fn read_loader_device_part_uuid() -> Result<String, OsUpdateError> {
     // Skip the first 4 bytes (EFI variable attributes), rest is UTF-16LE
     let utf16_bytes = &raw[4..];
     let utf16: Vec<u16> = utf16_bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&chunk| u16::from_le_bytes(chunk))
         .collect();
 
     let uuid_str = String::from_utf16(&utf16)
