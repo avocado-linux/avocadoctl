@@ -438,6 +438,29 @@ fn require_utf8_path(path: &Path) -> Result<&str, SystemdError> {
         })
 }
 
+/// Resolve `loop_ref` to a loop device that is still attached, or None.
+///
+/// The by-loop-ref symlink is udev state and lags the kernel: `losetup -d`
+/// detaches the loop immediately, but the symlink survives until udev
+/// processes the change event. In that window the symlink still resolves -
+/// to a device with no backing file - so the symlink existing says nothing
+/// about a loop being attached. Treating it as attached makes the remount
+/// path hand systemd-dissect the dead device it just detached, and the
+/// remount fails. Attachment is what `/sys/block/<dev>/loop` existing
+/// means, so probe that instead.
+///
+/// `sysfs_block` is `/sys/block`, parameterized so the probe is testable
+/// without a real loop device.
+fn live_loop_device(loop_ref: &Path, sysfs_block: &Path) -> Option<PathBuf> {
+    let dev = fs::canonicalize(loop_ref).ok()?;
+    let name = dev.file_name()?;
+    if sysfs_block.join(name).join("loop/backing_file").exists() {
+        Some(dev)
+    } else {
+        None
+    }
+}
+
 /// Detach the persistent loop behind `mount_name`, if one is still attached.
 ///
 /// `systemd-dissect -U` unmounts the mount point but deliberately leaves a
@@ -455,11 +478,13 @@ fn detach_loop_ref(mount_name: &str, verbose: bool) -> Result<(), SystemdError> 
 
     let loop_ref = PathBuf::from(format!("/dev/disk/by-loop-ref/{mount_name}"));
 
-    // canonicalize resolves the ../../loopN symlink and tells us in one step
-    // whether anything is still there.
-    let dev = match fs::canonicalize(&loop_ref) {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
+    // A dangling symlink and a symlink to an already-detached device are both
+    // "nothing attached": `losetup -d` on the latter would error and misreport
+    // an unmount that already did its job. The replace path unmounts twice, so
+    // the second detach must be a genuine no-op.
+    let dev = match live_loop_device(&loop_ref, Path::new("/sys/block")) {
+        Some(d) => d,
+        None => return Ok(()),
     };
 
     let dev_str = require_utf8_path(&dev)?;
@@ -736,7 +761,13 @@ impl ImageAdaptor for RawAdaptor {
         }
 
         let loop_ref = PathBuf::from(format!("/dev/disk/by-loop-ref/{mount_name}"));
-        let present = loop_ref.exists();
+        // The symlink existing is not enough: the remount path detaches with
+        // `losetup -d` and mounts again immediately, and udev removes the
+        // symlink asynchronously. In that window `exists()` is true while the
+        // device is dead, the backing-file check can read nothing and reports
+        // unchanged, and the plan comes out Reuse - handing systemd-dissect
+        // the very device the caller just detached. Probe actual attachment.
+        let present = live_loop_device(&loop_ref, Path::new("/sys/block")).is_some();
         let plan = plan_mount(
             present,
             present && check_backing_file_changed(&loop_ref, raw_path, raw_exposed_bytes(raw_path)),
@@ -1418,6 +1449,52 @@ mod tests {
     #[test]
     fn loop_size_matches_an_image_that_is_not_a_whole_number_of_sectors() {
         assert!(loop_size_matches(8, 4097));
+    }
+
+    /// The udev-lag window that made the remount fail: `losetup -d` has
+    /// detached the loop, the by-loop-ref symlink still resolves to the
+    /// device node, but /sys/block/<dev>/loop is gone. Counting that as
+    /// present planned a Reuse of a dead device.
+    #[test]
+    fn a_symlink_to_a_detached_loop_is_not_a_live_loop() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dev = tmp.path().join("loop7");
+        fs::write(&dev, b"").unwrap();
+        let link = tmp.path().join("by-loop-ref-name");
+        symlink(&dev, &link).unwrap();
+        let sysfs = tmp.path().join("sys-block");
+        fs::create_dir_all(sysfs.join("loop7")).unwrap(); // no loop/backing_file
+
+        assert_eq!(live_loop_device(&link, &sysfs), None);
+    }
+
+    #[test]
+    fn a_dangling_loop_ref_symlink_is_not_a_live_loop() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("by-loop-ref-name");
+        symlink(tmp.path().join("loop7-gone"), &link).unwrap();
+
+        assert_eq!(live_loop_device(&link, tmp.path()), None);
+    }
+
+    #[test]
+    fn an_attached_loop_resolves_to_its_device() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dev = tmp.path().join("loop7");
+        fs::write(&dev, b"").unwrap();
+        let link = tmp.path().join("by-loop-ref-name");
+        symlink(&dev, &link).unwrap();
+        let sysfs = tmp.path().join("sys-block");
+        fs::create_dir_all(sysfs.join("loop7/loop")).unwrap();
+        fs::write(sysfs.join("loop7/loop/backing_file"), "/data/ext.raw\n").unwrap();
+
+        assert_eq!(
+            live_loop_device(&link, &sysfs),
+            Some(dev.canonicalize().unwrap())
+        );
     }
 
     #[test]
