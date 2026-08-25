@@ -114,6 +114,7 @@ mod tests {
             image_id: None,
             image_type: None,
             sha256: None,
+            root_hash: None,
             enabled,
         }
     }
