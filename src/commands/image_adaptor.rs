@@ -70,6 +70,28 @@ pub enum ImageTypeTag {
 // ImageAdaptor trait
 // ---------------------------------------------------------------------------
 
+/// Everything needed to mount an image through dm-verity.
+#[derive(Debug, Clone)]
+pub struct VeritySpec {
+    /// Hex-encoded root hash, from the runtime manifest.
+    pub root_hash: String,
+    /// Hash tree sidecar. Sits next to the image so the two travel together.
+    pub hash_device: PathBuf,
+}
+
+/// Whether this kernel can serve a dm-verity device.
+///
+/// A builtin `CONFIG_DM_VERITY=y` still appears under /sys/module, so this
+/// covers builtin and loaded-module alike. When it is built as a module and not
+/// yet loaded, try to load it before giving up.
+fn kernel_has_dm_verity() -> bool {
+    if Path::new("/sys/module/dm_verity").exists() {
+        return true;
+    }
+    let _ = ProcessCommand::new("modprobe").arg("dm-verity").output();
+    Path::new("/sys/module/dm_verity").exists()
+}
+
 pub trait ImageAdaptor {
     /// Mount the image and return the mount point path.
     /// If already mounted with correct backing, return existing mount point.
@@ -77,6 +99,7 @@ pub trait ImageAdaptor {
         &self,
         mount_name: &str,
         image_path: &Path,
+        verity: Option<&VeritySpec>,
         verbose: bool,
     ) -> Result<PathBuf, SystemdError>;
 
@@ -120,11 +143,12 @@ impl ImageAdaptor for ImageType {
         &self,
         mount_name: &str,
         image_path: &Path,
+        verity: Option<&VeritySpec>,
         verbose: bool,
     ) -> Result<PathBuf, SystemdError> {
         match self {
-            ImageType::Raw(a) => a.mount(mount_name, image_path, verbose),
-            ImageType::Kab(a) => a.mount(mount_name, image_path, verbose),
+            ImageType::Raw(a) => a.mount(mount_name, image_path, verity, verbose),
+            ImageType::Kab(a) => a.mount(mount_name, image_path, verity, verbose),
         }
     }
 
@@ -196,11 +220,13 @@ fn is_test_mode() -> bool {
 ///
 /// When `use_loop_ref` is true, systemd-dissect manages the loop device (raw path).
 /// When false, the caller has already set up a loop device (KAB path).
+#[allow(clippy::too_many_arguments)]
 fn mount_with_dissect(
     mount_name: &str,
     image_source: &Path,
     mount_point: &str,
     use_loop_ref: bool,
+    verity: Option<&VeritySpec>,
     verbose: bool,
 ) -> Result<(), SystemdError> {
     // Create mount point parent directory
@@ -221,6 +247,46 @@ fn mount_with_dissect(
     if use_loop_ref {
         args.push(format!("--loop-ref={mount_name}"));
     }
+    // dm-verity, when the manifest carries a root hash. Passing these is what
+    // turns the mount into a continuously-verified one: the kernel checks every
+    // block against the tree on every read, for as long as it stays mounted,
+    // instead of the image being hashed once before mount and trusted after.
+    if let Some(v) = verity {
+        if !is_test_mode() && !kernel_has_dm_verity() {
+            // Refuse rather than fall through to an unverified mount. A manifest
+            // that asked for verity and did not get it is the silent-downgrade
+            // failure this whole path exists to avoid.
+            return Err(SystemdError::ConfigurationError {
+                message: format!(
+                    "extension '{mount_name}' declares a dm-verity root hash but this \
+                     kernel has no dm-verity support (no /sys/module/dm_verity, and \
+                     modprobe dm-verity did not provide it). Refusing to mount it \
+                     unverified."
+                ),
+            });
+        }
+        if !v.hash_device.exists() {
+            return Err(SystemdError::ConfigurationError {
+                message: format!(
+                    "extension '{mount_name}' declares a dm-verity root hash but its \
+                     hash tree is missing at {}. Refusing to mount it unverified.",
+                    v.hash_device.display()
+                ),
+            });
+        }
+        args.push(format!("--root-hash={}", v.root_hash));
+        args.push(format!(
+            "--verity-data={}",
+            v.hash_device.to_str().unwrap_or("")
+        ));
+        if verbose {
+            println!(
+                "Mounting {mount_name} with dm-verity (root hash {}...)",
+                &v.root_hash[..v.root_hash.len().min(16)]
+            );
+        }
+    }
+
     args.extend_from_slice(&[
         "--mkdir".to_string(),
         "-r".to_string(),
@@ -746,6 +812,7 @@ impl ImageAdaptor for RawAdaptor {
         &self,
         mount_name: &str,
         raw_path: &Path,
+        verity: Option<&VeritySpec>,
         verbose: bool,
     ) -> Result<PathBuf, SystemdError> {
         let mount_point = extension_mount_point(mount_name);
@@ -756,7 +823,7 @@ impl ImageAdaptor for RawAdaptor {
 
         if is_test_mode() {
             // In test mode, call mock-systemd-dissect but skip actual mounting
-            mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
+            mount_with_dissect(mount_name, raw_path, &mount_point, true, verity, verbose)?;
             return Ok(PathBuf::from(mount_point));
         }
 
@@ -781,7 +848,7 @@ impl ImageAdaptor for RawAdaptor {
                 if verbose {
                     println!("Reusing attached loop for {mount_name}");
                 }
-                mount_with_dissect(mount_name, &loop_ref, &mount_point, false, verbose)?;
+                mount_with_dissect(mount_name, &loop_ref, &mount_point, false, verity, verbose)?;
             }
             // The image behind the loop is not the one we were asked to mount,
             // so the loop is worthless: drop it and attach a fresh one. A loop
@@ -797,10 +864,10 @@ impl ImageAdaptor for RawAdaptor {
                         "Warning: mount-time teardown retry could not release {mount_name}: {e}"
                     );
                 }
-                mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
+                mount_with_dissect(mount_name, raw_path, &mount_point, true, verity, verbose)?;
             }
             MountPlan::Fresh => {
-                mount_with_dissect(mount_name, raw_path, &mount_point, true, verbose)?;
+                mount_with_dissect(mount_name, raw_path, &mount_point, true, verity, verbose)?;
             }
         }
 
@@ -1145,6 +1212,7 @@ impl ImageAdaptor for KabAdaptor {
         &self,
         mount_name: &str,
         kab_path: &Path,
+        verity: Option<&VeritySpec>,
         verbose: bool,
     ) -> Result<PathBuf, SystemdError> {
         let mount_point = extension_mount_point(mount_name);
@@ -1200,7 +1268,9 @@ impl ImageAdaptor for KabAdaptor {
 
         // Phase 2: Mount via systemd-dissect (shared path)
         // No --loop-ref since we manage the outer loop ourselves
-        if let Err(e) = mount_with_dissect(mount_name, &loop_dev, &mount_point, false, verbose) {
+        if let Err(e) =
+            mount_with_dissect(mount_name, &loop_dev, &mount_point, false, verity, verbose)
+        {
             // Cleanup the offset loop on mount failure
             let _ = Self::detach_offset_loop(&loop_dev);
             Self::remove_loop_state(mount_name);

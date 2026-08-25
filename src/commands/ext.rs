@@ -469,6 +469,23 @@ pub(crate) fn merge_extensions_internal(
     // try to fall back to a previous runtime that is compatible.
     // Never refuse to merge extensions — always make a best effort.
     if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
+        // Refuse a manifest from the future before acting on any of it. Such a
+        // manifest may describe integrity guarantees this build cannot honor --
+        // a verity root hash it would not check, say -- and merging it anyway
+        // would deliver less protection than the manifest claims while looking
+        // like success. Failing here is the only honest option.
+        if !manifest.is_version_supported() {
+            let message = format!(
+                "runtime manifest version {} is newer than this avocadoctl supports \
+                 (max {}). Refusing to merge: it may declare protections this build \
+                 cannot enforce. Update avocadoctl.",
+                manifest.manifest_version,
+                crate::manifest::MAX_SUPPORTED_MANIFEST_VERSION,
+            );
+            output.error("Extension Merge", &message);
+            return Err(SystemdError::ConfigurationError { message });
+        }
+
         // Spot-check extension image integrity before merging
         let spot_bytes = config.get_spot_check_bytes();
         if let Err(e) = crate::staging::verify_spot_hashes(
@@ -2328,11 +2345,19 @@ fn scan_extensions_from_all_sources_with_verbosity(
                 } else {
                     // Image file extension — adaptor selected by manifest image_type
                     let adaptor = ImageType::from_manifest(&mext.image_type);
+                    // Only the manifest knows whether this image is verity-backed.
+                    let verity = mext.resolve_verity_path(base_path).map(|hash_device| {
+                        crate::commands::image_adaptor::VeritySpec {
+                            root_hash: mext.root_hash.clone().unwrap_or_default(),
+                            hash_device,
+                        }
+                    });
                     match analyze_image_extension(
                         &mext.name,
                         &Some(mext.version.clone()),
                         &raw_path,
                         &adaptor,
+                        verity.as_ref(),
                         verbose,
                     ) {
                         Ok(mut ext) => {
@@ -2427,6 +2452,7 @@ fn scan_extensions_from_all_sources_with_verbosity(
                                 &ext_version,
                                 &ext_path,
                                 &adaptor,
+                                None,
                                 verbose,
                             ) {
                                 if verbose {
@@ -2533,6 +2559,7 @@ fn scan_extensions_from_all_sources_with_verbosity(
                             &ext_version,
                             &path,
                             &adaptor,
+                            None,
                             verbose,
                         )?;
                         entry.insert(extension);
@@ -2660,6 +2687,7 @@ fn analyze_image_extension(
     version: &Option<String>,
     path: &Path,
     adaptor: &ImageType,
+    verity: Option<&crate::commands::image_adaptor::VeritySpec>,
     verbose: bool,
 ) -> Result<Extension, SystemdError> {
     if verbose {
@@ -2688,7 +2716,7 @@ fn analyze_image_extension(
             if let Err(e) = adaptor.unmount(&mount_name, verbose) {
                 eprintln!("Warning: pre-remount cleanup could not unmount {mount_name}: {e}");
             }
-            adaptor.mount(&mount_name, path, verbose)?
+            adaptor.mount(&mount_name, path, verity, verbose)?
         } else {
             if verbose {
                 println!("Using existing mount for {mount_name}");
@@ -2696,7 +2724,7 @@ fn analyze_image_extension(
             PathBuf::from(extension_mount_point(&mount_name))
         }
     } else {
-        adaptor.mount(&mount_name, path, verbose)?
+        adaptor.mount(&mount_name, path, verity, verbose)?
     };
 
     let (sysext_enabled, confext_enabled, _detected_version) =

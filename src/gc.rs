@@ -94,6 +94,16 @@ fn cleanup_orphaned_images(base_dir: &Path, runtimes: &[(RuntimeManifest, bool)]
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 referenced.insert(filename.to_string());
             }
+            // The dm-verity hash tree is a sibling file, not something
+            // resolve_path returns. Without this it reads as an orphan and gets
+            // collected, leaving an image that declares a root hash whose tree
+            // is gone -- which now refuses to mount rather than mounting
+            // unverified, so losing it takes the extension down.
+            if let Some(vpath) = ext.resolve_verity_path(base_dir) {
+                if let Some(filename) = vpath.file_name().and_then(|n| n.to_str()) {
+                    referenced.insert(filename.to_string());
+                }
+            }
         }
         if let Some(ref os_bundle) = m.os_bundle {
             referenced.insert(format!("{}.raw", os_bundle.image_id));
@@ -137,6 +147,7 @@ mod tests {
                 image_id: Some(image_id.to_string()),
                 image_type: None,
                 sha256: None,
+                root_hash: None,
                 enabled: true,
             }],
             os_bundle: None,
@@ -175,6 +186,38 @@ mod tests {
             serde_json::to_string_pretty(&pending).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn gc_keeps_the_verity_sidecar_of_a_referenced_image() {
+        // The hash tree is a sibling file that resolve_path never returns, so
+        // it looks like an orphan. Collecting it would leave an image that
+        // declares a root hash with no tree -- which now refuses to mount.
+        let tmp = TempDir::new().unwrap();
+        let mut m = make_manifest("rt-1", "2026-01-01T00:00:00Z", "img-1");
+        m.extensions[0].root_hash = Some("beef".to_string());
+        write_manifest(tmp.path(), &m);
+        write_image(tmp.path(), "img-1.raw");
+        write_image(tmp.path(), "img-1.verity");
+        write_image(tmp.path(), "orphan.verity");
+
+        let removed = cleanup_orphaned_images(tmp.path(), &[(m, true)]);
+
+        assert!(
+            !removed.contains(&"img-1.verity".to_string()),
+            "the referenced image's hash tree must survive GC, removed: {removed:?}"
+        );
+        assert!(
+            tmp.path()
+                .join(IMAGES_DIR_NAME)
+                .join("img-1.verity")
+                .exists(),
+            "hash tree should still be on disk"
+        );
+        assert!(
+            removed.contains(&"orphan.verity".to_string()),
+            "an unreferenced hash tree is still garbage, removed: {removed:?}"
+        );
     }
 
     #[test]

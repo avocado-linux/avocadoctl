@@ -9,6 +9,14 @@ pub const MANIFEST_FILENAME: &str = "manifest.json";
 pub const IMAGES_DIR_NAME: &str = "images";
 pub const METADATA_FILENAME: &str = "metadata.json";
 
+/// Highest `manifest_version` this build understands.
+///
+/// A manifest from the future may describe integrity guarantees we cannot
+/// honor — a verity root hash we would not check, say — so merging it would
+/// silently deliver less protection than the manifest claims. Refuse instead.
+/// Bumping this is how a future format becomes acceptable.
+pub const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 2;
+
 /// Fixed namespace UUID for generating content-addressable image IDs.
 /// Must match the constant used in avocado-cli.
 pub const AVOCADO_IMAGE_NAMESPACE: uuid::Uuid = uuid::uuid!("7488fa35-6390-425b-bbbf-b156cfe1eed2");
@@ -53,6 +61,15 @@ pub struct ManifestExtension {
     /// SHA256 hash of the extension image for integrity verification
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// dm-verity root hash, hex-encoded. When present the image is mounted
+    /// through a verity device and every block is checked on every read for as
+    /// long as it stays mounted, rather than hashed once before mount.
+    ///
+    /// The hash tree lives in a sidecar next to the image — see
+    /// [`ManifestExtension::resolve_verity_path`]. Absent means no verity, which
+    /// is every manifest written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_hash: Option<String>,
     /// Build-time default activation state. Absent/true = auto-activated
     /// at refresh; false = present-but-inactive (user must opt in via
     /// `avocadoctl ext enable`). Skipped from JSON when true to keep
@@ -78,6 +95,22 @@ impl ManifestExtension {
         self.image_type.as_deref() == Some("kab")
     }
 
+    /// Returns true if this extension carries a dm-verity root hash.
+    pub fn has_verity(&self) -> bool {
+        self.root_hash.as_deref().is_some_and(|h| !h.is_empty())
+    }
+
+    /// Resolve the on-disk path of the dm-verity hash tree sidecar, if this
+    /// extension has one. Derived from the image path the same way the image
+    /// extension is, so the two always travel together.
+    pub fn resolve_verity_path(&self, base_dir: &Path) -> Option<PathBuf> {
+        if !self.has_verity() {
+            return None;
+        }
+        let image = self.resolve_path(base_dir);
+        Some(image.with_extension("verity"))
+    }
+
     /// Resolve the on-disk path for this extension image.
     pub fn resolve_path(&self, base_dir: &Path) -> PathBuf {
         let ext = if self.is_kab() { "kab" } else { "raw" };
@@ -92,6 +125,11 @@ impl ManifestExtension {
 }
 
 impl RuntimeManifest {
+    /// Whether this build understands the manifest's format version.
+    pub fn is_version_supported(&self) -> bool {
+        self.manifest_version <= MAX_SUPPORTED_MANIFEST_VERSION
+    }
+
     /// Resolve the on-disk path for the OS bundle image, if present.
     pub fn resolve_os_bundle_path(&self, base_dir: &Path) -> Option<PathBuf> {
         self.os_bundle.as_ref().map(|b| {
@@ -172,6 +210,85 @@ mod tests {
     use std::os::unix::fs as unix_fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn manifest_without_root_hash_has_no_verity() {
+        // Every manifest written before the field existed must keep working and
+        // must not be mistaken for a verity-backed one.
+        let json = r#"{
+            "manifest_version": 1,
+            "id": "r1",
+            "built_at": "2026-01-01T00:00:00Z",
+            "runtime": { "name": "dev", "version": "0.1.0" },
+            "extensions": [
+                { "name": "app", "version": "0.1.0", "image_id": "abc", "sha256": "de" }
+            ]
+        }"#;
+        let parsed: RuntimeManifest = serde_json::from_str(json).unwrap();
+        let ext = &parsed.extensions[0];
+        assert_eq!(ext.root_hash, None);
+        assert!(!ext.has_verity());
+        assert_eq!(ext.resolve_verity_path(Path::new("/var/lib/avocado")), None);
+    }
+
+    #[test]
+    fn root_hash_round_trips_and_derives_a_sibling_tree_path() {
+        let json = r#"{
+            "manifest_version": 2,
+            "id": "r1",
+            "built_at": "2026-01-01T00:00:00Z",
+            "runtime": { "name": "dev", "version": "0.1.0" },
+            "extensions": [
+                { "name": "app", "version": "0.1.0", "image_id": "abc",
+                  "sha256": "de", "root_hash": "beef" }
+            ]
+        }"#;
+        let parsed: RuntimeManifest = serde_json::from_str(json).unwrap();
+        let ext = &parsed.extensions[0];
+        assert!(ext.has_verity());
+        assert_eq!(ext.root_hash.as_deref(), Some("beef"));
+        assert_eq!(
+            ext.resolve_verity_path(Path::new("/var/lib/avocado"))
+                .unwrap(),
+            Path::new("/var/lib/avocado/images/abc.verity")
+        );
+        // The image path itself must be untouched by the sidecar derivation.
+        assert_eq!(
+            ext.resolve_path(Path::new("/var/lib/avocado")),
+            Path::new("/var/lib/avocado/images/abc.raw")
+        );
+    }
+
+    #[test]
+    fn an_empty_root_hash_is_not_verity() {
+        // Guards against a producer emitting "" and us building a VeritySpec
+        // with no hash, which systemd-dissect would reject far from the cause.
+        let ext = ManifestExtension {
+            name: "app".to_string(),
+            version: "0.1.0".to_string(),
+            image_id: Some("abc".to_string()),
+            image_type: None,
+            sha256: None,
+            root_hash: Some(String::new()),
+            enabled: true,
+        };
+        assert!(!ext.has_verity());
+        assert_eq!(ext.resolve_verity_path(Path::new("/var/lib/avocado")), None);
+    }
+
+    #[test]
+    fn manifest_version_ceiling_accepts_current_and_refuses_future() {
+        let mut m = make_manifest("r1", "dev", "0.1.0", "2026-01-01T00:00:00Z");
+        for v in 1..=MAX_SUPPORTED_MANIFEST_VERSION {
+            m.manifest_version = v;
+            assert!(m.is_version_supported(), "version {v} should be supported");
+        }
+        m.manifest_version = MAX_SUPPORTED_MANIFEST_VERSION + 1;
+        assert!(
+            !m.is_version_supported(),
+            "a manifest newer than this build must be refused, not merged"
+        );
+    }
+
     fn write_manifest(dir: &Path, manifest: &RuntimeManifest) {
         fs::create_dir_all(dir).unwrap();
         let json = serde_json::to_string_pretty(manifest).unwrap();
@@ -193,6 +310,7 @@ mod tests {
                 image_id: Some("a1b2c3d4-e5f6-5789-abcd-ef0123456789".to_string()),
                 image_type: None,
                 sha256: None,
+                root_hash: None,
                 enabled: true,
             }],
             os_bundle: None,
@@ -321,6 +439,7 @@ mod tests {
             image_id: Some("a1b2c3d4-e5f6-5789-abcd-ef0123456789".to_string()),
             image_type: None,
             sha256: None,
+            root_hash: None,
             enabled: true,
         };
         let base = Path::new("/var/lib/avocado");
@@ -434,6 +553,7 @@ mod tests {
             image_id: None,
             image_type: None,
             sha256: None,
+            root_hash: None,
             enabled: true,
         };
         let base = Path::new("/var/lib/avocado");
@@ -449,6 +569,7 @@ mod tests {
             image_id: None,
             image_type: None,
             sha256: None,
+            root_hash: None,
             enabled: true,
         };
         assert!(!raw_ext.is_kab());
@@ -459,6 +580,7 @@ mod tests {
             image_id: None,
             image_type: Some("kab".to_string()),
             sha256: None,
+            root_hash: None,
             enabled: true,
         };
         assert!(kab_ext.is_kab());
@@ -472,6 +594,7 @@ mod tests {
             image_id: Some("a1b2c3d4-e5f6-5789-abcd-ef0123456789".to_string()),
             image_type: Some("kab".to_string()),
             sha256: None,
+            root_hash: None,
             enabled: true,
         };
         let base = Path::new("/var/lib/avocado");
@@ -490,6 +613,7 @@ mod tests {
             image_id: None,
             image_type: Some("kab".to_string()),
             sha256: None,
+            root_hash: None,
             enabled: true,
         };
         let base = Path::new("/var/lib/avocado");
