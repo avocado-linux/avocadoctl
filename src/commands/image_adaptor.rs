@@ -1475,8 +1475,6 @@ pub fn unmount_all_persistent_mounts() -> Result<(), SystemdError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn a_hex_root_hash_is_accepted() {
         assert!(require_hex_root_hash("app", &"ab".repeat(32)).is_ok());
