@@ -466,8 +466,13 @@ pub(crate) fn merge_extensions_internal(
 
     // Verify rootfs matches what the active runtime expects.
     // If the runtime's os_bundle.os_build_id doesn't match the running rootfs,
-    // try to fall back to a previous runtime that is compatible.
-    // Never refuse to merge extensions — always make a best effort.
+    // try to fall back to a previous runtime that is compatible. An os_build_id
+    // mismatch is best-effort: fall back rather than refuse.
+    //
+    // Integrity is the exception. A failed image hash check, or a manifest whose
+    // format this build cannot honor, both refuse the merge outright — merging
+    // anyway would deliver less protection than the manifest claims while
+    // looking like success.
     if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
         // Refuse a manifest from the future before acting on any of it. Such a
         // manifest may describe integrity guarantees this build cannot honor --
