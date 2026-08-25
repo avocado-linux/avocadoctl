@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Error type (moved from ext.rs)
@@ -85,11 +86,34 @@ pub struct VeritySpec {
 /// covers builtin and loaded-module alike. When it is built as a module and not
 /// yet loaded, try to load it before giving up.
 fn kernel_has_dm_verity() -> bool {
-    if Path::new("/sys/module/dm_verity").exists() {
-        return true;
+    // Cached for the process: a refresh mounting several verity-backed
+    // extensions would otherwise re-run modprobe per mount, which is slow and
+    // noisy in the log for no new information.
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        if Path::new("/sys/module/dm_verity").exists() {
+            return true;
+        }
+        let _ = ProcessCommand::new("modprobe").arg("dm-verity").output();
+        Path::new("/sys/module/dm_verity").exists()
+    })
+}
+
+/// Reject a root hash that is not hex.
+///
+/// Two reasons beyond rejecting nonsense early: systemd-dissect would fail on it
+/// anyway but far from the cause, and knowing the hash is ASCII is what makes it
+/// safe to take a byte-slice prefix of it when logging.
+fn require_hex_root_hash(mount_name: &str, root_hash: &str) -> Result<(), SystemdError> {
+    if !root_hash.len().is_multiple_of(2) || !root_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(SystemdError::ConfigurationError {
+            message: format!(
+                "extension '{mount_name}' has a dm-verity root hash that is not \
+                 valid hex. Refusing to mount it unverified."
+            ),
+        });
     }
-    let _ = ProcessCommand::new("modprobe").arg("dm-verity").output();
-    Path::new("/sys/module/dm_verity").exists()
+    Ok(())
 }
 
 pub trait ImageAdaptor {
@@ -274,12 +298,14 @@ fn mount_with_dissect(
                 ),
             });
         }
+        require_hex_root_hash(mount_name, &v.root_hash)?;
         args.push(format!("--root-hash={}", v.root_hash));
         args.push(format!(
             "--verity-data={}",
-            v.hash_device.to_str().unwrap_or("")
+            require_utf8_path(&v.hash_device)?
         ));
         if verbose {
+            // Safe to slice by byte: require_hex_root_hash proved it is ASCII.
             println!(
                 "Mounting {mount_name} with dm-verity (root hash {}...)",
                 &v.root_hash[..v.root_hash.len().min(16)]
@@ -1449,6 +1475,33 @@ pub fn unmount_all_persistent_mounts() -> Result<(), SystemdError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hex_root_hash_is_accepted() {
+        assert!(require_hex_root_hash("app", &"ab".repeat(32)).is_ok());
+        assert!(require_hex_root_hash("app", "ABCDEF0123456789").is_ok());
+    }
+
+    #[test]
+    fn a_non_hex_root_hash_is_refused_rather_than_passed_through() {
+        // systemd-dissect would reject these too, but far from the cause.
+        for bad in ["zz", "ab c", "0x1234", "abc"] {
+            assert!(
+                require_hex_root_hash("app", bad).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_multibyte_root_hash_is_refused_and_does_not_panic() {
+        // The verbose log takes a byte-slice prefix of the hash. Validating hex
+        // first is what keeps that from slicing a multi-byte char in half.
+        let multibyte = "é".repeat(40);
+        assert!(require_hex_root_hash("app", &multibyte).is_err());
+    }
+
     use super::*;
     use crate::commands::test_env::ENV_VAR_MUTEX;
 
