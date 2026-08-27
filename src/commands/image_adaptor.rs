@@ -380,19 +380,19 @@ fn mount_with_dissect(
                     v.hash_device.display()
                 ),
             });
-            if !is_test_mode() && !kernel_has_dm_verity() {
-                // Refuse rather than fall through to an unverified mount. A manifest
-                // that asked for verity and did not get it is the silent-downgrade
-                // failure this whole path exists to avoid.
-                return Err(SystemdError::ConfigurationError {
-                    message: format!(
-                        "extension '{mount_name}' declares a dm-verity root hash but this \
+        }
+        // Refuse rather than fall through to an unverified mount. A manifest
+        // that asked for verity and did not get it is the silent-downgrade
+        // failure this whole path exists to avoid.
+        if !is_test_mode() && !kernel_has_dm_verity() {
+            return Err(SystemdError::ConfigurationError {
+                message: format!(
+                    "extension '{mount_name}' declares a dm-verity root hash but this \
                      kernel has no dm-verity support (no /sys/module/dm_verity, and \
                      modprobe dm-verity did not provide it). Refusing to mount it \
                      unverified."
-                    ),
-                });
-            }
+                ),
+            });
         }
     }
 
