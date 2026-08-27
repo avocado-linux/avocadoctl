@@ -22,6 +22,14 @@ while [[ $# -gt 0 ]]; do
             LOOP_REF="${1#*=}"
             shift
             ;;
+        --root-hash=*)
+            ROOT_HASH="${1#*=}"
+            shift
+            ;;
+        --verity-data=*)
+            VERITY_DATA="${1#*=}"
+            shift
+            ;;
         --mkdir)
             MKDIR="1"
             shift

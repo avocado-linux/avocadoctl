@@ -354,6 +354,18 @@ pub fn perform_update(
     let new_manifest: RuntimeManifest = serde_json::from_str(&manifest_content)
         .map_err(|e| UpdateError::StagingFailed(format!("Invalid manifest.json: {e}")))?;
 
+    // Refuse a format this build cannot honor here, before anything is
+    // installed or activated. Discovering it at merge time would leave the new
+    // runtime active with every extension unmerged.
+    if !new_manifest.is_version_supported() {
+        return Err(UpdateError::StagingFailed(format!(
+            "runtime manifest version {} is newer than this avocadoctl supports (max {}). \
+             Update avocadoctl.",
+            new_manifest.manifest_version,
+            crate::manifest::MAX_SUPPORTED_MANIFEST_VERSION
+        )));
+    }
+
     let short_id = &new_manifest.id[..8.min(new_manifest.id.len())];
     println!(
         "  New runtime: {} {} ({short_id})",

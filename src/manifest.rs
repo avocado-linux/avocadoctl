@@ -11,10 +11,13 @@ pub const METADATA_FILENAME: &str = "metadata.json";
 
 /// Highest `manifest_version` this build understands.
 ///
-/// A manifest from the future may describe integrity guarantees we cannot
-/// honor — a verity root hash we would not check, say — so merging it would
-/// silently deliver less protection than the manifest claims. Refuse instead.
-/// Bumping this is how a future format becomes acceptable.
+/// Contract with the producer (avocado-cli): a version bump means the manifest
+/// carries something an older reader would silently get wrong — a new image
+/// type it has no adaptor for, an integrity mechanism it does not check. Fields
+/// this build already honors on existing versions are NOT a bump: `root_hash`
+/// is an optional v2 field, and a producer that bumped to 3 just for adding it
+/// would be refused by the very binaries built to enforce it. Bumping this
+/// constant is how a future format becomes acceptable.
 pub const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 2;
 
 /// Fixed namespace UUID for generating content-addressable image IDs.
@@ -111,6 +114,20 @@ impl ManifestExtension {
         Some(image.with_extension("verity"))
     }
 
+    /// Root hash and sidecar path together, or None when the extension is not
+    /// verity-backed. The one place that pairs the two, so callers cannot end up
+    /// with a hash and no tree or a tree and no hash.
+    pub fn verity_spec(
+        &self,
+        base_dir: &Path,
+    ) -> Option<crate::commands::image_adaptor::VeritySpec> {
+        let hash_device = self.resolve_verity_path(base_dir)?;
+        Some(crate::commands::image_adaptor::VeritySpec {
+            root_hash: self.root_hash.clone()?,
+            hash_device,
+        })
+    }
+
     /// Resolve the on-disk path for this extension image.
     pub fn resolve_path(&self, base_dir: &Path) -> PathBuf {
         let ext = if self.is_kab() { "kab" } else { "raw" };
@@ -128,6 +145,38 @@ impl RuntimeManifest {
     /// Whether this build understands the manifest's format version.
     pub fn is_version_supported(&self) -> bool {
         self.manifest_version <= MAX_SUPPORTED_MANIFEST_VERSION
+    }
+
+    /// Everything that must hold before this manifest is activated or merged:
+    /// a format version this build understands, and every verity-backed
+    /// extension's hash tree present next to its image. Cheap on purpose (no
+    /// hashing) so it can run before an unmerge or an activation, where a
+    /// failure discovered later would leave the device on a runtime it cannot
+    /// use.
+    pub fn preflight(&self, base_dir: &Path) -> Result<(), String> {
+        if !self.is_version_supported() {
+            return Err(format!(
+                "runtime manifest version {} is newer than this avocadoctl supports \
+                 (max {MAX_SUPPORTED_MANIFEST_VERSION}). It may declare protections \
+                 this build cannot enforce. Update avocadoctl.",
+                self.manifest_version
+            ));
+        }
+        let missing: Vec<String> = self
+            .extensions
+            .iter()
+            .filter_map(|e| e.resolve_verity_path(base_dir))
+            .filter(|p| !p.exists())
+            .map(|p| p.display().to_string())
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "dm-verity hash tree missing for {} extension(s):\n  {}",
+                missing.len(),
+                missing.join("\n  ")
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve the on-disk path for the OS bundle image, if present.
@@ -154,6 +203,29 @@ impl RuntimeManifest {
             return None;
         }
         Self::load_from(&active_path)
+    }
+
+    /// Like `load_active`, but an `active` link that is present and does not
+    /// parse is an error rather than "no manifest". A future format that changed
+    /// a field's shape would otherwise collapse into legacy discovery, which is
+    /// exactly the case the version ceiling exists to refuse. Legacy devices
+    /// have no `active` link and still get `Ok(None)`.
+    pub fn load_active_checked(base_dir: &Path) -> Result<Option<Self>, String> {
+        let active_path = base_dir.join(ACTIVE_LINK_NAME);
+        if !active_path.exists() {
+            return Ok(None);
+        }
+        let manifest_path = active_path.join(MANIFEST_FILENAME);
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+        serde_json::from_str(&content).map(Some).map_err(|e| {
+            format!(
+                "active runtime manifest {} does not parse ({e}). Refusing to fall \
+                 back to legacy extension discovery; it may be a format this \
+                 avocadoctl does not understand. Update avocadoctl.",
+                manifest_path.display()
+            )
+        })
     }
 
     /// Resolve the UUID directory name that the `active` symlink points to.
@@ -239,13 +311,17 @@ mod tests {
             "runtime": { "name": "dev", "version": "0.1.0" },
             "extensions": [
                 { "name": "app", "version": "0.1.0", "image_id": "abc",
-                  "sha256": "de", "root_hash": "beef" }
+                  "sha256": "de",
+                  "root_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
             ]
         }"#;
         let parsed: RuntimeManifest = serde_json::from_str(json).unwrap();
         let ext = &parsed.extensions[0];
         assert!(ext.has_verity());
-        assert_eq!(ext.root_hash.as_deref(), Some("beef"));
+        assert_eq!(
+            ext.root_hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(
             ext.resolve_verity_path(Path::new("/var/lib/avocado"))
                 .unwrap(),
