@@ -82,16 +82,18 @@ pub struct VeritySpec {
 
 /// Whether this kernel can serve a dm-verity device.
 ///
-/// A builtin `CONFIG_DM_VERITY=y` still appears under /sys/module, so this
-/// covers builtin and loaded-module alike. When it is built as a module and not
-/// yet loaded, try to load it before giving up.
-fn kernel_has_dm_verity() -> bool {
+/// /sys/module/dm_verity exists for a loaded module, and for a builtin
+/// `CONFIG_DM_VERITY=y` only because dm-verity exports a module parameter
+/// (`prefetch_cluster`); a builtin with no parameters gets no /sys/module entry.
+/// So a builtin is also accepted when modules.builtin lists it, which does not
+/// depend on that parameter surviving. A module not yet loaded is loaded first.
+pub(crate) fn kernel_has_dm_verity() -> bool {
     // Cached for the process: a refresh mounting several verity-backed
     // extensions would otherwise re-run modprobe per mount, which is slow and
     // noisy in the log for no new information.
     static PROBE: OnceLock<bool> = OnceLock::new();
     *PROBE.get_or_init(|| {
-        if Path::new("/sys/module/dm_verity").exists() {
+        if Path::new("/sys/module/dm_verity").exists() || dm_verity_is_builtin() {
             return true;
         }
         let _ = ProcessCommand::new("modprobe").arg("dm-verity").output();
@@ -99,17 +101,82 @@ fn kernel_has_dm_verity() -> bool {
     })
 }
 
-/// Reject a root hash that is not hex.
+fn dm_verity_is_builtin() -> bool {
+    let release = match fs::read_to_string("/proc/sys/kernel/osrelease") {
+        Ok(r) => r.trim().to_string(),
+        Err(_) => return false,
+    };
+    fs::read_to_string(format!("/lib/modules/{release}/modules.builtin"))
+        .map(|s| s.lines().any(|l| l.ends_with("/dm-verity.ko")))
+        .unwrap_or(false)
+}
+
+/// The device systemd-dissect mounts a verity image from. dissect-image.c names
+/// the dm-verity device after the root hash, so an existing mount's source in
+/// mountinfo says whether it is verified and against which hash.
+fn expected_verity_source(root_hash: &str) -> String {
+    format!("/dev/mapper/{root_hash}-verity")
+}
+
+/// Source device of the filesystem mounted at `mount_point`, from
+/// /proc/self/mountinfo (field 10). None when nothing is mounted there.
+fn mount_source(mount_point: &str) -> Option<String> {
+    let info = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    info.lines()
+        .filter_map(|line| {
+            let (pre, post) = line.split_once(" - ")?;
+            let mp = pre.split_whitespace().nth(4)?;
+            if mp != mount_point {
+                return None;
+            }
+            post.split_whitespace().nth(1).map(str::to_string)
+        })
+        .next_back()
+}
+
+/// Whether an existing mount's verity state disagrees with what the manifest
+/// now asks for: unverified but a root hash is requested, verified against a
+/// different hash, or verified when verity was dropped. Pure so it can be
+/// tested; `verity_state_changed` feeds it the live mount source.
+fn verity_source_matches(source: &str, verity: Option<&VeritySpec>) -> bool {
+    match verity {
+        Some(v) => source == expected_verity_source(&v.root_hash),
+        None => !source.ends_with("-verity"),
+    }
+}
+
+/// True when the mount at `mount_name` must be redone for its verity state to
+/// match the manifest. The backing-file check in `needs_remount` cannot see
+/// this: a verity rollout leaves the image bytes (and so the image_id) unchanged
+/// and only adds a root hash and a sidecar.
+pub fn verity_state_changed(mount_name: &str, verity: Option<&VeritySpec>) -> bool {
+    if is_test_mode() {
+        return false;
+    }
+    match mount_source(&extension_mount_point(mount_name)) {
+        Some(source) => !verity_source_matches(&source, verity),
+        None => false,
+    }
+}
+
+/// Reject a root hash that is not hex, or too short to be one.
 ///
-/// Two reasons beyond rejecting nonsense early: systemd-dissect would fail on it
-/// anyway but far from the cause, and knowing the hash is ASCII is what makes it
+/// systemd-dissect refuses anything under 128 bits ("Root hash must be at least
+/// 128-bit long") and a sha256 tree is 64 hex chars, so a truncated hash would
+/// fail far from the cause. Knowing the hash is ASCII is also what makes it
 /// safe to take a byte-slice prefix of it when logging.
+const MIN_ROOT_HASH_HEX: usize = 32;
+
 fn require_hex_root_hash(mount_name: &str, root_hash: &str) -> Result<(), SystemdError> {
-    if !root_hash.len().is_multiple_of(2) || !root_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+    if root_hash.len() < MIN_ROOT_HASH_HEX
+        || !root_hash.len().is_multiple_of(2)
+        || !root_hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
         return Err(SystemdError::ConfigurationError {
             message: format!(
                 "extension '{mount_name}' has a dm-verity root hash that is not \
-                 valid hex. Refusing to mount it unverified."
+                 valid hex of at least {MIN_ROOT_HASH_HEX} characters. Refusing to \
+                 mount it unverified."
             ),
         });
     }
@@ -239,6 +306,42 @@ fn is_test_mode() -> bool {
     std::env::var("AVOCADO_TEST_MODE").is_ok()
 }
 
+/// The systemd-dissect argv for mounting `image_source` at `mount_point`.
+///
+/// Pure: validates the root hash and sidecar path but touches nothing, so the
+/// exact flags handed to dissect can be asserted in tests. `--root-hash` and
+/// `--verity-data` are what turn the mount into a continuously-verified one:
+/// the kernel checks every block against the tree on every read for as long as
+/// it stays mounted, instead of the image being hashed once and trusted after.
+fn dissect_args(
+    mount_name: &str,
+    image_source: &Path,
+    mount_point: &str,
+    use_loop_ref: bool,
+    verity: Option<&VeritySpec>,
+) -> Result<Vec<String>, SystemdError> {
+    let mut args: Vec<String> = Vec::new();
+    if use_loop_ref {
+        args.push(format!("--loop-ref={mount_name}"));
+    }
+    if let Some(v) = verity {
+        require_hex_root_hash(mount_name, &v.root_hash)?;
+        args.push(format!("--root-hash={}", v.root_hash));
+        args.push(format!(
+            "--verity-data={}",
+            require_utf8_path(&v.hash_device)?
+        ));
+    }
+    args.extend_from_slice(&[
+        "--mkdir".to_string(),
+        "-r".to_string(),
+        "-M".to_string(),
+        require_utf8_path(image_source)?.to_string(),
+        mount_point.to_string(),
+    ]);
+    Ok(args)
+}
+
 /// Mount an image (file or block device) using systemd-dissect.
 /// Shared final mount step used by both RawAdaptor and KabAdaptor.
 ///
@@ -267,28 +370,8 @@ fn mount_with_dissect(
 
     let cmd = dissect_command();
 
-    let mut args: Vec<String> = Vec::new();
-    if use_loop_ref {
-        args.push(format!("--loop-ref={mount_name}"));
-    }
-    // dm-verity, when the manifest carries a root hash. Passing these is what
-    // turns the mount into a continuously-verified one: the kernel checks every
-    // block against the tree on every read, for as long as it stays mounted,
-    // instead of the image being hashed once before mount and trusted after.
     if let Some(v) = verity {
-        if !is_test_mode() && !kernel_has_dm_verity() {
-            // Refuse rather than fall through to an unverified mount. A manifest
-            // that asked for verity and did not get it is the silent-downgrade
-            // failure this whole path exists to avoid.
-            return Err(SystemdError::ConfigurationError {
-                message: format!(
-                    "extension '{mount_name}' declares a dm-verity root hash but this \
-                     kernel has no dm-verity support (no /sys/module/dm_verity, and \
-                     modprobe dm-verity did not provide it). Refusing to mount it \
-                     unverified."
-                ),
-            });
-        }
+        // Sidecar first: it is the cheaper check and the more actionable message.
         if !v.hash_device.exists() {
             return Err(SystemdError::ConfigurationError {
                 message: format!(
@@ -297,29 +380,32 @@ fn mount_with_dissect(
                     v.hash_device.display()
                 ),
             });
+            if !is_test_mode() && !kernel_has_dm_verity() {
+                // Refuse rather than fall through to an unverified mount. A manifest
+                // that asked for verity and did not get it is the silent-downgrade
+                // failure this whole path exists to avoid.
+                return Err(SystemdError::ConfigurationError {
+                    message: format!(
+                        "extension '{mount_name}' declares a dm-verity root hash but this \
+                     kernel has no dm-verity support (no /sys/module/dm_verity, and \
+                     modprobe dm-verity did not provide it). Refusing to mount it \
+                     unverified."
+                    ),
+                });
+            }
         }
-        require_hex_root_hash(mount_name, &v.root_hash)?;
-        args.push(format!("--root-hash={}", v.root_hash));
-        args.push(format!(
-            "--verity-data={}",
-            require_utf8_path(&v.hash_device)?
-        ));
+    }
+
+    let args = dissect_args(mount_name, image_source, mount_point, use_loop_ref, verity)?;
+    if let Some(v) = verity {
         if verbose {
-            // Safe to slice by byte: require_hex_root_hash proved it is ASCII.
+            // Safe to slice by byte: dissect_args proved it is ASCII.
             println!(
                 "Mounting {mount_name} with dm-verity (root hash {}...)",
                 &v.root_hash[..v.root_hash.len().min(16)]
             );
         }
     }
-
-    args.extend_from_slice(&[
-        "--mkdir".to_string(),
-        "-r".to_string(),
-        "-M".to_string(),
-        image_source.to_str().unwrap_or("").to_string(),
-        mount_point.to_string(),
-    ]);
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -1478,7 +1564,110 @@ mod tests {
     #[test]
     fn a_hex_root_hash_is_accepted() {
         assert!(require_hex_root_hash("app", &"ab".repeat(32)).is_ok());
-        assert!(require_hex_root_hash("app", "ABCDEF0123456789").is_ok());
+        assert!(require_hex_root_hash("app", &"ABCDEF0123456789".repeat(2)).is_ok());
+    }
+
+    #[test]
+    fn a_root_hash_under_128_bits_is_refused() {
+        assert!(require_hex_root_hash("app", "beef").is_err());
+        assert!(require_hex_root_hash("app", &"ab".repeat(15)).is_err());
+        assert!(require_hex_root_hash("app", &"ab".repeat(16)).is_ok());
+    }
+
+    fn spec() -> VeritySpec {
+        VeritySpec {
+            root_hash: "ab".repeat(32),
+            hash_device: PathBuf::from("/var/lib/avocado/images/x.verity"),
+        }
+    }
+
+    #[test]
+    fn dissect_args_for_a_fresh_raw_mount_carry_loop_ref_and_verity_flags() {
+        let v = spec();
+        let args = dissect_args("app", Path::new("/i/x.raw"), "/mnt/app", true, Some(&v)).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--loop-ref=app",
+                format!("--root-hash={}", "ab".repeat(32)).as_str(),
+                "--verity-data=/var/lib/avocado/images/x.verity",
+                "--mkdir",
+                "-r",
+                "-M",
+                "/i/x.raw",
+                "/mnt/app",
+            ]
+        );
+    }
+
+    #[test]
+    fn dissect_args_for_a_kab_or_reused_loop_omit_loop_ref_but_keep_verity() {
+        let v = spec();
+        let args =
+            dissect_args("app", Path::new("/dev/loop3"), "/mnt/app", false, Some(&v)).unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("--loop-ref")));
+        assert!(args.iter().any(|a| a.starts_with("--root-hash=")));
+        assert!(args.iter().any(|a| a.starts_with("--verity-data=")));
+        assert_eq!(&args[args.len() - 2..], ["/dev/loop3", "/mnt/app"]);
+    }
+
+    #[test]
+    fn dissect_args_without_verity_emit_no_verity_flags() {
+        let args = dissect_args("app", Path::new("/i/x.raw"), "/mnt/app", true, None).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--loop-ref=app",
+                "--mkdir",
+                "-r",
+                "-M",
+                "/i/x.raw",
+                "/mnt/app"
+            ]
+        );
+    }
+
+    #[test]
+    fn dissect_args_refuse_a_bad_root_hash_before_reaching_dissect() {
+        let mut v = spec();
+        v.root_hash = "beef".into();
+        assert!(dissect_args("app", Path::new("/i/x.raw"), "/mnt/app", true, Some(&v)).is_err());
+    }
+
+    #[test]
+    fn a_missing_sidecar_refuses_the_mount_before_dissect_runs() {
+        let mut v = spec();
+        v.hash_device = PathBuf::from("/nonexistent/definitely/x.verity");
+        let mount_point = std::env::temp_dir().join("avocadoctl-verity-test/app");
+        let err = mount_with_dissect(
+            "app",
+            Path::new("/i/x.raw"),
+            mount_point.to_str().unwrap(),
+            true,
+            Some(&v),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("hash tree is missing"), "{err}");
+    }
+
+    #[test]
+    fn an_unverified_mount_no_longer_matches_once_a_root_hash_is_requested() {
+        let v = spec();
+        assert!(!verity_source_matches("/dev/loop2", Some(&v)));
+        assert!(verity_source_matches(
+            &format!("/dev/mapper/{}-verity", "ab".repeat(32)),
+            Some(&v)
+        ));
+        assert!(!verity_source_matches(
+            &format!("/dev/mapper/{}-verity", "cd".repeat(32)),
+            Some(&v)
+        ));
+        assert!(verity_source_matches("/dev/loop2", None));
+        assert!(!verity_source_matches(
+            &format!("/dev/mapper/{}-verity", "ab".repeat(32)),
+            None
+        ));
     }
 
     #[test]

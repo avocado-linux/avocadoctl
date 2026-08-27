@@ -267,6 +267,19 @@ pub fn validate_manifest_images(
             });
             continue;
         }
+        // A verity-backed image without its hash tree cannot be mounted as the
+        // manifest demands, so it is as missing as the image itself. Checked
+        // here so it is caught at staging, and so a sidecar-less runtime never
+        // counts as "current".
+        if let Some(tree) = ext.resolve_verity_path(base_dir) {
+            if !tree.exists() {
+                missing.push(MissingImage {
+                    extension_name: format!("{} {} (dm-verity hash tree)", ext.name, ext.version),
+                    expected_path: tree.display().to_string(),
+                });
+                continue;
+            }
+        }
         if let Some(ref expected_sha) = ext.sha256 {
             let actual = sha256_file(&path).map_err(|e| {
                 StagingError::StagingFailed(format!("Failed to hash {}: {e}", path.display()))
@@ -402,6 +415,17 @@ pub fn install_images_from_staging(
                         ext.name
                     ))
                 })?;
+                // The hash tree travels with the image; without this copy a
+                // downloaded sidecar never reaches images/ and validation fails.
+                let staged_tree = staged_file.with_extension("verity");
+                if ext.has_verity() && staged_tree.exists() {
+                    fs::copy(&staged_tree, dest.with_extension("verity")).map_err(|e| {
+                        StagingError::StagingFailed(format!(
+                            "Failed to install dm-verity hash tree for {}: {e}",
+                            ext.name
+                        ))
+                    })?;
+                }
                 // Verify hash after copy if sha256 is available
                 if let Some(ref expected_sha) = ext.sha256 {
                     verify_installed_hash(&dest, expected_sha, &ext.name)?;

@@ -432,18 +432,34 @@ pub(crate) fn merge_extensions_internal(
             output.step("OS Update", "Verification passed, clearing pending marker");
             // Promote pending runtime to active if one is set
             if let Some(ref runtime_id) = pending.runtime_id {
-                match crate::staging::activate_runtime(runtime_id, base_path) {
-                    Ok(()) => {
-                        output.step(
-                            "OS Update",
-                            &format!("Activated pending runtime: {runtime_id}"),
-                        );
-                    }
-                    Err(e) => {
-                        output.error(
-                            "OS Update",
-                            &format!("Failed to activate pending runtime {runtime_id}: {e}"),
-                        );
+                // Refuse before activation, not after: a manifest this build
+                // cannot honor must not become the active one and lose every
+                // extension at merge.
+                let pending_dir = base_path
+                    .join(crate::manifest::RUNTIMES_DIR_NAME)
+                    .join(runtime_id);
+                let preflight = crate::manifest::RuntimeManifest::load_from(&pending_dir)
+                    .ok_or_else(|| format!("no readable manifest in {}", pending_dir.display()))
+                    .and_then(|m| m.preflight(base_path));
+                if let Err(e) = preflight {
+                    output.error(
+                        "OS Update",
+                        &format!("Not activating pending runtime {runtime_id}: {e}"),
+                    );
+                } else {
+                    match crate::staging::activate_runtime(runtime_id, base_path) {
+                        Ok(()) => {
+                            output.step(
+                                "OS Update",
+                                &format!("Activated pending runtime: {runtime_id}"),
+                            );
+                        }
+                        Err(e) => {
+                            output.error(
+                                "OS Update",
+                                &format!("Failed to activate pending runtime {runtime_id}: {e}"),
+                            );
+                        }
                     }
                 }
             }
@@ -473,20 +489,23 @@ pub(crate) fn merge_extensions_internal(
     // format this build cannot honor, both refuse the merge outright — merging
     // anyway would deliver less protection than the manifest claims while
     // looking like success.
-    if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
-        // Refuse a manifest from the future before acting on any of it. Such a
-        // manifest may describe integrity guarantees this build cannot honor --
-        // a verity root hash it would not check, say -- and merging it anyway
-        // would deliver less protection than the manifest claims while looking
-        // like success. Failing here is the only honest option.
-        if !manifest.is_version_supported() {
-            let message = format!(
-                "runtime manifest version {} is newer than this avocadoctl supports \
-                 (max {}). Refusing to merge: it may declare protections this build \
-                 cannot enforce. Update avocadoctl.",
-                manifest.manifest_version,
-                crate::manifest::MAX_SUPPORTED_MANIFEST_VERSION,
-            );
+    // An `active` link whose manifest does not parse is refused here rather than
+    // treated as "no manifest": falling through to legacy discovery would merge
+    // whatever is lying around while the device believes it runs a manifest.
+    let active_manifest = crate::manifest::RuntimeManifest::load_active_checked(base_path)
+        .map_err(|message| {
+            output.error("Extension Merge", &message);
+            SystemdError::ConfigurationError { message }
+        })?;
+    if let Some(manifest) = active_manifest {
+        // Backstop for the same check `avocadoctl update` and the pending-OS
+        // boot path run before activation: a manifest this build cannot honor
+        // (a format from the future, an image type with no adaptor here, a
+        // verity tree that never arrived) is refused rather than merged with the
+        // parts we do not understand ignored, which would deliver less than the
+        // manifest claims while looking like success.
+        if let Err(e) = manifest.preflight(base_path) {
+            let message = format!("Refusing to merge: {e}");
             output.error("Extension Merge", &message);
             return Err(SystemdError::ConfigurationError { message });
         }
@@ -527,6 +546,7 @@ pub(crate) fn merge_extensions_internal(
                         let all_runtimes = crate::manifest::RuntimeManifest::list_all(base_path);
                         let fallback = all_runtimes.iter().find(|(rt, is_active)| {
                             !is_active
+                                && rt.preflight(base_path).is_ok()
                                 && match &rt.os_bundle {
                                     Some(bundle) => match &bundle.os_build_id {
                                         Some(rt_id) => rt_id == running_id,
@@ -1179,6 +1199,38 @@ pub fn refresh_extensions(config: &Config, output: &OutputManager) {
         "Extension Refresh",
         &format!("Starting extension refresh process in {environment_info}"),
     );
+
+    // Preflight the active manifest before touching anything. Refresh unmerges
+    // first, so a manifest that would be refused at merge time would otherwise
+    // leave the device with no extensions - and if avocado-connect or sshd is
+    // one of them, offline on a runtime it cannot use.
+    let base_dir = config.get_avocado_base_dir();
+    let base_path = Path::new(&base_dir);
+    let preflight =
+        crate::manifest::RuntimeManifest::load_active_checked(base_path).and_then(|manifest| {
+            match manifest {
+                Some(m) => {
+                    m.preflight(base_path)?;
+                    if m.extensions.iter().any(|e| e.has_verity())
+                        && std::env::var("AVOCADO_TEST_MODE").is_err()
+                        && !crate::commands::image_adaptor::kernel_has_dm_verity()
+                    {
+                        return Err("manifest declares dm-verity extensions but this kernel \
+                                has no dm-verity support"
+                            .to_string());
+                    }
+                    Ok(())
+                }
+                None => Ok(()),
+            }
+        });
+    if let Err(e) = preflight {
+        output.error(
+            "Extension Refresh",
+            &format!("Refusing to refresh (extensions left as they are): {e}"),
+        );
+        std::process::exit(1);
+    }
 
     // First unmerge (skip depmod since we'll call it after merge, don't unmount loops —
     // the caller may be running from a loop-mounted extension like avocado-connect)
@@ -2351,12 +2403,7 @@ fn scan_extensions_from_all_sources_with_verbosity(
                     // Image file extension — adaptor selected by manifest image_type
                     let adaptor = ImageType::from_manifest(&mext.image_type);
                     // Only the manifest knows whether this image is verity-backed.
-                    let verity = mext.resolve_verity_path(base_path).map(|hash_device| {
-                        crate::commands::image_adaptor::VeritySpec {
-                            root_hash: mext.root_hash.clone().unwrap_or_default(),
-                            hash_device,
-                        }
-                    });
+                    let verity = mext.verity_spec(base_path);
                     match analyze_image_extension(
                         &mext.name,
                         &Some(mext.version.clone()),
@@ -2706,9 +2753,16 @@ fn analyze_image_extension(
     };
 
     let mount_point = if adaptor.is_mounted(&mount_name) {
-        if adaptor.needs_remount(&mount_name, path) {
+        // Backing file changed, or the mount's verity state no longer matches
+        // the manifest (a rollout that added a root hash leaves the image bytes
+        // untouched, so only the second check sees it). Deliberately not
+        // "always remount when verity is requested": that would redo every
+        // verity extension on every refresh, including one the caller runs from.
+        if adaptor.needs_remount(&mount_name, path)
+            || crate::commands::image_adaptor::verity_state_changed(&mount_name, verity)
+        {
             if verbose {
-                println!("Backing file changed for {mount_name}, remounting...");
+                println!("Backing file or verity state changed for {mount_name}, remounting...");
             }
             // The remount below can still succeed after a partial teardown, so
             // this is not fatal - but it is reported unconditionally. Hiding it
