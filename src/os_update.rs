@@ -587,54 +587,65 @@ fn locate_target(
     partition_name: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<WriteTarget, OsUpdateError> {
-    // Only an ABSENT label may fall back. A label that exists but cannot be
-    // resolved (dangling symlink, EACCES, I/O error) is a real error to surface,
-    // not a reason to start writing by computed offset.
-    let label = PathBuf::from(format!("/dev/disk/by-partlabel/{partition_name}"));
-    if label.exists() {
+    // Only a DEFINITELY ABSENT label may fall back. A label entry that exists
+    // but cannot be resolved (dangling symlink, EACCES, I/O error) is a real
+    // error to surface, not a reason to start writing by computed offset.
+    if !label_absent(partition_name) {
         return resolve_partition(partition_name).map(WriteTarget::Partition);
     }
-    match resolve_partition(partition_name) {
-        Ok(path) => Ok(WriteTarget::Partition(path)),
-        Err(not_found) => match layout {
-            // Offsets are only trusted on a disk that carries no labels at all.
-            // A labeled disk missing this one label is a layout mismatch (a
-            // device provisioned before a partition was added), and writing by
-            // computed offset there would land on whatever lives at that offset
-            // now.
-            Some(layout) if !disk_has_any_label(layout) => Ok(WriteTarget::Offset {
-                device: layout.device.clone(),
-                byte_offset: resolve_partition_offset(partition_name, layout)?,
-            }),
-            Some(_) => Err(OsUpdateError::ArtifactWriteFailed(format!(
-                "Partition '{partition_name}' has no PARTLABEL on this device but its \
-                 neighbours do: the device's partition layout predates this bundle. \
-                 Reprovision to the new layout; an OS update cannot add partitions."
-            ))),
-            None => Err(not_found),
-        },
+    match layout {
+        // Offsets are only trusted on a disk that carries no labels at all.
+        // A labeled disk missing this one label is a layout mismatch (a
+        // device provisioned before a partition was added), and writing by
+        // computed offset there would land on whatever lives at that offset
+        // now.
+        Some(layout) if !disk_has_any_label(layout) => Ok(WriteTarget::Offset {
+            device: layout.device.clone(),
+            byte_offset: resolve_partition_offset(partition_name, layout)?,
+        }),
+        Some(_) => Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "Partition '{partition_name}' has no PARTLABEL on this device but its \
+             neighbours do: the device's partition layout predates this bundle. \
+             Reprovision to the new layout; an OS update cannot add partitions."
+        ))),
+        None => Err(not_found(partition_name)),
     }
 }
 
-/// Whether any partition the bundle's layout names exists by PARTLABEL here -
-/// i.e. the disk is GPT with labels, and offsets are not the way to address it.
+/// Whether `/dev/disk/by-partlabel/<name>` is definitely absent. Only a clean
+/// NotFound counts: `Path::exists()` also says "no" for a dangling symlink or
+/// a metadata error, and treating those as absent would enable raw offset
+/// writes on a disk that is in fact labeled.
+fn label_absent(partition_name: &str) -> bool {
+    matches!(
+        fs::symlink_metadata(format!("/dev/disk/by-partlabel/{partition_name}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound
+    )
+}
+
+fn not_found(partition_name: &str) -> OsUpdateError {
+    OsUpdateError::ArtifactWriteFailed(format!(
+        "Partition not found: /dev/disk/by-partlabel/{partition_name}"
+    ))
+}
+
+/// Whether any partition the bundle's layout names has a PARTLABEL entry here,
+/// i.e. the disk is GPT with labels and offsets are not the way to address it.
+/// Anything short of a definite NotFound counts as evidence of a label.
 fn disk_has_any_label(layout: &BundleLayout) -> bool {
     layout
         .partitions
         .iter()
         .filter_map(|p| p.name.as_deref())
-        .any(|name| Path::new(&format!("/dev/disk/by-partlabel/{name}")).exists())
+        .any(|name| !label_absent(name))
 }
 
 fn resolve_partition(partition_name: &str) -> Result<PathBuf, OsUpdateError> {
-    let path = PathBuf::from(format!("/dev/disk/by-partlabel/{partition_name}"));
-    if !path.exists() {
-        return Err(OsUpdateError::ArtifactWriteFailed(format!(
-            "Partition not found: /dev/disk/by-partlabel/{partition_name}"
-        )));
+    if label_absent(partition_name) {
+        return Err(not_found(partition_name));
     }
     // Resolve the symlink to get the actual device
-    fs::canonicalize(&path).map_err(|e| {
+    fs::canonicalize(format!("/dev/disk/by-partlabel/{partition_name}")).map_err(|e| {
         OsUpdateError::ArtifactWriteFailed(format!(
             "Failed to resolve partition {partition_name}: {e}"
         ))
