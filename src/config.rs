@@ -799,13 +799,17 @@ dir = "/override/test/path"
         let _guard = ENV_VAR_MUTEX.lock().unwrap();
         let restore = ScopedEnv::clear(&[]);
         std::env::set_var("AVOCADO_TEST_MODE", "1");
-        std::env::set_var("TMPDIR", "/scratch");
+        // A real directory, kept: tests in other modules call TempDir::new()
+        // without ENV_VAR_MUTEX and read TMPDIR while this is set. A path that
+        // does not exist (the old "/scratch") made them fail on NotFound.
+        let scratch = tempfile::tempdir().unwrap().keep();
+        std::env::set_var("TMPDIR", &scratch);
 
         let mut config = Config::default();
         config.avocado.runtimes_dir = Some("/mnt/state/avocado".to_string());
         assert_eq!(
             config.get_os_releases_dir("v1"),
-            "/scratch/avocado/os-releases/v1"
+            format!("{}/avocado/os-releases/v1", scratch.display())
         );
 
         std::env::remove_var("AVOCADO_TEST_MODE");
