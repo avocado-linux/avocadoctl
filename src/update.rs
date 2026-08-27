@@ -403,6 +403,13 @@ pub fn perform_update(
     )
     .map_err(|e| UpdateError::StagingFailed(e.to_string()))?;
 
+    // Everything the manifest needs is now supposed to be in images/. Refuse
+    // here, while the staging dir still holds the downloads, rather than
+    // activating a runtime whose hash tree is about to be deleted with it.
+    new_manifest
+        .preflight(base_dir)
+        .map_err(UpdateError::StagingFailed)?;
+
     staging::stage_manifest(&new_manifest, &manifest_content, base_dir, verbose)
         .map_err(|e| UpdateError::StagingFailed(e.to_string()))?;
 

@@ -1188,6 +1188,36 @@ pub(crate) fn invalidate_hitl_caches(output: &OutputManager) {
     }
 }
 
+/// Everything a refresh must know before it unmerges: the active manifest is
+/// readable, its format is supported, every verity sidecar is present, and the
+/// kernel can serve dm-verity if any extension asks for it. Refresh unmerges
+/// first, so a manifest that would be refused at merge time would otherwise
+/// leave the device with no extensions - and if avocado-connect or sshd is one
+/// of them, offline on a runtime it cannot use. Shared by the CLI and the
+/// service (varlink / Connect-driven) refresh paths.
+pub(crate) fn refresh_preflight(config: &Config) -> Result<(), SystemdError> {
+    let base_dir = config.get_avocado_base_dir();
+    let base_path = Path::new(&base_dir);
+    let check = || -> Result<(), String> {
+        let Some(manifest) = crate::manifest::RuntimeManifest::load_active_checked(base_path)?
+        else {
+            return Ok(());
+        };
+        manifest.preflight(base_path)?;
+        if manifest.extensions.iter().any(|e| e.has_verity())
+            && std::env::var("AVOCADO_TEST_MODE").is_err()
+            && !crate::commands::image_adaptor::kernel_has_dm_verity()
+        {
+            return Err(
+                "manifest declares dm-verity extensions but this kernel has no dm-verity support"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    };
+    check().map_err(|message| SystemdError::ConfigurationError { message })
+}
+
 /// Refresh extensions (unmerge then merge)
 pub fn refresh_extensions(config: &Config, output: &OutputManager) {
     let environment_info = if is_running_in_initrd() {
@@ -1200,31 +1230,7 @@ pub fn refresh_extensions(config: &Config, output: &OutputManager) {
         &format!("Starting extension refresh process in {environment_info}"),
     );
 
-    // Preflight the active manifest before touching anything. Refresh unmerges
-    // first, so a manifest that would be refused at merge time would otherwise
-    // leave the device with no extensions - and if avocado-connect or sshd is
-    // one of them, offline on a runtime it cannot use.
-    let base_dir = config.get_avocado_base_dir();
-    let base_path = Path::new(&base_dir);
-    let preflight =
-        crate::manifest::RuntimeManifest::load_active_checked(base_path).and_then(|manifest| {
-            match manifest {
-                Some(m) => {
-                    m.preflight(base_path)?;
-                    if m.extensions.iter().any(|e| e.has_verity())
-                        && std::env::var("AVOCADO_TEST_MODE").is_err()
-                        && !crate::commands::image_adaptor::kernel_has_dm_verity()
-                    {
-                        return Err("manifest declares dm-verity extensions but this kernel \
-                                has no dm-verity support"
-                            .to_string());
-                    }
-                    Ok(())
-                }
-                None => Ok(()),
-            }
-        });
-    if let Err(e) = preflight {
+    if let Err(e) = refresh_preflight(config) {
         output.error(
             "Extension Refresh",
             &format!("Refusing to refresh (extensions left as they are): {e}"),

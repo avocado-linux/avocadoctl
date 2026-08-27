@@ -111,50 +111,56 @@ fn dm_verity_is_builtin() -> bool {
         .unwrap_or(false)
 }
 
-/// The device systemd-dissect mounts a verity image from. dissect-image.c names
-/// the dm-verity device after the root hash, so an existing mount's source in
-/// mountinfo says whether it is verified and against which hash.
-fn expected_verity_source(root_hash: &str) -> String {
-    format!("/dev/mapper/{root_hash}-verity")
-}
-
-/// Source device of the filesystem mounted at `mount_point`, from
-/// /proc/self/mountinfo (field 10). None when nothing is mounted there.
-fn mount_source(mount_point: &str) -> Option<String> {
-    let info = fs::read_to_string("/proc/self/mountinfo").ok()?;
-    info.lines()
+/// `maj:min` (mountinfo field 3) of the filesystem mounted at `mount_point`.
+///
+/// The mount *source* (field 10) is useless here: systemd-dissect mounts from
+/// `/proc/self/fd/<n>`, and the dm name it would otherwise show is
+/// `loopN-<diskseq>-verity`, never something derived from the root hash. The
+/// device number, by contrast, resolves under /sys/dev/block to the dm node.
+fn mountinfo_dev(mountinfo: &str, mount_point: &str) -> Option<String> {
+    mountinfo
+        .lines()
         .filter_map(|line| {
-            let (pre, post) = line.split_once(" - ")?;
-            let mp = pre.split_whitespace().nth(4)?;
-            if mp != mount_point {
-                return None;
-            }
-            post.split_whitespace().nth(1).map(str::to_string)
+            let mut f = line.split_whitespace();
+            let dev = f.nth(2)?;
+            let mp = f.nth(1)?;
+            (mp == mount_point).then(|| dev.to_string())
         })
         .next_back()
 }
 
-/// Whether an existing mount's verity state disagrees with what the manifest
-/// now asks for: unverified but a root hash is requested, verified against a
-/// different hash, or verified when verity was dropped. Pure so it can be
-/// tested; `verity_state_changed` feeds it the live mount source.
-fn verity_source_matches(source: &str, verity: Option<&VeritySpec>) -> bool {
-    match verity {
-        Some(v) => source == expected_verity_source(&v.root_hash),
-        None => !source.ends_with("-verity"),
-    }
+/// cryptsetup names verity mappings `<something>-verity` (systemd-dissect:
+/// `loopN-<diskseq>-verity`, or `<roothash>-verity` under verity sharing).
+fn dm_name_is_verity(name: &str) -> bool {
+    name.trim_end().ends_with("-verity")
+}
+
+/// Whether the filesystem at `mount_point` sits on a dm-verity device. None when
+/// nothing is mounted there.
+fn mount_is_verity_dm(mount_point: &str) -> Option<bool> {
+    let info = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let dev = mountinfo_dev(&info, mount_point)?;
+    // Only device-mapper nodes have dm/name; a plain loop device is unverified.
+    Some(
+        fs::read_to_string(format!("/sys/dev/block/{dev}/dm/name"))
+            .map(|n| dm_name_is_verity(&n))
+            .unwrap_or(false),
+    )
 }
 
 /// True when the mount at `mount_name` must be redone for its verity state to
-/// match the manifest. The backing-file check in `needs_remount` cannot see
-/// this: a verity rollout leaves the image bytes (and so the image_id) unchanged
-/// and only adds a root hash and a sidecar.
+/// match the manifest: verity requested but the mount is unverified, or verity
+/// dropped but the mount is still a dm-verity device. The backing-file check in
+/// `needs_remount` cannot see either: a verity rollout leaves the image bytes
+/// (and so the image_id) unchanged and only adds a root hash and a sidecar.
+/// A changed hash on an unchanged image is not detectable this way, but an
+/// image change is already caught by the backing-file check.
 pub fn verity_state_changed(mount_name: &str, verity: Option<&VeritySpec>) -> bool {
     if is_test_mode() {
         return false;
     }
-    match mount_source(&extension_mount_point(mount_name)) {
-        Some(source) => !verity_source_matches(&source, verity),
+    match mount_is_verity_dm(&extension_mount_point(mount_name)) {
+        Some(is_verity) => is_verity != verity.is_some(),
         None => false,
     }
 }
@@ -1652,22 +1658,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unverified_mount_no_longer_matches_once_a_root_hash_is_requested() {
-        let v = spec();
-        assert!(!verity_source_matches("/dev/loop2", Some(&v)));
-        assert!(verity_source_matches(
-            &format!("/dev/mapper/{}-verity", "ab".repeat(32)),
-            Some(&v)
-        ));
-        assert!(!verity_source_matches(
-            &format!("/dev/mapper/{}-verity", "cd".repeat(32)),
-            Some(&v)
-        ));
-        assert!(verity_source_matches("/dev/loop2", None));
-        assert!(!verity_source_matches(
-            &format!("/dev/mapper/{}-verity", "ab".repeat(32)),
-            None
-        ));
+    fn verity_is_read_from_the_dm_name_not_the_mount_source() {
+        // What systemd-dissect actually produces: the name carries the loop and
+        // diskseq, never the root hash; the mount source is a /proc/self/fd path.
+        assert!(dm_name_is_verity("loop0-1-verity\n"));
+        assert!(dm_name_is_verity(&format!("{}-verity", "ab".repeat(32))));
+        assert!(!dm_name_is_verity("var"));
+        assert!(!dm_name_is_verity("root"));
+        assert!(!dm_name_is_verity(""));
+    }
+
+    #[test]
+    fn mountinfo_lookup_uses_the_device_number_and_ignores_the_fd_source() {
+        let info = "\
+36 35 0:30 / /proc rw,relatime - proc proc rw
+120 35 7:3 / /run/avocado/extensions/other rw - erofs /dev/loop3 ro
+121 35 253:2 / /run/avocado/extensions/app ro,relatime - erofs /proc/self/fd/7 ro
+";
+        assert_eq!(
+            mountinfo_dev(info, "/run/avocado/extensions/app").as_deref(),
+            Some("253:2")
+        );
+        assert_eq!(
+            mountinfo_dev(info, "/run/avocado/extensions/other").as_deref(),
+            Some("7:3")
+        );
+        assert_eq!(mountinfo_dev(info, "/run/avocado/extensions/none"), None);
     }
 
     #[test]
