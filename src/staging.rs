@@ -394,6 +394,7 @@ pub fn install_images_from_staging(
     for ext in &manifest.extensions {
         if let Some(ref image_id) = ext.image_id {
             let dest = images_dir.join(format!("{image_id}.raw"));
+            let staged_file = staging_dir.join(format!("{image_id}.raw"));
             if dest.exists() {
                 if verbose {
                     println!(
@@ -405,27 +406,13 @@ pub fn install_images_from_staging(
                 if let Some(ref expected_sha) = ext.sha256 {
                     verify_installed_hash(&dest, expected_sha, &ext.name)?;
                 }
-                continue;
-            }
-            let staged_file = staging_dir.join(format!("{image_id}.raw"));
-            if staged_file.exists() {
+            } else if staged_file.exists() {
                 fs::copy(&staged_file, &dest).map_err(|e| {
                     StagingError::StagingFailed(format!(
                         "Failed to install image for {}: {e}",
                         ext.name
                     ))
                 })?;
-                // The hash tree travels with the image; without this copy a
-                // downloaded sidecar never reaches images/ and validation fails.
-                let staged_tree = staged_file.with_extension("verity");
-                if ext.has_verity() && staged_tree.exists() {
-                    fs::copy(&staged_tree, dest.with_extension("verity")).map_err(|e| {
-                        StagingError::StagingFailed(format!(
-                            "Failed to install dm-verity hash tree for {}: {e}",
-                            ext.name
-                        ))
-                    })?;
-                }
                 // Verify hash after copy if sha256 is available
                 if let Some(ref expected_sha) = ext.sha256 {
                     verify_installed_hash(&dest, expected_sha, &ext.name)?;
@@ -442,6 +429,38 @@ pub fn install_images_from_staging(
                     ext.name, ext.version, image_id
                 );
                 missing.push(format!("{} {} ({})", ext.name, ext.version, image_id));
+                continue;
+            }
+
+            // The hash tree is installed independently of the .raw: a verity
+            // rollout leaves the image bytes (and image_id) unchanged, so the
+            // .raw is already present and only the sidecar is new. Skipping it
+            // with the image would strand a runtime whose only copy of the tree
+            // is about to be wiped with the staging dir.
+            if ext.has_verity() {
+                let tree = dest.with_extension("verity");
+                let staged_tree = staged_file.with_extension("verity");
+                if !tree.exists() && staged_tree.exists() {
+                    fs::copy(&staged_tree, &tree).map_err(|e| {
+                        StagingError::StagingFailed(format!(
+                            "Failed to install dm-verity hash tree for {}: {e}",
+                            ext.name
+                        ))
+                    })?;
+                    if verbose {
+                        println!(
+                            "    Installed dm-verity hash tree: {} {} -> {image_id}.verity",
+                            ext.name, ext.version,
+                        );
+                    }
+                }
+                if !tree.exists() {
+                    println!(
+                        "    WARNING: dm-verity hash tree not in staging and not on disk: {} {} ({})",
+                        ext.name, ext.version, image_id
+                    );
+                    missing.push(format!("{} {} ({image_id}.verity)", ext.name, ext.version));
+                }
             }
         }
     }
@@ -828,6 +847,50 @@ mod tests {
 
         let content = fs::read_to_string(images_dir.join(format!("{image_id}.raw"))).unwrap();
         assert_eq!(content, "old content");
+    }
+
+    #[test]
+    fn a_staged_sidecar_is_installed_even_when_the_raw_is_already_present() {
+        // The verity rollout: same image bytes, same image_id, only root_hash
+        // and the .verity sidecar are new.
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let image_id = "a1b2c3d4-e5f6-5789-abcd-ef0123456789";
+        fs::write(staging.join(format!("{image_id}.verity")), b"tree").unwrap();
+
+        let base = tmp.path().join("base");
+        let images_dir = base.join("images");
+        fs::create_dir_all(&images_dir).unwrap();
+        fs::write(images_dir.join(format!("{image_id}.raw")), b"old content").unwrap();
+
+        let mut manifest = make_manifest("test-id", "dev", "0.1.0");
+        manifest.extensions[0].root_hash = Some("ab".repeat(32));
+        install_images_from_staging(&manifest, &staging, &base, false, false).unwrap();
+
+        assert_eq!(
+            fs::read(images_dir.join(format!("{image_id}.verity"))).unwrap(),
+            b"tree"
+        );
+    }
+
+    #[test]
+    fn a_verity_extension_without_any_sidecar_is_reported_missing() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let image_id = "a1b2c3d4-e5f6-5789-abcd-ef0123456789";
+        let base = tmp.path().join("base");
+        let images_dir = base.join("images");
+        fs::create_dir_all(&images_dir).unwrap();
+        fs::write(images_dir.join(format!("{image_id}.raw")), b"content").unwrap();
+
+        let mut manifest = make_manifest("test-id", "dev", "0.1.0");
+        manifest.extensions[0].root_hash = Some("ab".repeat(32));
+        let err = install_images_from_staging(&manifest, &staging, &base, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".verity"), "{err}");
     }
 
     /// Helper: compute sha256 hex of some bytes for test fixtures.

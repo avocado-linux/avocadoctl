@@ -101,6 +101,16 @@ pub fn refresh_extensions_streaming(
     let handle = thread::spawn(move || {
         let output = OutputManager::new_streaming(tx);
 
+        // Same gate as the CLI refresh: refuse before the unmerge, so a manifest
+        // this build cannot honor leaves the running extensions in place.
+        if let Err(e) = ext::refresh_preflight(&config) {
+            output.error(
+                "Extension Refresh",
+                &format!("Refusing to refresh (extensions left as they are): {e}"),
+            );
+            return Err(AvocadoError::from(e));
+        }
+
         // First unmerge (skip depmod since we'll call it after merge, don't unmount loops —
         // the caller may be running from a loop-mounted extension like avocado-connect)
         ext::unmerge_extensions_internal_with_options(false, false, &output)
