@@ -241,23 +241,26 @@ pub fn apply_os_update(
         // Verify SHA256 of source file
         verify_sha256(&source_path, &artifact.sha256, &artifact.name)?;
 
-        // Write to partition: use layout-based offset if available (MBR), else PARTLABEL (GPT)
-        if let Some(ref layout) = bundle.layout {
-            let byte_offset = resolve_partition_offset(&target.partition, layout)?;
-            println!(
-                "    Writing {} -> {}@{} (partition: {})",
-                artifact.name, layout.device, byte_offset, target.partition
-            );
-            write_to_device_at_offset(&source_path, &layout.device, byte_offset, &artifact.name)?;
-        } else {
-            let partition_path = resolve_partition(&target.partition)?;
-            println!(
-                "    Writing {} -> {} (partition: {})",
-                artifact.name,
-                partition_path.display(),
-                target.partition
-            );
-            write_to_partition(&source_path, &partition_path, &artifact.name)?;
+        match locate_target(&target.partition, bundle.layout.as_ref())? {
+            WriteTarget::Partition(partition_path) => {
+                println!(
+                    "    Writing {} -> {} (partition: {})",
+                    artifact.name,
+                    partition_path.display(),
+                    target.partition
+                );
+                write_to_partition(&source_path, &partition_path, &artifact.name)?;
+            }
+            WriteTarget::Offset {
+                device,
+                byte_offset,
+            } => {
+                println!(
+                    "    Writing {} -> {}@{} (partition: {})",
+                    artifact.name, device, byte_offset, target.partition
+                );
+                write_to_device_at_offset(&source_path, &device, byte_offset, &artifact.name)?;
+            }
         }
     }
 
@@ -565,6 +568,55 @@ fn determine_inactive_slot(current: &str, strategy: &str) -> Result<String, OsUp
             ))),
         },
     }
+}
+
+/// Where an artifact for `partition_name` gets written.
+enum WriteTarget {
+    Partition(PathBuf),
+    Offset { device: String, byte_offset: u64 },
+}
+
+/// The kernel's view of the disk wins over the bundle's. A GPT partition is
+/// addressed by its PARTLABEL whenever udev has one for it; the bundle's
+/// `layout` (device path + computed offsets) is only for layouts that carry no
+/// labels (MBR). Preferring the layout when a label exists wrote to the wrong
+/// disk on i.MX: the manifest's devpath names the eMMC as /dev/mmcblk1, the
+/// running kernel enumerates it as /dev/mmcblk2, and the computed offsets need
+/// not match where the flasher actually placed the partitions.
+fn locate_target(
+    partition_name: &str,
+    layout: Option<&BundleLayout>,
+) -> Result<WriteTarget, OsUpdateError> {
+    match resolve_partition(partition_name) {
+        Ok(path) => Ok(WriteTarget::Partition(path)),
+        Err(not_found) => match layout {
+            // Offsets are only trusted on a disk that carries no labels at all.
+            // A labeled disk missing this one label is a layout mismatch (a
+            // device provisioned before a partition was added), and writing by
+            // computed offset there would land on whatever lives at that offset
+            // now.
+            Some(layout) if !disk_has_any_label(layout) => Ok(WriteTarget::Offset {
+                device: layout.device.clone(),
+                byte_offset: resolve_partition_offset(partition_name, layout)?,
+            }),
+            Some(_) => Err(OsUpdateError::ArtifactWriteFailed(format!(
+                "Partition '{partition_name}' has no PARTLABEL on this device but its \
+                 neighbours do: the device's partition layout predates this bundle. \
+                 Reprovision to the new layout; an OS update cannot add partitions."
+            ))),
+            None => Err(not_found),
+        },
+    }
+}
+
+/// Whether any partition the bundle's layout names exists by PARTLABEL here -
+/// i.e. the disk is GPT with labels, and offsets are not the way to address it.
+fn disk_has_any_label(layout: &BundleLayout) -> bool {
+    layout
+        .partitions
+        .iter()
+        .filter_map(|p| p.name.as_deref())
+        .any(|name| Path::new(&format!("/dev/disk/by-partlabel/{name}")).exists())
 }
 
 fn resolve_partition(partition_name: &str) -> Result<PathBuf, OsUpdateError> {
@@ -1418,24 +1470,27 @@ pub fn apply_os_update_streaming<R: Read>(
             artifact.name, target.partition
         );
 
-        // Route to the appropriate write function based on layout (MBR vs GPT)
-        if let Some(ref layout) = bundle.layout {
-            let byte_offset = resolve_partition_offset(&target.partition, layout)?;
-            stream_to_device_at_offset(
-                &mut entry,
-                &layout.device,
+        match locate_target(&target.partition, bundle.layout.as_ref())? {
+            WriteTarget::Partition(partition_path) => {
+                stream_to_partition(
+                    &mut entry,
+                    &partition_path,
+                    &artifact.sha256,
+                    &artifact.name,
+                )?;
+            }
+            WriteTarget::Offset {
+                device,
                 byte_offset,
-                &artifact.sha256,
-                &artifact.name,
-            )?;
-        } else {
-            let partition_path = resolve_partition(&target.partition)?;
-            stream_to_partition(
-                &mut entry,
-                &partition_path,
-                &artifact.sha256,
-                &artifact.name,
-            )?;
+            } => {
+                stream_to_device_at_offset(
+                    &mut entry,
+                    &device,
+                    byte_offset,
+                    &artifact.sha256,
+                    &artifact.name,
+                )?;
+            }
         }
 
         seen.insert(entry_path_str);
@@ -1481,6 +1536,45 @@ pub fn apply_os_update_streaming<R: Read>(
 
 #[cfg(test)]
 mod tests {
+    fn layout_with(name: &str, offset: f64) -> BundleLayout {
+        BundleLayout {
+            device: "/dev/mmcblk1".to_string(),
+            block_size: Some(512),
+            partitions: vec![LayoutPartition {
+                name: Some(name.to_string()),
+                offset: Some(offset),
+                offset_unit: Some("bytes".to_string()),
+                size: 8.0,
+                size_unit: "mebibytes".to_string(),
+                expand: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn an_unlabeled_partition_falls_back_to_the_layout_offset() {
+        // No such PARTLABEL on any test host, so the label lookup fails and the
+        // layout (MBR-style) is the only way to address it.
+        match locate_target(
+            "avocadoctl-test-no-such-label",
+            Some(&layout_with("avocadoctl-test-no-such-label", 4096.0)),
+        ) {
+            Ok(WriteTarget::Offset {
+                device,
+                byte_offset,
+            }) => {
+                assert_eq!(device, "/dev/mmcblk1");
+                assert_eq!(byte_offset, 4096);
+            }
+            other => panic!("expected layout offset, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn an_unlabeled_partition_without_a_layout_is_an_error() {
+        assert!(locate_target("avocadoctl-test-no-such-label", None).is_err());
+    }
+
     use super::*;
     use tempfile::TempDir;
 
