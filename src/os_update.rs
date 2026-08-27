@@ -587,6 +587,13 @@ fn locate_target(
     partition_name: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<WriteTarget, OsUpdateError> {
+    // Only an ABSENT label may fall back. A label that exists but cannot be
+    // resolved (dangling symlink, EACCES, I/O error) is a real error to surface,
+    // not a reason to start writing by computed offset.
+    let label = PathBuf::from(format!("/dev/disk/by-partlabel/{partition_name}"));
+    if label.exists() {
+        return resolve_partition(partition_name).map(WriteTarget::Partition);
+    }
     match resolve_partition(partition_name) {
         Ok(path) => Ok(WriteTarget::Partition(path)),
         Err(not_found) => match layout {
@@ -1551,14 +1558,16 @@ mod tests {
         }
     }
 
+    /// A label no attached medium can plausibly carry: the test's own pid makes
+    /// it unique per run, so the lookup fails for the right reason.
+    fn no_such_label() -> String {
+        format!("avocadoctl-test-no-such-label-{}", std::process::id())
+    }
+
     #[test]
     fn an_unlabeled_partition_falls_back_to_the_layout_offset() {
-        // No such PARTLABEL on any test host, so the label lookup fails and the
-        // layout (MBR-style) is the only way to address it.
-        match locate_target(
-            "avocadoctl-test-no-such-label",
-            Some(&layout_with("avocadoctl-test-no-such-label", 4096.0)),
-        ) {
+        let name = no_such_label();
+        match locate_target(&name, Some(&layout_with(&name, 4096.0))) {
             Ok(WriteTarget::Offset {
                 device,
                 byte_offset,
@@ -1572,7 +1581,7 @@ mod tests {
 
     #[test]
     fn an_unlabeled_partition_without_a_layout_is_an_error() {
-        assert!(locate_target("avocadoctl-test-no-such-label", None).is_err());
+        assert!(locate_target(&no_such_label(), None).is_err());
     }
 
     use super::*;
