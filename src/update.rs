@@ -30,6 +30,9 @@ pub enum UpdateError {
 
     #[error("Metadata error: {0}")]
     MetadataError(String),
+
+    #[error("Another update is already in progress")]
+    UpdateInProgress,
 }
 
 /// What a `perform_update` call actually did.
@@ -64,6 +67,14 @@ pub fn perform_update(
     spot_check_bytes: u64,
 ) -> Result<UpdateOutcome, UpdateError> {
     let url = url.trim_end_matches('/');
+
+    // Serialise whole update passes. The agent can re-fire "update available"
+    // (e.g. on reconnect) while a previous pass is still downloading; two passes
+    // sharing one .part file interleave their bytes and both fail with a bogus
+    // hash mismatch, and the loser's cleanup deletes the winner's staging dir.
+    // The lock file lives beside the staging dir, never inside it, so cleanup
+    // cannot unlink the inode we hold.
+    let _lock = acquire_update_lock(base_dir)?;
 
     // 1. Load the local trust anchor
     let root_path = base_dir.join("metadata").join("root.json");
@@ -451,6 +462,23 @@ pub fn perform_update(
     Ok(outcome)
 }
 
+/// Take an exclusive advisory lock on `<base_dir>/.update.lock` for the lifetime
+/// of the returned handle. Fails fast with `UpdateInProgress` rather than
+/// blocking: the caller (usually the agent) already has its own retry cadence.
+fn acquire_update_lock(base_dir: &Path) -> Result<File, UpdateError> {
+    fs::create_dir_all(base_dir)
+        .map_err(|e| UpdateError::StagingFailed(format!("Failed to create base dir: {e}")))?;
+    let lock = File::create(base_dir.join(".update.lock"))
+        .map_err(|e| UpdateError::StagingFailed(format!("Failed to open update lock: {e}")))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => Err(UpdateError::UpdateInProgress),
+        Err(std::fs::TryLockError::Error(e)) => Err(UpdateError::StagingFailed(format!(
+            "Failed to lock update lock: {e}"
+        ))),
+    }
+}
+
 /// True when nothing about `manifest` requires work: the runtime side is
 /// already active and intact, and the running OS already satisfies the
 /// manifest's os_bundle (if any).
@@ -765,11 +793,10 @@ fn download_target_streaming(
         println!("    Downloading {name} ({expected_len} bytes)...");
     }
 
-    let (mut file, bytes_before) = fetch_streaming(url, &part_path, existing_len, auth_token)?;
+    let (mut file, _bytes_before) = fetch_streaming(url, &part_path, existing_len, auth_token)?;
 
     // 4. Stream response body to disk
     let mut buf = [0u8; 64 * 1024];
-    let mut total = bytes_before;
     let mut reader = file.1.as_reader();
     loop {
         let n = reader
@@ -781,19 +808,26 @@ fn download_target_streaming(
         file.0
             .write_all(&buf[..n])
             .map_err(|e| UpdateError::StagingFailed(format!("Write failed for {name}: {e}")))?;
-        total += n as u64;
     }
     file.0
         .sync_all()
         .map_err(|e| UpdateError::StagingFailed(format!("Sync failed for {name}: {e}")))?;
 
-    // 5. Verify length
-    if total != expected_len {
-        let _ = fs::remove_file(&part_path);
+    // 5. Verify length of the file on disk, not our own byte counter. A short
+    // body is a valid prefix: keep the .part so the next pass resumes it.
+    // Anything longer than expected is corrupt and must not be resumed.
+    let on_disk = part_path
+        .metadata()
+        .map_err(|e| UpdateError::StagingFailed(format!("Failed to stat {name}.part: {e}")))?
+        .len();
+    if on_disk != expected_len {
+        if on_disk > expected_len {
+            let _ = fs::remove_file(&part_path);
+        }
         return Err(UpdateError::HashMismatch {
             target: name.to_string(),
             expected: format!("{expected_len} bytes"),
-            actual: format!("{total} bytes"),
+            actual: format!("{on_disk} bytes"),
         });
     }
 
@@ -842,8 +876,13 @@ fn fetch_streaming(
         match make_request(Some(existing_len)) {
             Ok(response) => {
                 let status = response.status().as_u16();
-                if status == 206 {
-                    // Server supports Range — append to existing .part file
+                let resumed_at = response
+                    .headers()
+                    .get("Content-Range")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(content_range_start);
+                if status == 206 && resumed_at == Some(existing_len) {
+                    // Server resumed exactly where we left off — append.
                     let file = OpenOptions::new()
                         .append(true)
                         .open(part_path)
@@ -854,11 +893,17 @@ fn fetch_streaming(
                         })?;
                     return Ok(((file, response.into_body()), existing_len));
                 }
-                // 200 or other — server sent the full file; start fresh
-                let file = File::create(part_path).map_err(|e| {
-                    UpdateError::StagingFailed(format!("Failed to create .part: {e}"))
-                })?;
-                return Ok(((file, response.into_body()), 0));
+                if status == 206 {
+                    // Partial content from the wrong offset: appending would
+                    // corrupt the prefix. Drop it and download from scratch.
+                    let _ = fs::remove_file(part_path);
+                } else {
+                    // 200 or other — server sent the full file; start fresh
+                    let file = File::create(part_path).map_err(|e| {
+                        UpdateError::StagingFailed(format!("Failed to create .part: {e}"))
+                    })?;
+                    return Ok(((file, response.into_body()), 0));
+                }
             }
             Err(_) => {
                 // Request failed (possibly 416) — delete .part and try fresh
@@ -872,6 +917,18 @@ fn fetch_streaming(
     let file = File::create(part_path)
         .map_err(|e| UpdateError::StagingFailed(format!("Failed to create .part: {e}")))?;
     Ok(((file, response.into_body()), 0))
+}
+
+/// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
+fn content_range_start(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Compute SHA256 hash of a file by streaming, avoiding loading the full file into memory.
@@ -1478,6 +1535,166 @@ mod tests {
         // Should fail because the URL is unreachable, but the bad file should be gone
         assert!(result.is_err());
         assert!(!dest.exists(), "Bad file should have been removed");
+    }
+
+    /// One-shot HTTP server: answers the first request with `status`, the given
+    /// extra headers and `body`, then exits. Returns the URL to hit.
+    fn serve_once(status: &'static str, headers: &'static str, body: Vec<u8>) -> String {
+        serve_once_then(status, headers, body, || {})
+    }
+
+    /// Like `serve_once`, but runs `on_request` after the request arrives and
+    /// before the body is sent — a hook to act as a concurrent writer.
+    fn serve_once_then(
+        status: &'static str,
+        headers: &'static str,
+        body: Vec<u8>,
+        on_request: impl FnOnce() + Send + 'static,
+    ) -> String {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/t.raw", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req);
+            on_request();
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(&body).unwrap();
+        });
+        url
+    }
+
+    #[test]
+    fn test_update_lock_rejects_concurrent_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let held = acquire_update_lock(tmp.path()).unwrap();
+        let result = perform_update(
+            "http://127.0.0.1:1",
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            0,
+        );
+        assert!(
+            matches!(result, Err(UpdateError::UpdateInProgress)),
+            "{result:?}"
+        );
+        drop(held);
+        // Lock released: the pass proceeds far enough to hit the missing trust anchor.
+        let result = perform_update(
+            "http://127.0.0.1:1",
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            0,
+        );
+        assert!(
+            matches!(result, Err(UpdateError::NoTrustAnchor)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_resume_length_check_uses_file_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("t.raw");
+        let part = tmp.path().join("t.raw.part");
+        let full = b"0123456789abcdefghijklmnopqrstuvwxyz"; // 36 bytes
+        fs::write(&part, &full[..10]).unwrap();
+        // Correct offset and the correct 26 remaining bytes over our socket —
+        // but a second writer appends to the .part while we download. The old
+        // in-process counter saw 36 and passed; only the hash caught it.
+        let racer = part.clone();
+        let url = serve_once_then(
+            "206 Partial Content",
+            "Content-Range: bytes 10-35/36\r\n",
+            full[10..].to_vec(),
+            move || {
+                OpenOptions::new()
+                    .append(true)
+                    .open(racer)
+                    .unwrap()
+                    .write_all(b"XXXX")
+                    .unwrap();
+            },
+        );
+        let result = download_target_streaming(&url, &dest, 36, &sha256_hex(full), None, false);
+        match result {
+            Err(UpdateError::HashMismatch { actual, .. }) => assert_eq!(actual, "40 bytes"),
+            other => panic!("expected length mismatch from disk, got {other:?}"),
+        }
+        assert!(!part.exists(), "over-long .part must not be resumed");
+    }
+
+    #[test]
+    fn test_short_body_keeps_part_for_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("t.raw");
+        let part = tmp.path().join("t.raw.part");
+        let full = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        fs::write(&part, &full[..10]).unwrap();
+        let url = serve_once(
+            "206 Partial Content",
+            "Content-Range: bytes 10-19/36\r\n",
+            full[10..20].to_vec(),
+        );
+        let result = download_target_streaming(&url, &dest, 36, &sha256_hex(full), None, false);
+        assert!(
+            matches!(result, Err(UpdateError::HashMismatch { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            &full[..20],
+            "valid prefix must survive"
+        );
+    }
+
+    #[test]
+    fn test_206_wrong_offset_discards_part() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("t.raw");
+        let part = tmp.path().join("t.raw.part");
+        let full = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        fs::write(&part, &full[..10]).unwrap();
+        // 206 that resumes from 0 instead of 10. Appending it would have
+        // produced a 46-byte file that also passed the old counter check.
+        let url = serve_once(
+            "206 Partial Content",
+            "Content-Range: bytes 0-35/36\r\n",
+            full.to_vec(),
+        );
+        let result = download_target_streaming(&url, &dest, 36, &sha256_hex(full), None, false);
+        // The poisoned .part is dropped and a fresh request made; the one-shot
+        // server is gone by then, so that fetch fails — the point is the .part.
+        assert!(
+            matches!(result, Err(UpdateError::FetchFailed(..))),
+            "{result:?}"
+        );
+        assert!(
+            !part.exists(),
+            "wrong-offset .part must be discarded, not appended to"
+        );
+    }
+
+    #[test]
+    fn test_content_range_start() {
+        assert_eq!(
+            content_range_start("bytes 2318743016-2447994879/2447994880"),
+            Some(2318743016)
+        );
+        assert_eq!(content_range_start("bytes 0-9/*"), Some(0));
+        assert_eq!(content_range_start("bytes */36"), None);
+        assert_eq!(content_range_start("garbage"), None);
     }
 
     #[test]
