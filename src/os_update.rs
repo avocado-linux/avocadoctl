@@ -270,6 +270,12 @@ pub fn apply_os_update(
                 );
                 write_to_emmc_boot(&source_path, &dev, &artifact.name)?;
             }
+            WriteTarget::NotOnThisMedium(reason) => {
+                println!(
+                    "    Skipping {} ({}): {reason}",
+                    artifact.name, target.partition
+                );
+            }
         }
     }
 
@@ -590,13 +596,19 @@ enum WriteTarget {
     /// manifest as `emmc-boot:<N>`. Written with force_ro lifted and verified
     /// by read-back; the BootROM reads the bootloader from offset 0 of it.
     EmmcBoot(PathBuf),
+    /// The target describes hardware this boot medium does not have (an eMMC
+    /// boot partition while running from an SD card). The artifact is skipped
+    /// with a message, not failed: a manifest describes every medium the
+    /// machine can be provisioned on, and the update must keep working on all
+    /// of them - only the pieces that exist on this one are written.
+    NotOnThisMedium(String),
 }
 
 /// `emmc-boot:<n>` -> the n-th hardware boot partition of the disk that holds
 /// the `var` partition (the disk the system runs from). Resolved at run time
 /// because the kernel's numbering (mmcblk1 vs mmcblk2) is not stable across
 /// kernels. `Ok(None)` when `spec` is not an emmc-boot target at all.
-fn resolve_emmc_boot(spec: &str) -> Result<Option<PathBuf>, OsUpdateError> {
+fn resolve_emmc_boot(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
     let Some(index) = spec.strip_prefix("emmc-boot:") else {
         return Ok(None);
     };
@@ -606,15 +618,27 @@ fn resolve_emmc_boot(spec: &str) -> Result<Option<PathBuf>, OsUpdateError> {
         ))
     })?;
     let disk = root_disk_name()?;
+    Ok(Some(emmc_boot_device(&disk, n)))
+}
+
+/// `/dev/<disk>boot<n>` when the disk has hardware boot partitions, otherwise
+/// the reason this medium has no such target. Pure over the disk name and the
+/// existence check so it can be tested without an eMMC.
+fn emmc_boot_target(disk: &str, n: u8, exists: impl Fn(&Path) -> bool) -> WriteTarget {
     let dev = PathBuf::from(format!("/dev/{disk}boot{n}"));
-    if !dev.exists() {
-        return Err(OsUpdateError::ArtifactWriteFailed(format!(
-            "slot target '{spec}': {} does not exist - {disk} has no eMMC boot partitions \
-             (SD card, or not an eMMC). Provision this medium instead of updating the bootloader.",
+    if exists(&dev) {
+        WriteTarget::EmmcBoot(dev)
+    } else {
+        WriteTarget::NotOnThisMedium(format!(
+            "{disk} has no eMMC hardware boot partitions ({} does not exist) - running from \
+             an SD card or another medium whose bootloader is not updated by the OS update",
             dev.display()
-        )));
+        ))
     }
-    Ok(Some(dev))
+}
+
+fn emmc_boot_device(disk: &str, n: u8) -> WriteTarget {
+    emmc_boot_target(disk, n, |p| p.exists())
 }
 
 /// Name of the whole disk holding the `var` partition, e.g. `mmcblk2`.
@@ -700,8 +724,8 @@ fn locate_target(
     partition_name: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<WriteTarget, OsUpdateError> {
-    if let Some(dev) = resolve_emmc_boot(partition_name)? {
-        return Ok(WriteTarget::EmmcBoot(dev));
+    if let Some(target) = resolve_emmc_boot(partition_name)? {
+        return Ok(target);
     }
     // Only a DEFINITELY ABSENT label may fall back. A label entry that exists
     // but cannot be resolved (dangling symlink, EACCES, I/O error) is a real
@@ -1649,6 +1673,16 @@ pub fn apply_os_update_streaming<R: Read>(
                 let _ = fs::remove_file(&tmp);
                 spooled?;
             }
+            WriteTarget::NotOnThisMedium(reason) => {
+                println!(
+                    "    Skipping {} ({}): {reason}",
+                    artifact.name, target.partition
+                );
+                // Drain the entry so the archive stream stays in sync.
+                io::copy(&mut entry, &mut io::sink()).map_err(|e| {
+                    OsUpdateError::ArtifactWriteFailed(format!("skipping {}: {e}", artifact.name))
+                })?;
+            }
         }
 
         seen.insert(entry_path_str);
@@ -1736,6 +1770,23 @@ mod tests {
         assert!(resolve_emmc_boot("rootfs-b").unwrap().is_none());
         // Malformed index is an error, not a fallback.
         assert!(resolve_emmc_boot("emmc-boot:x").is_err());
+    }
+
+    #[test]
+    fn emmc_boot_target_is_skipped_on_a_medium_without_boot_partitions() {
+        // eMMC: the hardware boot partition is the target.
+        match emmc_boot_target("mmcblk2", 1, |p| p == Path::new("/dev/mmcblk2boot1")) {
+            WriteTarget::EmmcBoot(dev) => assert_eq!(dev, PathBuf::from("/dev/mmcblk2boot1")),
+            _ => panic!("eMMC must yield the boot partition"),
+        }
+        // SD card: no such device, the artifact is skipped - never an error.
+        match emmc_boot_target("mmcblk1", 1, |_| false) {
+            WriteTarget::NotOnThisMedium(reason) => {
+                assert!(reason.contains("mmcblk1"), "{reason}");
+                assert!(reason.contains("SD card"), "{reason}");
+            }
+            _ => panic!("a disk without boot partitions must be skipped"),
+        }
     }
 
     #[test]
