@@ -261,6 +261,15 @@ pub fn apply_os_update(
                 );
                 write_to_device_at_offset(&source_path, &device, byte_offset, &artifact.name)?;
             }
+            WriteTarget::EmmcBoot(dev) => {
+                println!(
+                    "    Writing {} -> {} (eMMC boot partition {})",
+                    artifact.name,
+                    dev.display(),
+                    target.partition
+                );
+                write_to_emmc_boot(&source_path, &dev, &artifact.name)?;
+            }
         }
     }
 
@@ -573,7 +582,111 @@ fn determine_inactive_slot(current: &str, strategy: &str) -> Result<String, OsUp
 /// Where an artifact for `partition_name` gets written.
 enum WriteTarget {
     Partition(PathBuf),
-    Offset { device: String, byte_offset: u64 },
+    Offset {
+        device: String,
+        byte_offset: u64,
+    },
+    /// An eMMC hardware boot partition (`/dev/mmcblkXbootN`), named in the
+    /// manifest as `emmc-boot:<N>`. Written with force_ro lifted and verified
+    /// by read-back; the BootROM reads the bootloader from offset 0 of it.
+    EmmcBoot(PathBuf),
+}
+
+/// `emmc-boot:<n>` -> the n-th hardware boot partition of the disk that holds
+/// the `var` partition (the disk the system runs from). Resolved at run time
+/// because the kernel's numbering (mmcblk1 vs mmcblk2) is not stable across
+/// kernels. `Ok(None)` when `spec` is not an emmc-boot target at all.
+fn resolve_emmc_boot(spec: &str) -> Result<Option<PathBuf>, OsUpdateError> {
+    let Some(index) = spec.strip_prefix("emmc-boot:") else {
+        return Ok(None);
+    };
+    let n: u8 = index.parse().map_err(|_| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "slot target '{spec}': expected emmc-boot:<0|1>"
+        ))
+    })?;
+    let disk = root_disk_name()?;
+    let dev = PathBuf::from(format!("/dev/{disk}boot{n}"));
+    if !dev.exists() {
+        return Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "slot target '{spec}': {} does not exist - {disk} has no eMMC boot partitions \
+             (SD card, or not an eMMC). Provision this medium instead of updating the bootloader.",
+            dev.display()
+        )));
+    }
+    Ok(Some(dev))
+}
+
+/// Name of the whole disk holding the `var` partition, e.g. `mmcblk2`.
+fn root_disk_name() -> Result<String, OsUpdateError> {
+    let part = fs::canonicalize("/dev/disk/by-partlabel/var").map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "cannot resolve /dev/disk/by-partlabel/var to find the boot disk: {e}"
+        ))
+    })?;
+    let part_name = part
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| OsUpdateError::ArtifactWriteFailed("odd var partition path".into()))?
+        .to_string();
+    // /sys/class/block/<part>/.. is the parent disk for partition devices.
+    let parent = fs::canonicalize(format!("/sys/class/block/{part_name}/..")).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!("no parent disk for {part_name}: {e}"))
+    })?;
+    parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            OsUpdateError::ArtifactWriteFailed(format!("no parent disk for {part_name}"))
+        })
+}
+
+/// Write `source` to an eMMC boot partition: lift force_ro, write, fsync,
+/// read back and compare, restore force_ro whatever happened.
+fn write_to_emmc_boot(source: &Path, dev: &Path, artifact_name: &str) -> Result<(), OsUpdateError> {
+    let name = dev
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let force_ro = format!("/sys/block/{name}/force_ro");
+    fs::write(&force_ro, "0").map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!("cannot lift force_ro on {name}: {e}"))
+    })?;
+    let result = (|| -> Result<(), OsUpdateError> {
+        let data = fs::read(source).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!("Failed to read {artifact_name}: {e}"))
+        })?;
+        let mut f = fs::OpenOptions::new().write(true).open(dev).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!("Failed to open {}: {e}", dev.display()))
+        })?;
+        f.write_all(&data).and_then(|_| f.sync_all()).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!(
+                "Failed to write {artifact_name} to {}: {e}",
+                dev.display()
+            ))
+        })?;
+        drop(f);
+        let mut back = vec![0u8; data.len()];
+        fs::File::open(dev)
+            .and_then(|mut r| r.read_exact(&mut back))
+            .map_err(|e| {
+                OsUpdateError::ArtifactWriteFailed(format!(
+                    "Failed to read back {}: {e}",
+                    dev.display()
+                ))
+            })?;
+        if back != data {
+            return Err(OsUpdateError::ArtifactWriteFailed(format!(
+                "{artifact_name} read back from {} does not match what was written",
+                dev.display()
+            )));
+        }
+        Ok(())
+    })();
+    let _ = fs::write(&force_ro, "1");
+    result
 }
 
 /// The kernel's view of the disk wins over the bundle's. A GPT partition is
@@ -587,6 +700,9 @@ fn locate_target(
     partition_name: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<WriteTarget, OsUpdateError> {
+    if let Some(dev) = resolve_emmc_boot(partition_name)? {
+        return Ok(WriteTarget::EmmcBoot(dev));
+    }
     // Only a DEFINITELY ABSENT label may fall back. A label entry that exists
     // but cannot be resolved (dangling symlink, EACCES, I/O error) is a real
     // error to surface, not a reason to start writing by computed offset.
@@ -1509,6 +1625,30 @@ pub fn apply_os_update_streaming<R: Read>(
                     &artifact.name,
                 )?;
             }
+            WriteTarget::EmmcBoot(dev) => {
+                // A few MiB and it needs read-back verification: spool to a
+                // file and take the staged path.
+                let tmp =
+                    std::env::temp_dir().join(format!("avocadoctl-{}.emmc-boot", artifact.name));
+                let spooled = (|| -> Result<(), OsUpdateError> {
+                    let mut out = fs::File::create(&tmp).map_err(|e| {
+                        OsUpdateError::ArtifactWriteFailed(format!(
+                            "spool file {}: {e}",
+                            tmp.display()
+                        ))
+                    })?;
+                    io::copy(&mut entry, &mut out).map_err(|e| {
+                        OsUpdateError::ArtifactWriteFailed(format!(
+                            "spooling {}: {e}",
+                            artifact.name
+                        ))
+                    })?;
+                    verify_sha256(&tmp, &artifact.sha256, &artifact.name)?;
+                    write_to_emmc_boot(&tmp, &dev, &artifact.name)
+                })();
+                let _ = fs::remove_file(&tmp);
+                spooled?;
+            }
         }
 
         seen.insert(entry_path_str);
@@ -1588,6 +1728,14 @@ mod tests {
             }
             other => panic!("expected layout offset, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn emmc_boot_targets_are_recognised_and_validated() {
+        // Not an emmc-boot spec: falls through to the label/layout logic.
+        assert!(resolve_emmc_boot("rootfs-b").unwrap().is_none());
+        // Malformed index is an error, not a fallback.
+        assert!(resolve_emmc_boot("emmc-boot:x").is_err());
     }
 
     #[test]
