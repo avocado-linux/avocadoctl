@@ -13,6 +13,9 @@ pub enum StagingError {
     #[error("Staging failed: {0}")]
     StagingFailed(String),
 
+    #[error("Another update is in progress; garbage collection skipped")]
+    UpdateInProgress,
+
     #[error("Cannot remove the active runtime. Activate a different runtime first.")]
     RemoveActiveRuntime,
 

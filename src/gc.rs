@@ -19,6 +19,16 @@ pub struct GcResult {
 /// Keeps at most `retention` runtimes. The active runtime and any runtime
 /// referenced by `pending-update.json` are always kept regardless of the limit.
 pub fn collect_garbage(base_dir: &Path, retention: u32) -> Result<GcResult, StagingError> {
+    // Same lock as `update::perform_update`. Between an update installing its
+    // images and writing the runtime manifest, those images are referenced by
+    // nothing on disk, and `cleanup_orphaned_images` would delete them from
+    // under the pass. The agent calls GC right after an update returns, and a
+    // duplicate "update available" nudge can have a second pass mid-flight by
+    // then. Skip rather than wait: a stuck download must not pin this thread.
+    let _lock = crate::update::acquire_update_lock(base_dir).map_err(|e| match e {
+        crate::update::UpdateError::UpdateInProgress => StagingError::UpdateInProgress,
+        other => StagingError::StagingFailed(other.to_string()),
+    })?;
     let retention = retention.max(1) as usize;
     let mut result = GcResult::default();
 
@@ -218,6 +228,18 @@ mod tests {
             removed.contains(&"orphan.verity".to_string()),
             "an unreferenced hash tree is still garbage, removed: {removed:?}"
         );
+    }
+
+    #[test]
+    fn test_gc_skipped_while_update_holds_the_lock() {
+        let tmp = TempDir::new().unwrap();
+        let held = crate::update::acquire_update_lock(tmp.path()).unwrap();
+        assert!(matches!(
+            collect_garbage(tmp.path(), 3),
+            Err(StagingError::UpdateInProgress)
+        ));
+        drop(held);
+        collect_garbage(tmp.path(), 3).unwrap();
     }
 
     #[test]

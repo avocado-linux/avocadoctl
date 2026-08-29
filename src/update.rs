@@ -25,6 +25,15 @@ pub enum UpdateError {
         actual: String,
     },
 
+    #[error(
+        "Length mismatch for target '{target}': expected {expected} bytes, got {actual} bytes"
+    )]
+    LengthMismatch {
+        target: String,
+        expected: u64,
+        actual: u64,
+    },
+
     #[error("Staging failed: {0}")]
     StagingFailed(String),
 
@@ -465,7 +474,7 @@ pub fn perform_update(
 /// Take an exclusive advisory lock on `<base_dir>/.update.lock` for the lifetime
 /// of the returned handle. Fails fast with `UpdateInProgress` rather than
 /// blocking: the caller (usually the agent) already has its own retry cadence.
-fn acquire_update_lock(base_dir: &Path) -> Result<File, UpdateError> {
+pub(crate) fn acquire_update_lock(base_dir: &Path) -> Result<File, UpdateError> {
     fs::create_dir_all(base_dir)
         .map_err(|e| UpdateError::StagingFailed(format!("Failed to create base dir: {e}")))?;
     let lock = File::create(base_dir.join(".update.lock"))
@@ -701,10 +710,10 @@ fn download_target(
         let data = fetch_url_bytes(&target_url, auth_token)?;
 
         if data.len() as u64 != target_info.length {
-            return Err(UpdateError::HashMismatch {
+            return Err(UpdateError::LengthMismatch {
                 target: name_str.to_string(),
-                expected: format!("{} bytes", target_info.length),
-                actual: format!("{} bytes", data.len()),
+                expected: target_info.length,
+                actual: data.len() as u64,
             });
         }
 
@@ -824,10 +833,10 @@ fn download_target_streaming(
         if on_disk > expected_len {
             let _ = fs::remove_file(&part_path);
         }
-        return Err(UpdateError::HashMismatch {
+        return Err(UpdateError::LengthMismatch {
             target: name.to_string(),
-            expected: format!("{expected_len} bytes"),
-            actual: format!("{on_disk} bytes"),
+            expected: expected_len,
+            actual: on_disk,
         });
     }
 
@@ -851,9 +860,14 @@ fn download_target_streaming(
 }
 
 /// Issue an HTTP GET (optionally with Range header), returning the open file
-/// handle and a body reader. If the server doesn't support Range (returns 200
-/// instead of 206), the file is truncated and download starts from the beginning.
-/// Returns (file, body_reader) and the effective byte offset we're writing from.
+/// handle and a body reader, plus the byte offset the body continues from.
+///
+/// The `.part` is only ever replaced once a full-file response is in hand:
+/// `File::create` truncates it at that point and never before. A ranged request
+/// that fails on transport, or with any status other than 416, leaves the file
+/// untouched — it is still a valid prefix and the next pass resumes it. On a
+/// multi-GB bundle over a flaky link that is the difference between converging
+/// and starting over on every 503.
 fn fetch_streaming(
     url: &str,
     part_path: &Path,
@@ -869,7 +883,11 @@ fn fetch_streaming(
             req = req.header("Range", format!("bytes={from}-"));
         }
         req.call()
-            .map_err(|e| UpdateError::FetchFailed(url.to_string(), e.to_string()))
+    };
+    let fetch_failed = |e: ureq::Error| UpdateError::FetchFailed(url.to_string(), e.to_string());
+    let create_part = || {
+        File::create(part_path)
+            .map_err(|e| UpdateError::StagingFailed(format!("Failed to create .part: {e}")))
     };
 
     if existing_len > 0 {
@@ -893,42 +911,37 @@ fn fetch_streaming(
                         })?;
                     return Ok(((file, response.into_body()), existing_len));
                 }
-                if status == 206 {
-                    // Partial content from the wrong offset: appending would
-                    // corrupt the prefix. Drop it and download from scratch.
-                    let _ = fs::remove_file(part_path);
-                } else {
-                    // 200 or other — server sent the full file; start fresh
-                    let file = File::create(part_path).map_err(|e| {
-                        UpdateError::StagingFailed(format!("Failed to create .part: {e}"))
-                    })?;
-                    return Ok(((file, response.into_body()), 0));
+                if status != 206 {
+                    // 200: the server ignored Range and sent the whole file.
+                    // That is the replacement; truncate and stream it.
+                    return Ok(((create_part()?, response.into_body()), 0));
                 }
+                // 206 from the wrong offset: appending would corrupt the
+                // prefix. Fall through to a fresh un-ranged request; the .part
+                // is only truncated if that request succeeds.
             }
-            Err(_) => {
-                // Request failed (possibly 416) — delete .part and try fresh
-                let _ = fs::remove_file(part_path);
-            }
+            // Our .part is past what the server has: the resume can never
+            // work, so fall through to a fresh request the same way.
+            Err(ureq::Error::StatusCode(416)) => {}
+            // Transport error, 401, 429, 503, ...: nothing wrong with the
+            // .part. Keep it and let the next pass resume.
+            Err(e) => return Err(fetch_failed(e)),
         }
     }
 
-    // Full download from scratch
-    let response = make_request(None)?;
-    let file = File::create(part_path)
-        .map_err(|e| UpdateError::StagingFailed(format!("Failed to create .part: {e}")))?;
-    Ok(((file, response.into_body()), 0))
+    // Full download from scratch. Only now is the .part replaced.
+    let response = make_request(None).map_err(fetch_failed)?;
+    Ok(((create_part()?, response.into_body()), 0))
 }
 
 /// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
+/// Range units are case-insensitive (RFC 9110 §14.1).
 fn content_range_start(value: &str) -> Option<u64> {
-    value
-        .trim()
-        .strip_prefix("bytes ")?
-        .split('-')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    let (unit, range) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    range.trim().split('-').next()?.trim().parse().ok()
 }
 
 /// Compute SHA256 hash of a file by streaming, avoiding loading the full file into memory.
@@ -1569,11 +1582,68 @@ mod tests {
         url
     }
 
+    /// Serves `responses` to successive connections and records each request
+    /// head, so a test can assert what was asked (e.g. a `Range` header).
+    fn serve_requests(
+        responses: Vec<(&'static str, &'static str, Vec<u8>)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/t.raw", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for (status, headers, body) in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut req = [0u8; 4096];
+                let n = sock.read(&mut req).unwrap_or(0);
+                record
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req[..n]).into_owned());
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                sock.write_all(head.as_bytes()).unwrap();
+                sock.write_all(&body).unwrap();
+            }
+        });
+        (url, seen)
+    }
+
+    /// The guard must live for the whole pass, not just `acquire_update_lock`.
+    /// Holds a real `perform_update` inside its first network fetch (well past
+    /// the lock) and checks a second pass is refused while it is there.
     #[test]
-    fn test_update_lock_rejects_concurrent_pass() {
+    fn test_update_lock_held_for_the_whole_pass() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
         let tmp = tempfile::TempDir::new().unwrap();
-        let held = acquire_update_lock(tmp.path()).unwrap();
-        let result = perform_update(
+        let (root_json, _) = make_test_root_json();
+        fs::create_dir_all(tmp.path().join("metadata")).unwrap();
+        fs::write(tmp.path().join("metadata").join("root.json"), root_json).unwrap();
+
+        // Accept the timestamp.json request, then hold the pass there until told
+        // to let go; dropping the socket then fails the fetch and ends the pass.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req);
+            arrived_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+
+        let base = tmp.path().to_path_buf();
+        let first =
+            std::thread::spawn(move || perform_update(&url, &base, None, None, false, false, 0));
+        arrived_rx.recv().unwrap();
+
+        let second = perform_update(
             "http://127.0.0.1:1",
             tmp.path(),
             None,
@@ -1583,12 +1653,19 @@ mod tests {
             0,
         );
         assert!(
-            matches!(result, Err(UpdateError::UpdateInProgress)),
-            "{result:?}"
+            matches!(second, Err(UpdateError::UpdateInProgress)),
+            "a pass mid-flight must hold the lock: {second:?}"
         );
-        drop(held);
-        // Lock released: the pass proceeds far enough to hit the missing trust anchor.
-        let result = perform_update(
+
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        assert!(
+            matches!(first, Err(UpdateError::FetchFailed(..))),
+            "{first:?}"
+        );
+
+        // Released with the pass: the next one gets past the lock to its fetch.
+        let third = perform_update(
             "http://127.0.0.1:1",
             tmp.path(),
             None,
@@ -1598,8 +1675,8 @@ mod tests {
             0,
         );
         assert!(
-            matches!(result, Err(UpdateError::NoTrustAnchor)),
-            "{result:?}"
+            matches!(third, Err(UpdateError::FetchFailed(..))),
+            "{third:?}"
         );
     }
 
@@ -1629,7 +1706,7 @@ mod tests {
         );
         let result = download_target_streaming(&url, &dest, 36, &sha256_hex(full), None, false);
         match result {
-            Err(UpdateError::HashMismatch { actual, .. }) => assert_eq!(actual, "40 bytes"),
+            Err(UpdateError::LengthMismatch { actual, .. }) => assert_eq!(actual, 40),
             other => panic!("expected length mismatch from disk, got {other:?}"),
         }
         assert!(!part.exists(), "over-long .part must not be resumed");
@@ -1649,7 +1726,7 @@ mod tests {
         );
         let result = download_target_streaming(&url, &dest, 36, &sha256_hex(full), None, false);
         assert!(
-            matches!(result, Err(UpdateError::HashMismatch { .. })),
+            matches!(result, Err(UpdateError::LengthMismatch { .. })),
             "{result:?}"
         );
         assert_eq!(
@@ -1659,30 +1736,56 @@ mod tests {
         );
     }
 
+    /// A 206 from the wrong offset is never appended: the pass re-requests
+    /// the file un-ranged and replaces the .part only with that response.
     #[test]
-    fn test_206_wrong_offset_discards_part() {
+    fn test_206_wrong_offset_restarts_unranged() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dest = tmp.path().join("t.raw");
         let part = tmp.path().join("t.raw.part");
         let full = b"0123456789abcdefghijklmnopqrstuvwxyz";
         fs::write(&part, &full[..10]).unwrap();
-        // 206 that resumes from 0 instead of 10. Appending it would have
-        // produced a 46-byte file that also passed the old counter check.
-        let url = serve_once(
-            "206 Partial Content",
-            "Content-Range: bytes 0-35/36\r\n",
-            full.to_vec(),
+        let (url, seen) = serve_requests(vec![
+            (
+                "206 Partial Content",
+                "Content-Range: bytes 0-35/36\r\n",
+                full.to_vec(),
+            ),
+            ("200 OK", "", full.to_vec()),
+        ]);
+        download_target_streaming(&url, &dest, 36, &sha256_hex(full), None, false).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), full);
+        assert!(!part.exists());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let seen: Vec<String> = seen.iter().map(|r| r.to_ascii_lowercase()).collect();
+        assert!(seen[0].contains("range: bytes=10-"), "{}", seen[0]);
+        assert!(
+            !seen[1].contains("range:"),
+            "restart must be un-ranged: {}",
+            seen[1]
         );
+    }
+
+    /// A ranged request that fails for reasons unrelated to the .part (503,
+    /// 429, connection reset, ...) must leave the prefix for the next pass.
+    #[test]
+    fn test_failed_ranged_request_keeps_part() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("t.raw");
+        let part = tmp.path().join("t.raw.part");
+        let full = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        fs::write(&part, &full[..10]).unwrap();
+        let url = serve_once("503 Service Unavailable", "", b"busy".to_vec());
         let result = download_target_streaming(&url, &dest, 36, &sha256_hex(full), None, false);
-        // The poisoned .part is dropped and a fresh request made; the one-shot
-        // server is gone by then, so that fetch fails — the point is the .part.
         assert!(
             matches!(result, Err(UpdateError::FetchFailed(..))),
             "{result:?}"
         );
-        assert!(
-            !part.exists(),
-            "wrong-offset .part must be discarded, not appended to"
+        assert_eq!(
+            fs::read(&part).unwrap(),
+            &full[..10],
+            "prefix must survive a 503"
         );
     }
 
@@ -1693,6 +1796,8 @@ mod tests {
             Some(2318743016)
         );
         assert_eq!(content_range_start("bytes 0-9/*"), Some(0));
+        // RFC 9110 §14.1: range units are case-insensitive.
+        assert_eq!(content_range_start("Bytes 10-35/36"), Some(10));
         assert_eq!(content_range_start("bytes */36"), None);
         assert_eq!(content_range_start("garbage"), None);
     }

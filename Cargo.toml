@@ -2,6 +2,9 @@
 name = "avocadoctl"
 version = "0.10.0"
 edition = "2021"
+# File::try_lock / std::fs::TryLockError (update lock). Both device toolchains
+# clear this: scarthgap via meta-lts-mixins (rust 1.92), wrynose oe-core (1.94).
+rust-version = "1.89"
 description = "Avocado Linux control CLI tool"
 authors = ["Avocado"]
 license = "Apache-2.0"

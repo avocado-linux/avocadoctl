@@ -119,6 +119,9 @@ impl From<crate::staging::StagingError> for AvocadoError {
             crate::staging::StagingError::HashMismatch(details) => {
                 AvocadoError::StagingFailed { reason: details }
             }
+            crate::staging::StagingError::UpdateInProgress => AvocadoError::StagingFailed {
+                reason: crate::staging::StagingError::UpdateInProgress.to_string(),
+            },
         }
     }
 }
