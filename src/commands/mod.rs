@@ -3,6 +3,7 @@ pub mod hitl;
 pub mod image_adaptor;
 pub mod root_authority;
 pub mod runtime;
+pub mod var_key;
 
 #[cfg(test)]
 pub(crate) mod test_env {
