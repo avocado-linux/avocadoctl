@@ -15,7 +15,7 @@ mod varlink_client;
 mod varlink_server;
 
 use clap::{Arg, Command};
-use commands::{ext, hitl, root_authority, runtime};
+use commands::{ext, hitl, root_authority, runtime, var_key};
 use config::Config;
 use output::OutputManager;
 use varlink::org_avocado_Extensions as vl_ext;
@@ -67,6 +67,7 @@ fn main() {
         .subcommand(commands::hitl::create_command())
         .subcommand(commands::root_authority::create_command())
         .subcommand(commands::runtime::create_command())
+        .subcommand(commands::var_key::create_command())
         .subcommand(
             Command::new("status").about("Show overall system status including extensions"),
         )
@@ -773,6 +774,9 @@ fn handle_direct(matches: &clap::ArgMatches, config: &Config, output: &OutputMan
         }
         Some(("runtime", runtime_matches)) => {
             runtime::handle_command(runtime_matches, config, output);
+        }
+        Some(("var-key", vk_matches)) => {
+            var_key::handle_command(vk_matches, output);
         }
         Some(("serve", serve_matches)) => {
             let address = serve_matches
