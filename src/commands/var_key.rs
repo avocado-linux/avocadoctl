@@ -83,7 +83,13 @@ pub fn handle_command(matches: &ArgMatches, output: &OutputManager) {
                 remove(&SystemRunner)
             }
         }
-        _ => Err("unknown var-key subcommand".to_string()),
+        // clap has subcommand_required(true), so this is unreachable in
+        // practice; refusing loudly keeps a future subcommand from silently
+        // reporting success.
+        other => Err(format!(
+            "unknown var-key subcommand {:?}",
+            other.map(|(name, _)| name).unwrap_or("<none>")
+        )),
     };
     match result {
         Ok(msg) => output.success("var-key", &msg),
