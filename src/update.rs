@@ -300,22 +300,14 @@ pub fn perform_update(
                         existing_images.insert(bundle_filename.clone());
                     }
 
-                    if let Some(ref expected_id) = os_bundle.os_build_id {
-                        let matches =
-                            crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
-                                verify_type: "os-release".to_string(),
-                                field: "AVOCADO_OS_BUILD_ID".to_string(),
-                                expected: expected_id.clone(),
-                            })
-                            .unwrap_or(false);
-                        if matches {
-                            // OS is already at target version — skip downloading the bundle
-                            println!(
-                                "    OS already at target version (AVOCADO_OS_BUILD_ID={expected_id}), skipping OS bundle download"
-                            );
-                            existing_images.insert(bundle_filename);
-                            os_bundle_skipped = true;
-                        }
+                    // Rootfs and initramfs both already running: nothing to fetch.
+                    if crate::os_update::os_bundle_satisfied(os_bundle, base_dir) {
+                        println!(
+                            "    OS already at target version (AVOCADO_OS_BUILD_ID={}), skipping OS bundle download",
+                            os_bundle.os_build_id.as_deref().unwrap_or("unknown")
+                        );
+                        existing_images.insert(bundle_filename);
+                        os_bundle_skipped = true;
                     }
                 }
             }
@@ -492,7 +484,7 @@ pub(crate) fn acquire_update_lock(base_dir: &Path) -> Result<File, UpdateError> 
 /// already active and intact, and the running OS already satisfies the
 /// manifest's os_bundle (if any).
 fn is_already_current(manifest: &RuntimeManifest, base_dir: &Path) -> bool {
-    is_runtime_current(manifest, base_dir) && os_requirement_satisfied(manifest)
+    is_runtime_current(manifest, base_dir) && os_requirement_satisfied(manifest, base_dir)
 }
 
 /// The active runtime matches `manifest` and every *extension* image it lists
@@ -527,19 +519,11 @@ fn is_runtime_current(manifest: &RuntimeManifest, base_dir: &Path) -> bool {
 /// knows how to apply a bundle. That asymmetry matters after an OS rollback:
 /// the active runtime id still matches, but the OS no longer does, and a
 /// re-nudge must repair the OS rather than report nothing to do.
-fn os_requirement_satisfied(manifest: &RuntimeManifest) -> bool {
+fn os_requirement_satisfied(manifest: &RuntimeManifest, base_dir: &Path) -> bool {
     let Some(ref os_bundle) = manifest.os_bundle else {
         return true;
     };
-
-    os_bundle.os_build_id.as_ref().is_some_and(|expected| {
-        crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
-            verify_type: "os-release".to_string(),
-            field: "AVOCADO_OS_BUILD_ID".to_string(),
-            expected: expected.clone(),
-        })
-        .unwrap_or(false)
-    })
+    crate::os_update::os_bundle_satisfied(os_bundle, base_dir)
 }
 
 /// Complete the update after the runtime has been staged.
@@ -561,16 +545,7 @@ fn finish_update(
     // When an OS update is applied, the runtime stays pending (not active) — it will
     // be promoted to active on the next boot after the OS build ID is verified.
     if let Some(ref os_bundle) = new_manifest.os_bundle {
-        let skip = if let Some(ref expected_id) = os_bundle.os_build_id {
-            crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
-                verify_type: "os-release".to_string(),
-                field: "AVOCADO_OS_BUILD_ID".to_string(),
-                expected: expected_id.clone(),
-            })
-            .unwrap_or(false)
-        } else {
-            false
-        };
+        let skip = crate::os_update::os_bundle_satisfied(os_bundle, base_dir);
 
         if skip {
             println!(
@@ -1363,7 +1338,10 @@ mod tests {
     #[test]
     fn no_os_bundle_imposes_no_os_requirement() {
         let manifest = already_current_manifest("d164f0d8-f9f3-4597-8413-42a6429fe17d");
-        assert!(os_requirement_satisfied(&manifest));
+        assert!(os_requirement_satisfied(
+            &manifest,
+            std::path::Path::new("/nonexistent-avocado-base")
+        ));
     }
 
     /// An unverifiable bundle (no build id, or an os-release that does not
@@ -1380,12 +1358,18 @@ mod tests {
             os_build_id: None,
             initramfs_build_id: None,
         });
-        assert!(!os_requirement_satisfied(&manifest));
+        assert!(!os_requirement_satisfied(
+            &manifest,
+            std::path::Path::new("/nonexistent-avocado-base")
+        ));
 
         // The host running the test suite is not an Avocado OS at this build.
         manifest.os_bundle.as_mut().unwrap().os_build_id =
             Some("a-build-id-no-real-os-release-carries".to_string());
-        assert!(!os_requirement_satisfied(&manifest));
+        assert!(!os_requirement_satisfied(
+            &manifest,
+            std::path::Path::new("/nonexistent-avocado-base")
+        ));
     }
 
     #[test]

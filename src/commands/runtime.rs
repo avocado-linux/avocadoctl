@@ -293,12 +293,7 @@ fn handle_activate(matches: &ArgMatches, config: &Config, output: &OutputManager
                     expected: expected_id.clone(),
                 })
                 .unwrap_or(false);
-            let initramfs_changed = crate::service::runtime::initramfs_differs_from_active(
-                os_bundle,
-                crate::service::runtime::active_manifest(base_path).as_ref(),
-            );
-
-            if !already_matches || initramfs_changed {
+            if !crate::os_update::os_bundle_satisfied(os_bundle, base_path) {
                 // OS change required — apply update, mark pending, reboot
                 let aos_path = base_path
                     .join(IMAGES_DIR_NAME)
