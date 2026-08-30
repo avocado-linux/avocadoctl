@@ -285,63 +285,68 @@ fn handle_activate(matches: &ArgMatches, config: &Config, output: &OutputManager
 
     // Check if the target runtime requires a different OS
     if let Some(ref os_bundle) = matched.os_bundle {
-        if let Some(ref expected_id) = os_bundle.os_build_id {
-            let already_matches =
-                crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
-                    verify_type: "os-release".to_string(),
-                    field: "AVOCADO_OS_BUILD_ID".to_string(),
-                    expected: expected_id.clone(),
-                })
-                .unwrap_or(false);
-            if !crate::os_update::os_bundle_satisfied(os_bundle, base_path) {
-                // OS change required — apply update, mark pending, reboot
-                let aos_path = base_path
-                    .join(IMAGES_DIR_NAME)
-                    .join(format!("{}.raw", os_bundle.image_id));
+        // Not gated on os_build_id: os_bundle_satisfied treats a bundle without
+        // one as not satisfied, and skipping OS handling here entirely is how an
+        // initramfs-only change activated without its bundle ever being applied.
+        let expected_id = os_bundle.os_build_id.as_ref();
+        let already_matches = expected_id.is_some_and(|expected| {
+            crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
+                verify_type: "os-release".to_string(),
+                field: "AVOCADO_OS_BUILD_ID".to_string(),
+                expected: expected.clone(),
+            })
+            .unwrap_or(false)
+        });
+        if !crate::os_update::os_bundle_satisfied(os_bundle, base_path) {
+            // OS change required — apply update, mark pending, reboot
+            let aos_path = base_path
+                .join(IMAGES_DIR_NAME)
+                .join(format!("{}.raw", os_bundle.image_id));
 
-                if !aos_path.exists() {
-                    output.error(
-                        "Runtime Activate",
-                        &format!("OS bundle image not found: {}", aos_path.display()),
-                    );
-                    std::process::exit(1);
-                }
+            if !aos_path.exists() {
+                output.error(
+                    "Runtime Activate",
+                    &format!("OS bundle image not found: {}", aos_path.display()),
+                );
+                std::process::exit(1);
+            }
 
-                output.step(
+            output.step(
                     "Runtime Activate",
                     &if already_matches {
                         format!(
                             "OS change required: initramfs differs from the active runtime's (target initramfs_build_id={})",
                             os_bundle.initramfs_build_id.as_deref().unwrap_or("-")
                         )
-                    } else {
+                    } else if let Some(expected_id) = expected_id {
                         format!(
                             "OS change required (target AVOCADO_OS_BUILD_ID={})",
                             expected_id
                         )
+                    } else {
+                        "OS change required: the bundle carries no AVOCADO_OS_BUILD_ID to verify the running rootfs against".to_string()
                     },
                 );
 
-                if let Err(e) = crate::os_update::apply_os_update(&aos_path, base_path, false) {
-                    output.error("Runtime Activate", &format!("OS update failed: {e}"));
-                    std::process::exit(1);
-                }
-
-                if let Err(e) = crate::os_update::set_pending_runtime_id(&matched.id, base_path) {
-                    output.error(
-                        "Runtime Activate",
-                        &format!("Failed to set pending runtime: {e}"),
-                    );
-                    std::process::exit(1);
-                }
-
-                output.step(
-                    "Runtime Activate",
-                    "OS update applied. Rebooting to activate new OS...",
-                );
-                let _ = std::process::Command::new("reboot").status();
-                return;
+            if let Err(e) = crate::os_update::apply_os_update(&aos_path, base_path, false) {
+                output.error("Runtime Activate", &format!("OS update failed: {e}"));
+                std::process::exit(1);
             }
+
+            if let Err(e) = crate::os_update::set_pending_runtime_id(&matched.id, base_path) {
+                output.error(
+                    "Runtime Activate",
+                    &format!("Failed to set pending runtime: {e}"),
+                );
+                std::process::exit(1);
+            }
+
+            output.step(
+                "Runtime Activate",
+                "OS update applied. Rebooting to activate new OS...",
+            );
+            let _ = std::process::Command::new("reboot").status();
+            return;
         }
     }
 

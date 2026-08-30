@@ -361,18 +361,21 @@ fn runtime_requires_os_change(
         Some(b) => b,
         None => return Ok(false),
     };
-    let expected_id = match &os_bundle.os_build_id {
-        Some(id) => id,
-        None => return Ok(false),
-    };
+    // No early return when the bundle carries no os_build_id: os_bundle_satisfied
+    // is the source of truth and treats an unverifiable bundle as not satisfied.
+    // Returning "no OS change" here is how an initramfs-only runtime went active
+    // with its bundle never applied.
+    let expected_id = os_bundle.os_build_id.as_ref();
 
     // Check if the running rootfs already matches
-    let already_matches = crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
-        verify_type: "os-release".to_string(),
-        field: "AVOCADO_OS_BUILD_ID".to_string(),
-        expected: expected_id.clone(),
-    })
-    .unwrap_or(false);
+    let already_matches = expected_id.is_some_and(|expected| {
+        crate::os_update::verify_os_release(&crate::os_update::VerifyConfig {
+            verify_type: "os-release".to_string(),
+            field: "AVOCADO_OS_BUILD_ID".to_string(),
+            expected: expected.clone(),
+        })
+        .unwrap_or(false)
+    });
 
     if crate::os_update::os_bundle_satisfied(os_bundle, base_dir) {
         return Ok(false);
@@ -394,10 +397,14 @@ fn runtime_requires_os_change(
             "  OS change required: the initramfs differs from the active runtime's (target initramfs_build_id={})",
             os_bundle.initramfs_build_id.as_deref().unwrap_or("-")
         );
-    } else {
+    } else if let Some(expected_id) = expected_id {
         println!(
             "  OS change required: current rootfs does not match target AVOCADO_OS_BUILD_ID={}",
             expected_id
+        );
+    } else {
+        println!(
+            "  OS change required: the bundle carries no AVOCADO_OS_BUILD_ID to verify the running rootfs against"
         );
     }
     println!("  Applying OS update from {}...", aos_path.display());
