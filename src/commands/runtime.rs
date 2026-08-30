@@ -293,8 +293,12 @@ fn handle_activate(matches: &ArgMatches, config: &Config, output: &OutputManager
                     expected: expected_id.clone(),
                 })
                 .unwrap_or(false);
+            let initramfs_changed = crate::service::runtime::initramfs_differs_from_active(
+                os_bundle,
+                crate::service::runtime::active_manifest(base_path).as_ref(),
+            );
 
-            if !already_matches {
+            if !already_matches || initramfs_changed {
                 // OS change required — apply update, mark pending, reboot
                 let aos_path = base_path
                     .join(IMAGES_DIR_NAME)
@@ -310,10 +314,17 @@ fn handle_activate(matches: &ArgMatches, config: &Config, output: &OutputManager
 
                 output.step(
                     "Runtime Activate",
-                    &format!(
-                        "OS change required (target AVOCADO_OS_BUILD_ID={})",
-                        expected_id
-                    ),
+                    &if already_matches {
+                        format!(
+                            "OS change required: initramfs differs from the active runtime's (target initramfs_build_id={})",
+                            os_bundle.initramfs_build_id.as_deref().unwrap_or("-")
+                        )
+                    } else {
+                        format!(
+                            "OS change required (target AVOCADO_OS_BUILD_ID={})",
+                            expected_id
+                        )
+                    },
                 );
 
                 if let Err(e) = crate::os_update::apply_os_update(&aos_path, base_path, false) {
