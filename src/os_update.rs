@@ -206,13 +206,24 @@ pub fn apply_os_update(
 
     // Check if OS is already at the target version — skip if BUILD_ID matches
     if let Some(ref verify) = bundle.verify {
-        if let Ok(true) = verify_os_release(verify) {
+        let rootfs_matches = verify_os_release(verify).unwrap_or(false);
+        if write_can_be_skipped(
+            rootfs_matches,
+            bundle.initramfs_build_id.as_deref(),
+            active_manifest(base_dir).as_ref(),
+        ) {
             println!(
                 "  OS already up to date ({}={}), skipping write",
                 verify.field, verify.expected
             );
             let _ = fs::remove_dir_all(&staging_dir);
             return Ok(false);
+        }
+        if rootfs_matches {
+            println!(
+                "  Rootfs already at {}={}, but the initramfs differs — writing the bundle",
+                verify.field, verify.expected
+            );
         }
     }
 
@@ -1742,9 +1753,7 @@ pub fn apply_os_update_streaming<R: Read>(
 /// os-release, the initramfs against the currently active runtime's record,
 /// because the running system keeps no trace of its initramfs id. Unknown ids
 /// count as "not satisfied" for the rootfs (an OS rollback must be repaired)
-/// and as "no difference" for the initramfs (never reboot on a guess) - though
-/// the guess is only reached when the initrd published no id for this boot, see
-/// [`running_initramfs_build_id`].
+/// and as "no difference" for the initramfs (never reboot on a guess).
 pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &Path) -> bool {
     let rootfs_matches = os_bundle.os_build_id.as_ref().is_some_and(|expected| {
         verify_os_release(&VerifyConfig {
@@ -1777,28 +1786,44 @@ fn read_initramfs_id_file(path: &Path) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-/// See [`os_bundle_satisfied`]: the initramfs half of the comparison.
-pub fn initramfs_differs_from_active(
-    target: &crate::manifest::OsBundleRef,
+/// Whether writing a bundle can be skipped because the running OS already is it.
+///
+/// The rootfs matching is only half the question. An initramfs-only change ships
+/// the same rootfs and a different initramfs, so a rootfs-only skip here writes
+/// nothing while every caller upstream has already decided the bundle must be
+/// applied - the runtime then goes active over an initramfs that was never
+/// written. Same rule as [`os_bundle_satisfied`], which is what the callers use.
+fn write_can_be_skipped(
+    rootfs_matches: bool,
+    target_initramfs_id: Option<&str>,
     active: Option<&crate::manifest::RuntimeManifest>,
 ) -> bool {
-    initramfs_differs_from_running(target, active, running_initramfs_build_id().as_deref())
+    rootfs_matches && !initramfs_id_differs_from_active(target_initramfs_id, active)
 }
 
-/// [`initramfs_differs_from_active`] with the running id passed in.
+/// [`initramfs_differs_from_active`] for a target known only by its initramfs
+/// id - an on-disk bundle carries one but is not a manifest `OsBundleRef`.
+pub fn initramfs_id_differs_from_active(
+    target_id: Option<&str>,
+    active: Option<&crate::manifest::RuntimeManifest>,
+) -> bool {
+    initramfs_id_differs_from_running(target_id, active, running_initramfs_build_id().as_deref())
+}
+
+/// [`initramfs_id_differs_from_active`] with the running id passed in.
 ///
 /// `running` is what the initrd published for this boot and is authoritative
-/// when present: it describes the initramfs in memory, where the active
-/// manifest only records what some earlier update intended to install.
-/// Without it the comparison falls back to the manifest, where an unknown id
-/// still counts as "no difference" - a device whose initramfs predates the
-/// publisher must not be pushed into a reboot on a guess.
-fn initramfs_differs_from_running(
-    target: &crate::manifest::OsBundleRef,
+/// when present: it describes the initramfs in memory, where the active manifest
+/// only records what some earlier update intended to install. Without it the
+/// comparison falls back to the manifest, where an unknown id still counts as
+/// "no difference" - a device whose initramfs predates the publisher must not be
+/// pushed into a reboot on a guess.
+fn initramfs_id_differs_from_running(
+    target_id: Option<&str>,
     active: Option<&crate::manifest::RuntimeManifest>,
     running: Option<&str>,
 ) -> bool {
-    let Some(target_id) = target.initramfs_build_id.as_deref() else {
+    let Some(target_id) = target_id else {
         return false;
     };
     if let Some(running_id) = running {
@@ -1811,6 +1836,14 @@ fn initramfs_differs_from_running(
         Some(id) => id != target_id,
         None => false,
     }
+}
+
+/// See [`os_bundle_satisfied`]: the initramfs half of the comparison.
+pub fn initramfs_differs_from_active(
+    target: &crate::manifest::OsBundleRef,
+    active: Option<&crate::manifest::RuntimeManifest>,
+) -> bool {
+    initramfs_id_differs_from_active(target.initramfs_build_id.as_deref(), active)
 }
 
 /// The currently active runtime's manifest, if any.
@@ -1929,72 +1962,51 @@ mod tests {
         m
     }
 
-    fn target_with_initramfs(id: Option<&str>) -> crate::manifest::OsBundleRef {
-        crate::manifest::OsBundleRef {
-            image_id: "img2".into(),
-            sha256: "00".into(),
-            os_build_id: Some("os-1".into()),
-            initramfs_build_id: id.map(str::to_string),
-        }
-    }
-
     #[test]
     fn the_running_initramfs_id_beats_the_manifests() {
         // The manifest records what an update intended to install; /run records
-        // what booted. When they disagree the running one is the truth - this is
-        // the case a stale or missing manifest record used to get wrong.
-        let active_claims_match = active_with_initramfs(Some("initrd-b"));
-        assert!(
-            initramfs_differs_from_running(
-                &target_with_initramfs(Some("initrd-b")),
-                Some(&active_claims_match),
-                Some("initrd-a"),
-            ),
-            "the manifest claimed the target initramfs, but initrd-a is running"
-        );
-        // And the reverse: an unknown manifest record is no longer a guess.
-        let active_unknown = active_with_initramfs(None);
-        assert!(
-            initramfs_differs_from_running(
-                &target_with_initramfs(Some("initrd-b")),
-                Some(&active_unknown),
-                Some("initrd-a"),
-            ),
-            "unknown on the manifest side, but /run says initrd-a is running"
-        );
-        assert!(
-            !initramfs_differs_from_running(
-                &target_with_initramfs(Some("initrd-b")),
-                Some(&active_unknown),
-                Some("initrd-b"),
-            ),
-            "/run says the target initramfs is already running"
-        );
+        // what booted. When they disagree the running one is the truth.
+        let claims_match = active_with_initramfs(Some("initrd-b"));
+        assert!(initramfs_id_differs_from_running(
+            Some("initrd-b"),
+            Some(&claims_match),
+            Some("initrd-a")
+        ));
+        let unknown = active_with_initramfs(None);
+        assert!(initramfs_id_differs_from_running(
+            Some("initrd-b"),
+            Some(&unknown),
+            Some("initrd-a")
+        ));
+        assert!(!initramfs_id_differs_from_running(
+            Some("initrd-b"),
+            Some(&unknown),
+            Some("initrd-b")
+        ));
     }
 
     #[test]
     fn without_a_published_id_the_manifest_comparison_is_unchanged() {
-        // An initramfs from before the publisher must behave exactly as it did,
-        // so no fielded device takes a reboot it would not have taken before.
+        // An initramfs from before the publisher behaves exactly as it did, so
+        // no fielded device takes a reboot it would not have taken before.
         let active = active_with_initramfs(Some("initrd-a"));
-        assert!(initramfs_differs_from_running(
-            &target_with_initramfs(Some("initrd-b")),
+        assert!(initramfs_id_differs_from_running(
+            Some("initrd-b"),
             Some(&active),
             None
         ));
-        assert!(!initramfs_differs_from_running(
-            &target_with_initramfs(Some("initrd-a")),
+        assert!(!initramfs_id_differs_from_running(
+            Some("initrd-a"),
             Some(&active),
             None
         ));
-        assert!(!initramfs_differs_from_running(
-            &target_with_initramfs(Some("initrd-b")),
+        assert!(!initramfs_id_differs_from_running(
+            Some("initrd-b"),
             Some(&active_with_initramfs(None)),
             None
         ));
-        // A target that declares no initramfs id makes no claim, published id or not.
-        assert!(!initramfs_differs_from_running(
-            &target_with_initramfs(None),
+        assert!(!initramfs_id_differs_from_running(
+            None,
             Some(&active),
             Some("initrd-z")
         ));
@@ -2011,6 +2023,36 @@ mod tests {
         assert_eq!(read_initramfs_id_file(&p), None, "whitespace only");
         fs::write(&p, "initrd-a\n").unwrap();
         assert_eq!(read_initramfs_id_file(&p), Some("initrd-a".to_string()));
+    }
+
+    #[test]
+    fn a_matching_rootfs_does_not_skip_an_initramfs_only_change() {
+        // The bug this pins: three callers correctly decide the bundle must be
+        // applied, apply_os_update sees the rootfs id match and writes nothing,
+        // and the runtime goes active over an initramfs that never landed.
+        let active = active_with_initramfs(Some("initrd-a"));
+        assert!(
+            !write_can_be_skipped(true, Some("initrd-b"), Some(&active)),
+            "rootfs matches but the initramfs differs: the bundle must be written"
+        );
+        assert!(
+            write_can_be_skipped(true, Some("initrd-a"), Some(&active)),
+            "same rootfs and same initramfs is genuinely nothing to do"
+        );
+        // A rootfs that does not match is written regardless of the initramfs.
+        assert!(!write_can_be_skipped(
+            false,
+            Some("initrd-a"),
+            Some(&active)
+        ));
+        // Unknown on either side keeps the old behaviour: never write on a guess.
+        assert!(write_can_be_skipped(true, None, Some(&active)));
+        assert!(write_can_be_skipped(
+            true,
+            Some("initrd-b"),
+            Some(&active_with_initramfs(None))
+        ));
+        assert!(write_can_be_skipped(true, Some("initrd-b"), None));
     }
 
     #[test]
