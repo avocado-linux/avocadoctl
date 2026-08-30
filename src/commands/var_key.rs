@@ -306,15 +306,28 @@ pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, S
     // failed import above must leave the existing recovery path usable, not
     // strip the device of every recovery slot it had.
     if let Some((tid, _, slots)) = recovery_token(&h).cloned() {
-        r.cryptsetup(
-            &["token", "remove", "--token-id", &tid.to_string(), &dev],
-            None,
-        )?;
-        for s in slots {
-            r.cryptsetup(
-                &["luksKillSlot", "--batch-mode", &dev, &s.to_string()],
+        let retired = r
+            .cryptsetup(
+                &["token", "remove", "--token-id", &tid.to_string(), &dev],
                 None,
-            )?;
+            )
+            .and_then(|_| {
+                slots.iter().try_for_each(|s| {
+                    r.cryptsetup(
+                        &["luksKillSlot", "--batch-mode", &dev, &s.to_string()],
+                        None,
+                    )
+                    .map(|_| ())
+                })
+            });
+        // Enrolment already succeeded here, so say so: the failure is that the
+        // OLD key still opens /var. Reporting a bare error invites a retry,
+        // which would add a third slot rather than retire the stale one.
+        if let Err(e) = retired {
+            return Err(format!(
+                "recovery keyslot {slot} is enrolled on {dev} ({kind}), but the previous recovery keyslot(s) {slots:?} could not be retired: {e}. \
+                 The old recovery key still opens this device - remove those keyslots before treating it as revoked. Re-running enroll would add another slot, not fix this."
+            ));
         }
     }
     Ok(format!(
@@ -396,6 +409,7 @@ mod tests {
         dump: &'static str,
         calls: RefCell<Vec<String>>,
         fail_import: bool,
+        fail_retire: bool,
     }
     impl Fake {
         fn new(dump: &'static str) -> Self {
@@ -403,6 +417,7 @@ mod tests {
                 dump,
                 calls: RefCell::new(vec![]),
                 fail_import: false,
+                fail_retire: false,
             }
         }
     }
@@ -413,6 +428,7 @@ mod tests {
                 "status" => Ok("/dev/mapper/var is active and is in use.\n  type:    LUKS2\n  device:  /dev/mmcblk2p9\n".into()),
                 "luksDump" => Ok(self.dump.into()),
                 "token" if args[1] == "import" && self.fail_import => Err("token import failed".into()),
+                "token" if args[1] == "remove" && self.fail_retire => Err("token remove failed".into()),
                 _ => Ok(String::new()),
             }
         }
@@ -500,6 +516,25 @@ mod tests {
         );
         assert!(
             calls.iter().any(|c| c.contains("--new-key-slot 3 ")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_retire_reports_that_the_new_slot_is_already_enrolled() {
+        // The new slot and token are live by this point; a bare error would
+        // invite a retry that adds a third slot instead of retiring the stale one.
+        let mut f = Fake::new(DUMP_WITH_RECOVERY);
+        f.fail_retire = true;
+        let err = enroll(&f, b"secret", "hmac-sha256-uid").unwrap_err();
+        assert!(err.contains("keyslot 3 is enrolled"), "{err}");
+        assert!(err.contains("still opens this device"), "{err}");
+        // The enrolled slot must not be rolled back - only import failure does that.
+        let calls = f.calls.borrow();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "luksKillSlot --batch-mode /dev/mmcblk2p9 3"),
             "{calls:?}"
         );
     }
