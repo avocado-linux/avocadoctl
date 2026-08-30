@@ -282,11 +282,10 @@ pub fn apply_os_update(
     // Patch BLS entries if needed (sdboot-ab: fix rootfs PARTLABEL in boot partition)
     maybe_patch_bls_entries(update, &inactive_slot)?;
 
-    // Activate the new slot
-    println!("    Activating slot: {inactive_slot}");
-    execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref())?;
-
-    // Write pending-update marker
+    // The marker goes down BEFORE the slot flip. It is the only breadcrumb the
+    // next boot has to verify the new OS and roll back a bad one, so flipping
+    // first leaves a window where a crash - or a failed marker write - boots an
+    // unverified OS with nothing to roll back from.
     let pending = PendingUpdate {
         os_build_id: bundle.os_build_id.clone(),
         initramfs_build_id: bundle.initramfs_build_id.clone(),
@@ -298,6 +297,17 @@ pub fn apply_os_update(
         runtime_id: None,
     };
     write_pending_update(&pending, base_dir)?;
+
+    // Activate the new slot
+    println!("    Activating slot: {inactive_slot}");
+    if let Err(e) = execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref()) {
+        // The flip failed, so the marker now describes an update that is not
+        // happening. Leaving it would have the next boot verify the running OS
+        // against the new one's id, call that a failure, and roll back a slot
+        // that was never changed.
+        let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
+        return Err(e);
+    }
 
     // Clean up staging
     let _ = fs::remove_dir_all(&staging_dir);
@@ -1840,6 +1850,29 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_failed_activation_clears_the_marker_it_wrote() {
+        // apply_os_update writes the marker into base_dir before flipping the
+        // slot and clears that same path if the flip fails. The clear must target
+        // the file the write produced, not the AVOCADO_BASE_DIR-derived default.
+        let tmp = TempDir::new().unwrap();
+        let pending: PendingUpdate = serde_json::from_str(
+            r#"{"os_build_id":"os-2","verify":null,"rollback":null,"previous_slot":"a"}"#,
+        )
+        .unwrap();
+        write_pending_update(&pending, tmp.path()).unwrap();
+        let marker = tmp.path().join(PENDING_UPDATE_FILENAME);
+        assert!(
+            marker.exists(),
+            "marker was not written where apply writes it"
+        );
+        clear_pending_update_at(&marker).unwrap();
+        assert!(
+            !marker.exists(),
+            "a failed slot flip would leave the next boot verifying against an update that never happened"
+        );
+    }
 
     #[test]
     fn a_bundle_without_an_os_build_id_is_never_satisfied() {
