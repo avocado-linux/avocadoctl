@@ -348,7 +348,40 @@ pub fn inspect_runtime(
     Ok(manifest_to_entry(matched, is_active))
 }
 
-/// Check if activating a runtime requires an OS change (different os_build_id).
+/// The OS bundle carries the rootfs *and* the boot FIT (kernel + initramfs),
+/// but only the rootfs leaves a trace the running system can be checked
+/// against (AVOCADO_OS_BUILD_ID in os-release). An initramfs-only change - an
+/// encryption opt-in, a var.hardware requirement - has the same rootfs id, so
+/// compare its initramfs id against the runtime that is active now: if that
+/// differs, the bundle has to be applied even though the rootfs matches.
+pub fn initramfs_differs_from_active(
+    target: &crate::manifest::OsBundleRef,
+    active: Option<&RuntimeManifest>,
+) -> bool {
+    let Some(target_id) = target.initramfs_build_id.as_deref() else {
+        return false;
+    };
+    let active_id = active
+        .and_then(|m| m.os_bundle.as_ref())
+        .and_then(|b| b.initramfs_build_id.as_deref());
+    match active_id {
+        Some(id) => id != target_id,
+        // No record of what the running initramfs is: nothing to compare, and
+        // guessing "changed" would reboot every activation.
+        None => false,
+    }
+}
+
+/// The currently active runtime's manifest, if any.
+pub fn active_manifest(base_dir: &Path) -> Option<RuntimeManifest> {
+    RuntimeManifest::list_all(base_dir)
+        .into_iter()
+        .find(|(_, active)| *active)
+        .map(|(m, _)| m)
+}
+
+/// Check if activating a runtime requires an OS change (different os_build_id,
+/// or a different initramfs than the active runtime's).
 /// If so, applies the OS update from the on-disk image and sets up the pending
 /// runtime marker for verification on next boot.
 /// Returns true if a reboot is required (caller should reboot, not refresh).
@@ -373,7 +406,9 @@ fn runtime_requires_os_change(
     })
     .unwrap_or(false);
 
-    if already_matches {
+    let initramfs_changed =
+        initramfs_differs_from_active(os_bundle, active_manifest(base_dir).as_ref());
+    if already_matches && !initramfs_changed {
         return Ok(false);
     }
 
@@ -388,10 +423,17 @@ fn runtime_requires_os_change(
         });
     }
 
-    println!(
-        "  OS change required: current rootfs does not match target AVOCADO_OS_BUILD_ID={}",
-        expected_id
-    );
+    if already_matches {
+        println!(
+            "  OS change required: the initramfs differs from the active runtime's (target initramfs_build_id={})",
+            os_bundle.initramfs_build_id.as_deref().unwrap_or("-")
+        );
+    } else {
+        println!(
+            "  OS change required: current rootfs does not match target AVOCADO_OS_BUILD_ID={}",
+            expected_id
+        );
+    }
     println!("  Applying OS update from {}...", aos_path.display());
 
     crate::os_update::apply_os_update(&aos_path, base_dir, false).map_err(|e| {
@@ -539,5 +581,59 @@ fn resolve_runtime_with_active<'a>(
                 candidates,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod initramfs_change_tests {
+    use super::*;
+    use crate::manifest::OsBundleRef;
+
+    fn bundle(initramfs: Option<&str>) -> OsBundleRef {
+        OsBundleRef {
+            image_id: "img".into(),
+            sha256: "00".into(),
+            os_build_id: Some("os-1".into()),
+            initramfs_build_id: initramfs.map(str::to_string),
+        }
+    }
+
+    fn active_with(initramfs: Option<&str>) -> RuntimeManifest {
+        let mut m: RuntimeManifest = serde_json::from_str(
+            r#"{"manifest_version":1,"id":"active","runtime":{"name":"dev","version":"1"},"built_at":"2026-01-01T00:00:00Z","extensions":[]}"#,
+        )
+        .expect("minimal manifest");
+        m.os_bundle = Some(bundle(initramfs));
+        m
+    }
+
+    #[test]
+    fn same_rootfs_different_initramfs_is_an_os_change() {
+        let active = active_with(Some("initrd-a"));
+        assert!(initramfs_differs_from_active(
+            &bundle(Some("initrd-b")),
+            Some(&active)
+        ));
+        assert!(!initramfs_differs_from_active(
+            &bundle(Some("initrd-a")),
+            Some(&active)
+        ));
+    }
+
+    #[test]
+    fn unknown_sides_never_force_a_reboot() {
+        let active = active_with(None);
+        assert!(!initramfs_differs_from_active(
+            &bundle(Some("initrd-b")),
+            Some(&active)
+        ));
+        assert!(!initramfs_differs_from_active(
+            &bundle(None),
+            Some(&active_with(Some("x")))
+        ));
+        assert!(!initramfs_differs_from_active(
+            &bundle(Some("initrd-b")),
+            None
+        ));
     }
 }
