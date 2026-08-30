@@ -351,6 +351,17 @@ fn main() {
             }
         }
 
+        // ── var-key ──────────────────────────────────────────────────────────
+        // Not a varlink method: it manipulates the LUKS header of /var with the
+        // volume key the initramfs linked into root's keyring, which the daemon
+        // has no business proxying. Handled directly on both paths - without an
+        // arm here the daemon path fell through to the catch-all and printed
+        // the help text while exiting 0, so `avocado var-key enroll` reported
+        // success without a keyslot ever being added.
+        Some(("var-key", vk_matches)) => {
+            var_key::handle_command(vk_matches, &output);
+        }
+
         // ── root-authority ───────────────────────────────────────────────────
         Some(("root-authority", _)) => {
             let conn = varlink_client::connect_or_exit(&socket_address, &output);
