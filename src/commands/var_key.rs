@@ -236,7 +236,17 @@ fn header(r: &dyn Runner, dev: &str) -> Result<Header, String> {
 }
 
 fn recovery_token(h: &Header) -> Option<&(u32, String, Vec<u32>)> {
-    h.tokens.iter().find(|(_, ty, _)| ty == RECOVERY_TOKEN_TYPE)
+    recovery_tokens(h).next()
+}
+
+/// Every recovery token on the device, not just the first.
+///
+/// A retirement that failed half way can leave two, and revoking only one would
+/// report success while the other credential still opens /var.
+fn recovery_tokens(h: &Header) -> impl Iterator<Item = &(u32, String, Vec<u32>)> {
+    h.tokens
+        .iter()
+        .filter(|(_, ty, _)| ty == RECOVERY_TOKEN_TYPE)
 }
 
 fn free_slot(h: &Header) -> Option<u32> {
@@ -279,27 +289,42 @@ pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, S
         )
     })?;
 
-    let token = serde_json::json!({
-        "type": RECOVERY_TOKEN_TYPE,
-        "keyslots": [slot.to_string()],
-        "kind": kind,
-    })
-    .to_string();
-    let token_file = r.secret_file(token.as_bytes())?;
-    let imported = r.cryptsetup(
-        &[
-            "token",
-            "import",
-            "--json-file",
-            token_file.to_str().unwrap_or_default(),
-            &dev,
-        ],
-        None,
-    );
-    let _ = fs::remove_file(&token_file);
-    if let Err(e) = imported {
-        let _ = r.cryptsetup(&["luksKillSlot", "--batch-mode", &dev, &slot_s], None);
-        return Err(format!("{e}; keyslot {slot} removed again"));
+    // The keyslot is live from here on, so every failure below has to go through
+    // the same rollback - including the token file, which used to return early
+    // and leave a usable keyslot with nothing identifying it.
+    let tag = || -> Result<(), String> {
+        let token = serde_json::json!({
+            "type": RECOVERY_TOKEN_TYPE,
+            "keyslots": [slot.to_string()],
+            "kind": kind,
+        })
+        .to_string();
+        let token_file = r.secret_file(token.as_bytes())?;
+        let imported = r.cryptsetup(
+            &[
+                "token",
+                "import",
+                "--json-file",
+                token_file.to_str().unwrap_or_default(),
+                &dev,
+            ],
+            None,
+        );
+        let _ = fs::remove_file(&token_file);
+        imported.map(|_| ())
+    };
+    if let Err(e) = tag() {
+        // Report what the rollback actually achieved: claiming the slot was
+        // "removed again" when the kill failed would describe a device that
+        // still has a live, untagged recovery key as unchanged.
+        return Err(
+            match r.cryptsetup(&["luksKillSlot", "--batch-mode", &dev, &slot_s], None) {
+                Ok(_) => format!("{e}; keyslot {slot} removed again"),
+                Err(kill) => format!(
+                    "{e}; and keyslot {slot} could NOT be removed ({kill}): it is live on {dev} with no token identifying it - kill it by hand before treating this device as unchanged"
+                ),
+            },
+        );
     }
 
     // Retire the previous recovery slot only once the new token is on disk: a
@@ -338,20 +363,52 @@ pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, S
 pub fn remove(r: &dyn Runner) -> Result<String, String> {
     let dev = backing_device(r)?;
     let h = header(r, &dev)?;
-    let (tid, _, slots) = recovery_token(&h)
-        .cloned()
-        .ok_or_else(|| "no recovery keyslot on /var".to_string())?;
-    r.cryptsetup(
-        &["token", "remove", "--token-id", &tid.to_string(), &dev],
-        None,
-    )?;
-    for s in &slots {
-        r.cryptsetup(
-            &["luksKillSlot", "--batch-mode", &dev, &s.to_string()],
-            None,
-        )?;
+    let tokens: Vec<_> = recovery_tokens(&h).cloned().collect();
+    if tokens.is_empty() {
+        return Err("no recovery keyslot on /var".to_string());
     }
-    Ok(format!("recovery keyslot {:?} removed from {dev}", slots))
+
+    // Kill the keyslot before dropping the token that names it. The keyslot is
+    // the credential; the token is only how a later run finds it again. Removing
+    // metadata first means a failed kill leaves a key that still opens /var and
+    // nothing left to identify it by.
+    let mut killed = Vec::new();
+    let mut live = Vec::new();
+    for (tid, _, slots) in &tokens {
+        let mut all_gone = true;
+        for s in slots {
+            match r.cryptsetup(
+                &["luksKillSlot", "--batch-mode", &dev, &s.to_string()],
+                None,
+            ) {
+                Ok(_) => killed.push(*s),
+                Err(e) => {
+                    all_gone = false;
+                    live.push(format!("{s} ({e})"));
+                }
+            }
+        }
+        // Only drop the token once every keyslot it names is gone, so a device
+        // with a surviving key keeps the token that identifies it.
+        if all_gone {
+            if let Err(e) = r.cryptsetup(
+                &["token", "remove", "--token-id", &tid.to_string(), &dev],
+                None,
+            ) {
+                live.push(format!("token {tid} ({e})"));
+            }
+        }
+    }
+
+    if !live.is_empty() {
+        return Err(format!(
+            "recovery keyslot(s) {} still open {dev}: {}. Removed: {:?}. Revoke the rest before treating this device's recovery key as retired.",
+            live.len(),
+            live.join(", "),
+            killed
+        ));
+    }
+    Ok(format!("recovery keyslot {killed:?} removed from {dev}"))
 }
 
 /// Token types that reference `slot`.
@@ -410,6 +467,10 @@ mod tests {
         calls: RefCell<Vec<String>>,
         fail_import: bool,
         fail_retire: bool,
+        fail_kill: bool,
+        /// Fail `secret_file` from this call onward (1 = the keyfile, 2 = the
+        /// token file, which is the first failure that leaves a live keyslot).
+        fail_secret_file_from: usize,
     }
     impl Fake {
         fn new(dump: &'static str) -> Self {
@@ -418,6 +479,8 @@ mod tests {
                 calls: RefCell::new(vec![]),
                 fail_import: false,
                 fail_retire: false,
+                fail_kill: false,
+                fail_secret_file_from: 0,
             }
         }
     }
@@ -429,10 +492,22 @@ mod tests {
                 "luksDump" => Ok(self.dump.into()),
                 "token" if args[1] == "import" && self.fail_import => Err("token import failed".into()),
                 "token" if args[1] == "remove" && self.fail_retire => Err("token remove failed".into()),
+                "luksKillSlot" if self.fail_kill => Err("device busy".into()),
                 _ => Ok(String::new()),
             }
         }
         fn secret_file(&self, content: &[u8]) -> Result<PathBuf, String> {
+            let nth = self
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("secret_file"))
+                .count()
+                + 1;
+            self.calls.borrow_mut().push(format!("secret_file #{nth}"));
+            if self.fail_secret_file_from != 0 && nth >= self.fail_secret_file_from {
+                return Err("no space left on /run".to_string());
+            }
             let p = std::env::temp_dir().join(format!(
                 "avocadoctl-varkey-test-{}-{}",
                 std::process::id(),
@@ -517,6 +592,82 @@ mod tests {
         assert!(
             calls.iter().any(|c| c.contains("--new-key-slot 3 ")),
             "{calls:?}"
+        );
+    }
+
+    const DUMP_TWO_RECOVERY: &str = "Keyslots:\n  0: luks2\n  1: luks2\n  2: luks2\n  3: luks2\nTokens:\n  0: avocado-hwkey\n\tKeyslot:    1\n  1: avocado-recovery\n\tKeyslot:    2\n  2: avocado-recovery\n\tKeyslot:    3\nDigests:\n  0: pbkdf2\n";
+
+    #[test]
+    fn remove_revokes_every_recovery_slot_killing_before_untagging() {
+        // A retirement that failed half way leaves two recovery tokens; removing
+        // only the first would report success while the other still opens /var.
+        let f = Fake::new(DUMP_TWO_RECOVERY);
+        let msg = remove(&f).unwrap();
+        let calls = f.calls.borrow();
+        for slot in ["2", "3"] {
+            let kill = calls
+                .iter()
+                .position(|c| c == &format!("luksKillSlot --batch-mode /dev/mmcblk2p9 {slot}"))
+                .unwrap_or_else(|| panic!("slot {slot} not killed: {calls:?}"));
+            let tid = if slot == "2" { "1" } else { "2" };
+            let token = calls
+                .iter()
+                .position(|c| c.starts_with(&format!("token remove --token-id {tid} ")))
+                .unwrap_or_else(|| panic!("token {tid} not removed: {calls:?}"));
+            // The keyslot is the credential; the token is only how it is found
+            // again, so it must outlive a failed kill.
+            assert!(
+                kill < token,
+                "untagged before killing slot {slot}: {calls:?}"
+            );
+        }
+        assert!(msg.contains('2') && msg.contains('3'), "{msg}");
+    }
+
+    #[test]
+    fn a_failed_kill_keeps_the_token_and_fails_closed() {
+        let mut f = Fake::new(DUMP_WITH_RECOVERY);
+        f.fail_kill = true;
+        let err = remove(&f).unwrap_err();
+        assert!(err.contains("still open"), "{err}");
+        assert!(err.contains("device busy"), "{err}");
+        let calls = f.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("token remove")),
+            "the token identifying a still-live keyslot was removed: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_failure_after_the_key_is_added_rolls_the_keyslot_back() {
+        // Writing the token file used to return early with `?`, leaving a live
+        // keyslot that no token identified.
+        let mut f = Fake::new(DUMP);
+        f.fail_secret_file_from = 2;
+        let err = enroll(&f, b"secret", "hmac-sha256-uid").unwrap_err();
+        assert!(err.contains("no space left"), "{err}");
+        assert!(err.contains("removed again"), "{err}");
+        assert!(
+            f.calls
+                .borrow()
+                .iter()
+                .any(|c| c == "luksKillSlot --batch-mode /dev/mmcblk2p9 2"),
+            "the added keyslot was not rolled back: {:?}",
+            f.calls.borrow()
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_fails_says_the_keyslot_is_still_live() {
+        let mut f = Fake::new(DUMP);
+        f.fail_secret_file_from = 2;
+        f.fail_kill = true;
+        let err = enroll(&f, b"secret", "hmac-sha256-uid").unwrap_err();
+        assert!(err.contains("could NOT be removed"), "{err}");
+        assert!(err.contains("kill it by hand"), "{err}");
+        assert!(
+            !err.contains("removed again"),
+            "reported a rollback that did not happen: {err}"
         );
     }
 

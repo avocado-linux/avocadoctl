@@ -460,12 +460,28 @@ fn pending_update_path() -> PathBuf {
 }
 
 fn write_pending_update(pending: &PendingUpdate, base_dir: &Path) -> Result<(), OsUpdateError> {
-    let path = base_dir.join(PENDING_UPDATE_FILENAME);
+    write_pending_update_at(pending, &base_dir.join(PENDING_UPDATE_FILENAME))
+}
+
+/// Write the marker so a reader never sees a partial one.
+///
+/// Every writer goes through here, including the runtime-id update that runs
+/// after the slot has already been flipped: an `fs::write` truncates in place,
+/// so a crash or ENOSPC there would leave a flipped slot with a marker that no
+/// longer parses - the next boot would find nothing to verify against and
+/// nothing to roll back to. Write a sibling temp file, then rename it over the
+/// old one, which is atomic within the directory.
+fn write_pending_update_at(pending: &PendingUpdate, path: &Path) -> Result<(), OsUpdateError> {
     let json = serde_json::to_string_pretty(pending).map_err(|e| {
         OsUpdateError::UpdateFailed(format!("Failed to serialize pending update: {e}"))
     })?;
-    fs::write(&path, json).map_err(|e| {
+    let tmp = path.with_extension("json.new");
+    fs::write(&tmp, json).map_err(|e| {
         OsUpdateError::UpdateFailed(format!("Failed to write pending-update marker: {e}"))
+    })?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        OsUpdateError::UpdateFailed(format!("Failed to install pending-update marker: {e}"))
     })?;
     Ok(())
 }
@@ -1585,14 +1601,27 @@ pub fn apply_os_update_streaming<R: Read>(
         bundle.platform, bundle.architecture, bundle.os_build_id
     );
 
-    // 2. Check if OS is already at the target version
+    // 2. Check if OS is already at the target version. Same rule as the staged
+    // path and as os_bundle_satisfied: a matching rootfs is only half of it, or
+    // an initramfs-only bundle streams in and is thrown away here.
     if let Some(ref verify) = bundle.verify {
-        if let Ok(true) = verify_os_release(verify) {
+        let rootfs_matches = verify_os_release(verify).unwrap_or(false);
+        if write_can_be_skipped(
+            rootfs_matches,
+            bundle.initramfs_build_id.as_deref(),
+            active_manifest(base_dir).as_ref(),
+        ) {
             println!(
                 "  OS already up to date ({}={}), skipping write",
                 verify.field, verify.expected
             );
             return Ok(false);
+        }
+        if rootfs_matches {
+            println!(
+                "  Rootfs already at {}={}, but the initramfs differs — writing the bundle",
+                verify.field, verify.expected
+            );
         }
     }
 
@@ -1722,11 +1751,10 @@ pub fn apply_os_update_streaming<R: Read>(
     // 7. Patch BLS entries if needed (sdboot-ab: fix rootfs PARTLABEL in boot partition)
     maybe_patch_bls_entries(update, &inactive_slot)?;
 
-    // 8. Activate the new slot
-    println!("    Activating slot: {inactive_slot}");
-    execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref())?;
-
-    // 9. Write pending-update marker
+    // 8. Write the pending-update marker BEFORE flipping, for the same reason as
+    // the staged path: it is the only breadcrumb the next boot has to verify
+    // this OS and roll a bad one back, so a crash between flip and marker would
+    // boot an unverified OS with no way back.
     let pending = PendingUpdate {
         os_build_id: bundle.os_build_id.clone(),
         initramfs_build_id: bundle.initramfs_build_id.clone(),
@@ -1738,6 +1766,16 @@ pub fn apply_os_update_streaming<R: Read>(
         runtime_id: None,
     };
     write_pending_update(&pending, base_dir)?;
+
+    // 9. Activate the new slot
+    println!("    Activating slot: {inactive_slot}");
+    if let Err(e) = execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref()) {
+        // The flip failed, so the marker describes an update that is not
+        // happening: clear it rather than have the next boot verify the running
+        // OS against the new one's id and roll back a slot nothing changed.
+        let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
+        return Err(e);
+    }
 
     println!(
         "  OS update streamed to partitions (build_id: {}). Reboot required.",
