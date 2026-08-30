@@ -348,38 +348,6 @@ pub fn inspect_runtime(
     Ok(manifest_to_entry(matched, is_active))
 }
 
-/// The OS bundle carries the rootfs *and* the boot FIT (kernel + initramfs),
-/// but only the rootfs leaves a trace the running system can be checked
-/// against (AVOCADO_OS_BUILD_ID in os-release). An initramfs-only change - an
-/// encryption opt-in, a var.hardware requirement - has the same rootfs id, so
-/// compare its initramfs id against the runtime that is active now: if that
-/// differs, the bundle has to be applied even though the rootfs matches.
-pub fn initramfs_differs_from_active(
-    target: &crate::manifest::OsBundleRef,
-    active: Option<&RuntimeManifest>,
-) -> bool {
-    let Some(target_id) = target.initramfs_build_id.as_deref() else {
-        return false;
-    };
-    let active_id = active
-        .and_then(|m| m.os_bundle.as_ref())
-        .and_then(|b| b.initramfs_build_id.as_deref());
-    match active_id {
-        Some(id) => id != target_id,
-        // No record of what the running initramfs is: nothing to compare, and
-        // guessing "changed" would reboot every activation.
-        None => false,
-    }
-}
-
-/// The currently active runtime's manifest, if any.
-pub fn active_manifest(base_dir: &Path) -> Option<RuntimeManifest> {
-    RuntimeManifest::list_all(base_dir)
-        .into_iter()
-        .find(|(_, active)| *active)
-        .map(|(m, _)| m)
-}
-
 /// Check if activating a runtime requires an OS change (different os_build_id,
 /// or a different initramfs than the active runtime's).
 /// If so, applies the OS update from the on-disk image and sets up the pending
@@ -406,9 +374,7 @@ fn runtime_requires_os_change(
     })
     .unwrap_or(false);
 
-    let initramfs_changed =
-        initramfs_differs_from_active(os_bundle, active_manifest(base_dir).as_ref());
-    if already_matches && !initramfs_changed {
+    if crate::os_update::os_bundle_satisfied(os_bundle, base_dir) {
         return Ok(false);
     }
 
@@ -588,6 +554,7 @@ fn resolve_runtime_with_active<'a>(
 mod initramfs_change_tests {
     use super::*;
     use crate::manifest::OsBundleRef;
+    use crate::os_update::initramfs_differs_from_active;
 
     fn bundle(initramfs: Option<&str>) -> OsBundleRef {
         OsBundleRef {
