@@ -206,13 +206,24 @@ pub fn apply_os_update(
 
     // Check if OS is already at the target version — skip if BUILD_ID matches
     if let Some(ref verify) = bundle.verify {
-        if let Ok(true) = verify_os_release(verify) {
+        let rootfs_matches = verify_os_release(verify).unwrap_or(false);
+        if write_can_be_skipped(
+            rootfs_matches,
+            bundle.initramfs_build_id.as_deref(),
+            active_manifest(base_dir).as_ref(),
+        ) {
             println!(
                 "  OS already up to date ({}={}), skipping write",
                 verify.field, verify.expected
             );
             let _ = fs::remove_dir_all(&staging_dir);
             return Ok(false);
+        }
+        if rootfs_matches {
+            println!(
+                "  Rootfs already at {}={}, but the initramfs differs — writing the bundle",
+                verify.field, verify.expected
+            );
         }
     }
 
@@ -1755,12 +1766,28 @@ pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &
     rootfs_matches && !initramfs_differs_from_active(os_bundle, active_manifest(base_dir).as_ref())
 }
 
-/// See [`os_bundle_satisfied`]: the initramfs half of the comparison.
-pub fn initramfs_differs_from_active(
-    target: &crate::manifest::OsBundleRef,
+/// Whether writing a bundle can be skipped because the running OS already is it.
+///
+/// The rootfs matching is only half the question. An initramfs-only change ships
+/// the same rootfs and a different initramfs, so a rootfs-only skip here writes
+/// nothing while every caller upstream has already decided the bundle must be
+/// applied - the runtime then goes active over an initramfs that was never
+/// written. Same rule as [`os_bundle_satisfied`], which is what the callers use.
+fn write_can_be_skipped(
+    rootfs_matches: bool,
+    target_initramfs_id: Option<&str>,
     active: Option<&crate::manifest::RuntimeManifest>,
 ) -> bool {
-    let Some(target_id) = target.initramfs_build_id.as_deref() else {
+    rootfs_matches && !initramfs_id_differs_from_active(target_initramfs_id, active)
+}
+
+/// [`initramfs_differs_from_active`] for a target known only by its initramfs
+/// id - an on-disk bundle carries one but is not a manifest `OsBundleRef`.
+pub fn initramfs_id_differs_from_active(
+    target_id: Option<&str>,
+    active: Option<&crate::manifest::RuntimeManifest>,
+) -> bool {
+    let Some(target_id) = target_id else {
         return false;
     };
     match active
@@ -1770,6 +1797,14 @@ pub fn initramfs_differs_from_active(
         Some(id) => id != target_id,
         None => false,
     }
+}
+
+/// See [`os_bundle_satisfied`]: the initramfs half of the comparison.
+pub fn initramfs_differs_from_active(
+    target: &crate::manifest::OsBundleRef,
+    active: Option<&crate::manifest::RuntimeManifest>,
+) -> bool {
+    initramfs_id_differs_from_active(target.initramfs_build_id.as_deref(), active)
 }
 
 /// The currently active runtime's manifest, if any.
@@ -1872,6 +1907,50 @@ mod tests {
             !marker.exists(),
             "a failed slot flip would leave the next boot verifying against an update that never happened"
         );
+    }
+
+    fn active_with_initramfs(id: Option<&str>) -> crate::manifest::RuntimeManifest {
+        let mut m: crate::manifest::RuntimeManifest = serde_json::from_str(
+            r#"{"manifest_version":1,"id":"active","runtime":{"name":"dev","version":"1"},"built_at":"2026-01-01T00:00:00Z","extensions":[]}"#,
+        )
+        .expect("minimal manifest");
+        m.os_bundle = Some(crate::manifest::OsBundleRef {
+            image_id: "img".into(),
+            sha256: "00".into(),
+            os_build_id: Some("os-1".into()),
+            initramfs_build_id: id.map(str::to_string),
+        });
+        m
+    }
+
+    #[test]
+    fn a_matching_rootfs_does_not_skip_an_initramfs_only_change() {
+        // The bug this pins: three callers correctly decide the bundle must be
+        // applied, apply_os_update sees the rootfs id match and writes nothing,
+        // and the runtime goes active over an initramfs that never landed.
+        let active = active_with_initramfs(Some("initrd-a"));
+        assert!(
+            !write_can_be_skipped(true, Some("initrd-b"), Some(&active)),
+            "rootfs matches but the initramfs differs: the bundle must be written"
+        );
+        assert!(
+            write_can_be_skipped(true, Some("initrd-a"), Some(&active)),
+            "same rootfs and same initramfs is genuinely nothing to do"
+        );
+        // A rootfs that does not match is written regardless of the initramfs.
+        assert!(!write_can_be_skipped(
+            false,
+            Some("initrd-a"),
+            Some(&active)
+        ));
+        // Unknown on either side keeps the old behaviour: never write on a guess.
+        assert!(write_can_be_skipped(true, None, Some(&active)));
+        assert!(write_can_be_skipped(
+            true,
+            Some("initrd-b"),
+            Some(&active_with_initramfs(None))
+        ));
+        assert!(write_can_be_skipped(true, Some("initrd-b"), None));
     }
 
     #[test]
