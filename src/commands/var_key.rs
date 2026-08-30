@@ -70,9 +70,14 @@ pub fn handle_command(matches: &ArgMatches, output: &OutputManager) {
             let kind = m.get_one::<String>("kind").cloned().unwrap_or_default();
             passphrase.and_then(|p| enroll(&SystemRunner, &p, &kind))
         }
-        Some(("list", _)) => list(&SystemRunner).map(|rows| {
-            for r in rows {
-                println!("{r}");
+        Some(("list", _)) => list(&SystemRunner).map(|(dev, h)| {
+            if output.is_json() {
+                println!("{}", list_json(&dev, &h));
+            } else {
+                println!("device: {dev}");
+                for r in describe(&h) {
+                    println!("{r}");
+                }
             }
             "listed".to_string()
         }),
@@ -125,8 +130,11 @@ impl Runner for SystemRunner {
             .map_err(|e| format!("cannot run cryptsetup: {e}"))?;
         if let Some(data) = stdin {
             let mut pipe = child.stdin.take().expect("piped stdin");
-            pipe.write_all(data)
-                .map_err(|e| format!("cannot feed cryptsetup: {e}"))?;
+            if let Err(e) = pipe.write_all(data) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot feed cryptsetup: {e}"));
+            }
         }
         let out = child
             .wait_with_output()
@@ -146,11 +154,12 @@ impl Runner for SystemRunner {
         use std::os::unix::fs::OpenOptionsExt;
         let dir = Path::new("/run/avocado");
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let path = dir.join(format!("var-key.{}", std::process::id()));
+        // Random name and O_EXCL: a secret never lands on a path someone else
+        // could have guessed and pre-created as a symlink.
+        let path = dir.join(format!("var-key.{}", uuid::Uuid::new_v4()));
         let mut f = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&path)
             .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
@@ -230,8 +239,8 @@ fn recovery_token(h: &Header) -> Option<&(u32, String, Vec<u32>)> {
     h.tokens.iter().find(|(_, ty, _)| ty == RECOVERY_TOKEN_TYPE)
 }
 
-fn free_slot(h: &Header) -> u32 {
-    (0..32).find(|n| !h.keyslots.contains(n)).unwrap_or(31)
+fn free_slot(h: &Header) -> Option<u32> {
+    (0..32).find(|n| !h.keyslots.contains(n))
 }
 
 pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, String> {
@@ -240,7 +249,9 @@ pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, S
     }
     let dev = backing_device(r)?;
     let h = header(r, &dev)?;
-    let slot = free_slot(&h);
+    let slot = free_slot(&h).ok_or_else(|| {
+        "all 32 LUKS keyslots on /var are in use; remove one before enrolling".to_string()
+    })?;
     let keyfile = r.secret_file(passphrase)?;
     let slot_s = slot.to_string();
     let added = r.cryptsetup(
@@ -281,9 +292,12 @@ pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, S
             )?;
         }
     }
-    let token = format!(
-        "{{\"type\":\"{RECOVERY_TOKEN_TYPE}\",\"keyslots\":[\"{slot}\"],\"kind\":\"{kind}\"}}"
-    );
+    let token = serde_json::json!({
+        "type": RECOVERY_TOKEN_TYPE,
+        "keyslots": [slot.to_string()],
+        "kind": kind,
+    })
+    .to_string();
     let token_file = r.secret_file(token.as_bytes())?;
     let imported = r.cryptsetup(
         &[
@@ -324,17 +338,21 @@ pub fn remove(r: &dyn Runner) -> Result<String, String> {
     Ok(format!("recovery keyslot {:?} removed from {dev}", slots))
 }
 
+/// Token types that reference `slot`.
+fn unlocks(h: &Header, slot: u32) -> Vec<&str> {
+    h.tokens
+        .iter()
+        .filter(|(_, _, ks)| ks.contains(&slot))
+        .map(|(_, ty, _)| ty.as_str())
+        .collect()
+}
+
 /// One line per keyslot: what unlocks it, from the tokens that reference it.
 pub fn describe(h: &Header) -> Vec<String> {
     h.keyslots
         .iter()
         .map(|s| {
-            let via: Vec<&str> = h
-                .tokens
-                .iter()
-                .filter(|(_, _, ks)| ks.contains(s))
-                .map(|(_, ty, _)| ty.as_str())
-                .collect();
+            let via = unlocks(h, *s);
             let what = if via.is_empty() {
                 "passphrase (Argon2id recovery / derived key)".to_string()
             } else {
@@ -345,12 +363,22 @@ pub fn describe(h: &Header) -> Vec<String> {
         .collect()
 }
 
-pub fn list(r: &dyn Runner) -> Result<Vec<String>, String> {
+pub fn list(r: &dyn Runner) -> Result<(String, Header), String> {
     let dev = backing_device(r)?;
     let h = header(r, &dev)?;
-    let mut rows = vec![format!("device: {dev}")];
-    rows.extend(describe(&h));
-    Ok(rows)
+    Ok((dev, h))
+}
+
+/// Machine-readable form of `list`.
+pub fn list_json(dev: &str, h: &Header) -> serde_json::Value {
+    serde_json::json!({
+        "device": dev,
+        "keyslots": h
+            .keyslots
+            .iter()
+            .map(|s| serde_json::json!({ "slot": s, "unlocked_by": unlocks(h, *s) }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 #[cfg(test)]
@@ -407,8 +435,13 @@ mod tests {
                 (1, "avocado-recovery".into(), vec![2])
             ]
         );
-        assert_eq!(free_slot(&h), 3);
+        assert_eq!(free_slot(&h), Some(3));
         assert_eq!(describe(&h)[2], "slot 2: avocado-recovery");
+        let full = Header {
+            keyslots: (0..32).collect(),
+            tokens: vec![],
+        };
+        assert_eq!(free_slot(&full), None);
     }
 
     #[test]
