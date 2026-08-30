@@ -1742,7 +1742,9 @@ pub fn apply_os_update_streaming<R: Read>(
 /// os-release, the initramfs against the currently active runtime's record,
 /// because the running system keeps no trace of its initramfs id. Unknown ids
 /// count as "not satisfied" for the rootfs (an OS rollback must be repaired)
-/// and as "no difference" for the initramfs (never reboot on a guess).
+/// and as "no difference" for the initramfs (never reboot on a guess) - though
+/// the guess is only reached when the initrd published no id for this boot, see
+/// [`running_initramfs_build_id`].
 pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &Path) -> bool {
     let rootfs_matches = os_bundle.os_build_id.as_ref().is_some_and(|expected| {
         verify_os_release(&VerifyConfig {
@@ -1755,14 +1757,53 @@ pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &
     rootfs_matches && !initramfs_differs_from_active(os_bundle, active_manifest(base_dir).as_ref())
 }
 
+/// Where the initrd publishes the build id of the initramfs that is actually
+/// running (`avocado-initramfs-id` in meta-avocado). `/run` is created by the
+/// initrd and carried across switch-root, so this describes THIS boot: unlike a
+/// persisted stamp it cannot survive into a boot it does not describe, which
+/// matters after an A/B rollback.
+const RUNNING_INITRAMFS_ID_PATH: &str = "/run/avocado/initramfs-build-id";
+
+/// The running initramfs's build id, or `None` on an initramfs from before the
+/// publisher existed.
+pub fn running_initramfs_build_id() -> Option<String> {
+    read_initramfs_id_file(Path::new(RUNNING_INITRAMFS_ID_PATH))
+}
+
+fn read_initramfs_id_file(path: &Path) -> Option<String> {
+    let id = fs::read_to_string(path).ok()?.trim().to_string();
+    // An empty file is "the initrd had nothing to publish", not an id that
+    // happens to be empty - it must not compare equal to anything.
+    (!id.is_empty()).then_some(id)
+}
+
 /// See [`os_bundle_satisfied`]: the initramfs half of the comparison.
 pub fn initramfs_differs_from_active(
     target: &crate::manifest::OsBundleRef,
     active: Option<&crate::manifest::RuntimeManifest>,
 ) -> bool {
+    initramfs_differs_from_running(target, active, running_initramfs_build_id().as_deref())
+}
+
+/// [`initramfs_differs_from_active`] with the running id passed in.
+///
+/// `running` is what the initrd published for this boot and is authoritative
+/// when present: it describes the initramfs in memory, where the active
+/// manifest only records what some earlier update intended to install.
+/// Without it the comparison falls back to the manifest, where an unknown id
+/// still counts as "no difference" - a device whose initramfs predates the
+/// publisher must not be pushed into a reboot on a guess.
+fn initramfs_differs_from_running(
+    target: &crate::manifest::OsBundleRef,
+    active: Option<&crate::manifest::RuntimeManifest>,
+    running: Option<&str>,
+) -> bool {
     let Some(target_id) = target.initramfs_build_id.as_deref() else {
         return false;
     };
+    if let Some(running_id) = running {
+        return running_id != target_id;
+    }
     match active
         .and_then(|m| m.os_bundle.as_ref())
         .and_then(|b| b.initramfs_build_id.as_deref())
@@ -1872,6 +1913,104 @@ mod tests {
             !marker.exists(),
             "a failed slot flip would leave the next boot verifying against an update that never happened"
         );
+    }
+
+    fn active_with_initramfs(id: Option<&str>) -> crate::manifest::RuntimeManifest {
+        let mut m: crate::manifest::RuntimeManifest = serde_json::from_str(
+            r#"{"manifest_version":1,"id":"active","runtime":{"name":"dev","version":"1"},"built_at":"2026-01-01T00:00:00Z","extensions":[]}"#,
+        )
+        .expect("minimal manifest");
+        m.os_bundle = Some(crate::manifest::OsBundleRef {
+            image_id: "img".into(),
+            sha256: "00".into(),
+            os_build_id: Some("os-1".into()),
+            initramfs_build_id: id.map(str::to_string),
+        });
+        m
+    }
+
+    fn target_with_initramfs(id: Option<&str>) -> crate::manifest::OsBundleRef {
+        crate::manifest::OsBundleRef {
+            image_id: "img2".into(),
+            sha256: "00".into(),
+            os_build_id: Some("os-1".into()),
+            initramfs_build_id: id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_running_initramfs_id_beats_the_manifests() {
+        // The manifest records what an update intended to install; /run records
+        // what booted. When they disagree the running one is the truth - this is
+        // the case a stale or missing manifest record used to get wrong.
+        let active_claims_match = active_with_initramfs(Some("initrd-b"));
+        assert!(
+            initramfs_differs_from_running(
+                &target_with_initramfs(Some("initrd-b")),
+                Some(&active_claims_match),
+                Some("initrd-a"),
+            ),
+            "the manifest claimed the target initramfs, but initrd-a is running"
+        );
+        // And the reverse: an unknown manifest record is no longer a guess.
+        let active_unknown = active_with_initramfs(None);
+        assert!(
+            initramfs_differs_from_running(
+                &target_with_initramfs(Some("initrd-b")),
+                Some(&active_unknown),
+                Some("initrd-a"),
+            ),
+            "unknown on the manifest side, but /run says initrd-a is running"
+        );
+        assert!(
+            !initramfs_differs_from_running(
+                &target_with_initramfs(Some("initrd-b")),
+                Some(&active_unknown),
+                Some("initrd-b"),
+            ),
+            "/run says the target initramfs is already running"
+        );
+    }
+
+    #[test]
+    fn without_a_published_id_the_manifest_comparison_is_unchanged() {
+        // An initramfs from before the publisher must behave exactly as it did,
+        // so no fielded device takes a reboot it would not have taken before.
+        let active = active_with_initramfs(Some("initrd-a"));
+        assert!(initramfs_differs_from_running(
+            &target_with_initramfs(Some("initrd-b")),
+            Some(&active),
+            None
+        ));
+        assert!(!initramfs_differs_from_running(
+            &target_with_initramfs(Some("initrd-a")),
+            Some(&active),
+            None
+        ));
+        assert!(!initramfs_differs_from_running(
+            &target_with_initramfs(Some("initrd-b")),
+            Some(&active_with_initramfs(None)),
+            None
+        ));
+        // A target that declares no initramfs id makes no claim, published id or not.
+        assert!(!initramfs_differs_from_running(
+            &target_with_initramfs(None),
+            Some(&active),
+            Some("initrd-z")
+        ));
+    }
+
+    #[test]
+    fn an_empty_published_id_is_not_an_id() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("initramfs-build-id");
+        assert_eq!(read_initramfs_id_file(&p), None, "missing file");
+        fs::write(&p, "").unwrap();
+        assert_eq!(read_initramfs_id_file(&p), None, "empty file");
+        fs::write(&p, "  \n").unwrap();
+        assert_eq!(read_initramfs_id_file(&p), None, "whitespace only");
+        fs::write(&p, "initrd-a\n").unwrap();
+        assert_eq!(read_initramfs_id_file(&p), Some("initrd-a".to_string()));
     }
 
     #[test]
