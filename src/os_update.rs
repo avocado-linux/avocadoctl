@@ -1842,6 +1842,24 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn a_bundle_without_an_os_build_id_is_never_satisfied() {
+        // Both activation paths call os_bundle_satisfied unconditionally and
+        // rely on this: a bundle whose rootfs identity cannot be verified must
+        // be applied rather than assumed current.
+        let tmp = TempDir::new().unwrap();
+        let bundle = crate::manifest::OsBundleRef {
+            image_id: "cf136cbe-0000-0000-0000-000000000000".to_string(),
+            sha256: "0".repeat(64),
+            os_build_id: None,
+            initramfs_build_id: Some("initramfs-1".to_string()),
+        };
+        assert!(
+            !os_bundle_satisfied(&bundle, tmp.path()),
+            "an unverifiable bundle must not count as already running"
+        );
+    }
+
+    #[test]
     fn test_determine_inactive_slot_uboot() {
         assert_eq!(determine_inactive_slot("a", "uboot-ab").unwrap(), "b");
         assert_eq!(determine_inactive_slot("b", "uboot-ab").unwrap(), "a");
