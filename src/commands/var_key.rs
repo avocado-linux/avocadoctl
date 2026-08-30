@@ -279,19 +279,6 @@ pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, S
         )
     })?;
 
-    // Replace a previous recovery slot only once the new one is in place.
-    if let Some((tid, _, slots)) = recovery_token(&h).cloned() {
-        r.cryptsetup(
-            &["token", "remove", "--token-id", &tid.to_string(), &dev],
-            None,
-        )?;
-        for s in slots {
-            r.cryptsetup(
-                &["luksKillSlot", "--batch-mode", &dev, &s.to_string()],
-                None,
-            )?;
-        }
-    }
     let token = serde_json::json!({
         "type": RECOVERY_TOKEN_TYPE,
         "keyslots": [slot.to_string()],
@@ -313,6 +300,22 @@ pub fn enroll(r: &dyn Runner, passphrase: &[u8], kind: &str) -> Result<String, S
     if let Err(e) = imported {
         let _ = r.cryptsetup(&["luksKillSlot", "--batch-mode", &dev, &slot_s], None);
         return Err(format!("{e}; keyslot {slot} removed again"));
+    }
+
+    // Retire the previous recovery slot only once the new token is on disk: a
+    // failed import above must leave the existing recovery path usable, not
+    // strip the device of every recovery slot it had.
+    if let Some((tid, _, slots)) = recovery_token(&h).cloned() {
+        r.cryptsetup(
+            &["token", "remove", "--token-id", &tid.to_string(), &dev],
+            None,
+        )?;
+        for s in slots {
+            r.cryptsetup(
+                &["luksKillSlot", "--batch-mode", &dev, &s.to_string()],
+                None,
+            )?;
+        }
     }
     Ok(format!(
         "recovery keyslot {slot} enrolled on {dev} ({kind})"
@@ -486,9 +489,44 @@ mod tests {
             .iter()
             .position(|c| c == "luksKillSlot --batch-mode /dev/mmcblk2p9 2")
             .unwrap();
-        assert!(add < rm_token && rm_token < kill, "{calls:?}");
+        let import = calls
+            .iter()
+            .position(|c| c.starts_with("token import --json-file"))
+            .unwrap();
+        // The new token must be on disk before the old recovery path is retired.
+        assert!(
+            add < import && import < rm_token && rm_token < kill,
+            "{calls:?}"
+        );
         assert!(
             calls.iter().any(|c| c.contains("--new-key-slot 3 ")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn failed_token_import_leaves_the_previous_recovery_path_intact() {
+        // Retiring the old token before importing the new one left a device with
+        // no recovery slot at all when the import failed.
+        let mut f = Fake::new(DUMP_WITH_RECOVERY);
+        f.fail_import = true;
+        enroll(&f, b"secret", "hmac-sha256-uid").unwrap_err();
+        let calls = f.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("token remove")),
+            "the previous recovery token was removed anyway: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "luksKillSlot --batch-mode /dev/mmcblk2p9 2"),
+            "the previous recovery keyslot was killed anyway: {calls:?}"
+        );
+        // Only the slot this run added is rolled back.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "luksKillSlot --batch-mode /dev/mmcblk2p9 3"),
             "{calls:?}"
         );
     }
