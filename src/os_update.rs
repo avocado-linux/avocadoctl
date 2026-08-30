@@ -1726,6 +1726,50 @@ pub fn apply_os_update_streaming<R: Read>(
     Ok(true)
 }
 
+/// Whether the running system already satisfies a manifest's OS bundle, so it
+/// need not be downloaded or applied. The bundle carries the rootfs *and* the
+/// boot FIT (kernel + initramfs); the rootfs is checked against the running
+/// os-release, the initramfs against the currently active runtime's record,
+/// because the running system keeps no trace of its initramfs id. Unknown ids
+/// count as "not satisfied" for the rootfs (an OS rollback must be repaired)
+/// and as "no difference" for the initramfs (never reboot on a guess).
+pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &Path) -> bool {
+    let rootfs_matches = os_bundle.os_build_id.as_ref().is_some_and(|expected| {
+        verify_os_release(&VerifyConfig {
+            verify_type: "os-release".to_string(),
+            field: "AVOCADO_OS_BUILD_ID".to_string(),
+            expected: expected.clone(),
+        })
+        .unwrap_or(false)
+    });
+    rootfs_matches && !initramfs_differs_from_active(os_bundle, active_manifest(base_dir).as_ref())
+}
+
+/// See [`os_bundle_satisfied`]: the initramfs half of the comparison.
+pub fn initramfs_differs_from_active(
+    target: &crate::manifest::OsBundleRef,
+    active: Option<&crate::manifest::RuntimeManifest>,
+) -> bool {
+    let Some(target_id) = target.initramfs_build_id.as_deref() else {
+        return false;
+    };
+    match active
+        .and_then(|m| m.os_bundle.as_ref())
+        .and_then(|b| b.initramfs_build_id.as_deref())
+    {
+        Some(id) => id != target_id,
+        None => false,
+    }
+}
+
+/// The currently active runtime's manifest, if any.
+pub fn active_manifest(base_dir: &Path) -> Option<crate::manifest::RuntimeManifest> {
+    crate::manifest::RuntimeManifest::list_all(base_dir)
+        .into_iter()
+        .find(|(_, active)| *active)
+        .map(|(m, _)| m)
+}
+
 #[cfg(test)]
 mod tests {
     fn layout_with(name: &str, offset: f64) -> BundleLayout {
