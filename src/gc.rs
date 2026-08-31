@@ -32,8 +32,12 @@ pub fn collect_garbage(base_dir: &Path, retention: u32) -> Result<GcResult, Stag
     let retention = retention.max(1) as usize;
     let mut result = GcResult::default();
 
-    // 1. Load all runtimes, sorted: active first, then by built_at DESC
-    let runtimes = RuntimeManifest::list_all(base_dir);
+    // 1. Load all runtimes, sorted: active first, then by built_at DESC.
+    //    Checked: an active manifest that is present but unreadable would
+    //    otherwise contribute no references, and cleanup_orphaned_images would
+    //    delete every image only the running runtime uses.
+    let runtimes = RuntimeManifest::list_all_checked(base_dir)
+        .map_err(|e| StagingError::StagingFailed(format!("refusing to collect garbage: {e}")))?;
     if runtimes.len() <= retention {
         // Still clean up orphaned images even when no runtimes need removal
         result.removed_images = cleanup_orphaned_images(base_dir, &runtimes);
@@ -85,7 +89,8 @@ pub fn collect_garbage(base_dir: &Path, retention: u32) -> Result<GcResult, Stag
     }
 
     // 5. Clean up orphaned images
-    let surviving = RuntimeManifest::list_all(base_dir);
+    let surviving = RuntimeManifest::list_all_checked(base_dir)
+        .map_err(|e| StagingError::StagingFailed(format!("refusing to collect garbage: {e}")))?;
     result.removed_images = cleanup_orphaned_images(base_dir, &surviving);
 
     Ok(result)
@@ -137,6 +142,47 @@ fn cleanup_orphaned_images(base_dir: &Path, runtimes: &[(RuntimeManifest, bool)]
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unreadable_active_manifest_stops_gc_instead_of_orphaning_its_images() {
+        // The data-loss path from issue #23: list_all silently drops a manifest
+        // that does not parse, so the running runtime contributes no references
+        // and every image only it uses is collected. auto_gc is on by default.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let runtimes = base.join("runtimes");
+        let live = runtimes.join("live-id");
+        fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(base.join("images")).unwrap();
+        fs::write(base.join("images").join("img-1.raw"), b"payload").unwrap();
+        fs::write(live.join("manifest.json"), b"{ this is not json").unwrap();
+        std::os::unix::fs::symlink("runtimes/live-id", base.join("active")).unwrap();
+
+        let err = collect_garbage(base, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to collect garbage"),
+            "{err}"
+        );
+        assert!(
+            base.join("images").join("img-1.raw").exists(),
+            "an image was deleted while the active runtime's references were unknown"
+        );
+    }
+
+    #[test]
+    fn a_dangling_active_link_stops_gc() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        fs::create_dir_all(base.join("runtimes")).unwrap();
+        fs::create_dir_all(base.join("images")).unwrap();
+        fs::write(base.join("images").join("img-1.raw"), b"payload").unwrap();
+        // The link is there; its target is not.
+        std::os::unix::fs::symlink("runtimes/gone-id", base.join("active")).unwrap();
+
+        let err = collect_garbage(base, 3).unwrap_err();
+        assert!(err.to_string().contains("refusing to collect garbage"), "{err}");
+        assert!(base.join("images").join("img-1.raw").exists());
+    }
+
     use super::*;
     use crate::manifest::{ManifestExtension, OsBundleRef, RuntimeInfo, RuntimeManifest};
     use std::os::unix::fs as unix_fs;

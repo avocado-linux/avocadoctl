@@ -198,11 +198,19 @@ impl RuntimeManifest {
     /// Load the active runtime manifest by following the `active` symlink.
     /// Returns None if no active symlink or manifest file exists.
     pub fn load_active(base_dir: &Path) -> Option<Self> {
-        let active_path = base_dir.join(ACTIVE_LINK_NAME);
-        if !active_path.exists() {
-            return None;
-        }
-        Self::load_from(&active_path)
+        Self::load_active_checked(base_dir).ok().flatten()
+    }
+
+    /// Whether the `active` entry exists, WITHOUT following it.
+    ///
+    /// `Path::exists` follows the link, so a dangling `active` - the entry is
+    /// there, its target is gone - reads as "this device has no active
+    /// runtime". That is the one thing it does not mean: a device with a
+    /// manifest it cannot resolve is broken, and treating it as a legacy
+    /// device falls through to discovering whatever extensions are lying
+    /// around, with none of the manifest's checks.
+    fn active_entry_present(active_path: &Path) -> bool {
+        fs::symlink_metadata(active_path).is_ok()
     }
 
     /// Like `load_active`, but an `active` link that is present and does not
@@ -212,8 +220,16 @@ impl RuntimeManifest {
     /// have no `active` link and still get `Ok(None)`.
     pub fn load_active_checked(base_dir: &Path) -> Result<Option<Self>, String> {
         let active_path = base_dir.join(ACTIVE_LINK_NAME);
-        if !active_path.exists() {
+        if !Self::active_entry_present(&active_path) {
             return Ok(None);
+        }
+        if !active_path.exists() {
+            return Err(format!(
+                "the active link {} points at a runtime that is not there. \
+                 Refusing to fall back to legacy extension discovery: this device \
+                 has an active runtime, and what it names cannot be resolved.",
+                active_path.display()
+            ));
         }
         let manifest_path = active_path.join(MANIFEST_FILENAME);
         let content = fs::read_to_string(&manifest_path)
@@ -242,6 +258,35 @@ impl RuntimeManifest {
     /// List all available runtime manifests.
     /// Returns each manifest paired with a bool indicating whether it is the active runtime.
     /// Sorted by (name ASC, version ASC, built_at DESC).
+    /// [`list_all`], but an `active` entry that is present and cannot be read
+    /// is an error rather than absence.
+    ///
+    /// `list_all` drops a manifest that does not parse. For display that is
+    /// harmless; for garbage collection it is not. GC derives what is still
+    /// referenced from this list, so an unreadable active manifest means the
+    /// running runtime contributes no references and every image only it uses -
+    /// its extensions, its OS bundle - is collected as an orphan. Callers that
+    /// delete things must use this and refuse rather than guess.
+    pub fn list_all_checked(base_dir: &Path) -> Result<Vec<(Self, bool)>, String> {
+        // Surfaces both shapes of the problem: a dangling link, and a link
+        // whose manifest does not parse.
+        Self::load_active_checked(base_dir)?;
+        let all = Self::list_all(base_dir);
+        if let Some(active_id) = Self::resolve_active_id(base_dir) {
+            let listed = all
+                .iter()
+                .any(|(m, is_active)| *is_active || m.id == active_id);
+            if !listed {
+                return Err(format!(
+                    "the active runtime {active_id} is not among the readable manifests. \
+                     Refusing to act on a list that is missing the one runtime this device \
+                     is running."
+                ));
+            }
+        }
+        Ok(all)
+    }
+
     pub fn list_all(base_dir: &Path) -> Vec<(Self, bool)> {
         let active_id = Self::resolve_active_id(base_dir);
         let runtimes_dir = base_dir.join(RUNTIMES_DIR_NAME);
@@ -278,6 +323,47 @@ impl RuntimeManifest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dangling_active_link_is_an_error_not_an_absent_manifest() {
+        // Path::exists follows the link, so a dangling `active` used to read as
+        // "legacy device, no manifest" - and the merge then discovered whatever
+        // extensions were lying around, with none of the manifest's checks.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        fs::create_dir_all(base.join(RUNTIMES_DIR_NAME)).unwrap();
+        unix_fs::symlink("runtimes/gone-id", base.join(ACTIVE_LINK_NAME)).unwrap();
+
+        let err = RuntimeManifest::load_active_checked(base).unwrap_err();
+        assert!(err.contains("points at a runtime that is not there"), "{err}");
+        assert!(RuntimeManifest::list_all_checked(base).is_err());
+    }
+
+    #[test]
+    fn no_active_link_at_all_is_still_absence() {
+        // A genuine legacy device must keep working.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(RUNTIMES_DIR_NAME)).unwrap();
+        assert!(RuntimeManifest::load_active_checked(tmp.path())
+            .unwrap()
+            .is_none());
+        assert!(RuntimeManifest::list_all_checked(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_active_manifest_that_does_not_parse_is_not_dropped_from_the_list() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let live = base.join(RUNTIMES_DIR_NAME).join("live-id");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join(MANIFEST_FILENAME), b"{ not json").unwrap();
+        unix_fs::symlink("runtimes/live-id", base.join(ACTIVE_LINK_NAME)).unwrap();
+
+        // list_all keeps its lenient behaviour for display paths...
+        assert!(RuntimeManifest::list_all(base).is_empty());
+        // ...but the checked form refuses, so nothing deletes on that basis.
+        assert!(RuntimeManifest::list_all_checked(base).is_err());
+    }
+
     use super::*;
     use std::os::unix::fs as unix_fs;
     use tempfile::TempDir;

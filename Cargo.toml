@@ -1,6 +1,6 @@
 [package]
 name = "avocadoctl"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 # File::try_lock / std::fs::TryLockError (update lock). Both device toolchains
 # clear this: scarthgap via meta-lts-mixins (rust 1.92), wrynose oe-core (1.94).
