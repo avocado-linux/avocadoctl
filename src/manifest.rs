@@ -334,7 +334,10 @@ mod tests {
         unix_fs::symlink("runtimes/gone-id", base.join(ACTIVE_LINK_NAME)).unwrap();
 
         let err = RuntimeManifest::load_active_checked(base).unwrap_err();
-        assert!(err.contains("points at a runtime that is not there"), "{err}");
+        assert!(
+            err.contains("points at a runtime that is not there"),
+            "{err}"
+        );
         assert!(RuntimeManifest::list_all_checked(base).is_err());
     }
 
@@ -346,7 +349,9 @@ mod tests {
         assert!(RuntimeManifest::load_active_checked(tmp.path())
             .unwrap()
             .is_none());
-        assert!(RuntimeManifest::list_all_checked(tmp.path()).unwrap().is_empty());
+        assert!(RuntimeManifest::list_all_checked(tmp.path())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
