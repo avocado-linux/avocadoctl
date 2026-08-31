@@ -358,13 +358,10 @@ pub fn set_pending_runtime_id(runtime_id: &str, base_dir: &Path) -> Result<(), O
         OsUpdateError::UpdateFailed(format!("Failed to parse pending-update marker: {e}"))
     })?;
     pending.runtime_id = Some(runtime_id.to_string());
-    let json = serde_json::to_string_pretty(&pending).map_err(|e| {
-        OsUpdateError::UpdateFailed(format!("Failed to serialize pending update: {e}"))
-    })?;
-    fs::write(&path, json).map_err(|e| {
-        OsUpdateError::UpdateFailed(format!("Failed to write pending-update marker: {e}"))
-    })?;
-    Ok(())
+    // Through the same atomic writer as everything else: this runs AFTER the
+    // boot slot has been flipped, so an in-place truncating write that fails
+    // half way would destroy the only marker the next boot can roll back from.
+    write_pending_update_at(&pending, &path)
 }
 
 /// Remove the pending-update marker at a specific path (for testing).
@@ -476,13 +473,30 @@ fn write_pending_update_at(pending: &PendingUpdate, path: &Path) -> Result<(), O
         OsUpdateError::UpdateFailed(format!("Failed to serialize pending update: {e}"))
     })?;
     let tmp = path.with_extension("json.new");
-    fs::write(&tmp, json).map_err(|e| {
-        OsUpdateError::UpdateFailed(format!("Failed to write pending-update marker: {e}"))
-    })?;
+    // fsync before the rename and fsync the directory after it: this marker is
+    // the power-loss boundary for a slot flip, so "written" has to mean on the
+    // medium, not in page cache. Without the first sync a crash can leave a
+    // renamed but empty file; without the second the rename itself can be lost.
+    {
+        let mut f = fs::File::create(&tmp).map_err(|e| {
+            OsUpdateError::UpdateFailed(format!("Failed to write pending-update marker: {e}"))
+        })?;
+        f.write_all(json.as_bytes())
+            .and_then(|_| f.sync_all())
+            .map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                OsUpdateError::UpdateFailed(format!("Failed to write pending-update marker: {e}"))
+            })?;
+    }
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         OsUpdateError::UpdateFailed(format!("Failed to install pending-update marker: {e}"))
     })?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -1923,6 +1937,29 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn setting_the_runtime_id_never_writes_the_marker_in_place() {
+        // This runs after the boot slot has flipped, so a truncating rewrite
+        // that fails half way destroys the only marker the next boot can roll
+        // back from. It must go through the same atomic writer.
+        let tmp = TempDir::new().unwrap();
+        let pending: PendingUpdate = serde_json::from_str(
+            r#"{"os_build_id":"os-2","verify":null,"rollback":null,"previous_slot":"a"}"#,
+        )
+        .unwrap();
+        write_pending_update(&pending, tmp.path()).unwrap();
+        set_pending_runtime_id("runtime-7", tmp.path()).unwrap();
+
+        let marker = tmp.path().join(PENDING_UPDATE_FILENAME);
+        let back = read_pending_update_from(&marker).expect("marker still parses");
+        assert_eq!(back.runtime_id.as_deref(), Some("runtime-7"));
+        assert_eq!(back.os_build_id, "os-2", "the rest of the marker survived");
+        assert!(
+            !marker.with_extension("json.new").exists(),
+            "the temp file was left behind"
+        );
+    }
 
     #[test]
     fn a_failed_activation_clears_the_marker_it_wrote() {
