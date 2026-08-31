@@ -179,7 +179,10 @@ mod tests {
         std::os::unix::fs::symlink("runtimes/gone-id", base.join("active")).unwrap();
 
         let err = collect_garbage(base, 3).unwrap_err();
-        assert!(err.to_string().contains("refusing to collect garbage"), "{err}");
+        assert!(
+            err.to_string().contains("refusing to collect garbage"),
+            "{err}"
+        );
         assert!(base.join("images").join("img-1.raw").exists());
     }
 
