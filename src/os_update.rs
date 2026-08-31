@@ -1813,7 +1813,7 @@ const RUNNING_INITRAMFS_ID_PATH: &str = "/run/avocado/initramfs-build-id";
 
 /// The running initramfs's build id, or `None` on an initramfs from before the
 /// publisher existed.
-pub fn running_initramfs_build_id() -> Option<String> {
+fn running_initramfs_build_id() -> Option<String> {
     read_initramfs_id_file(Path::new(RUNNING_INITRAMFS_ID_PATH))
 }
 
@@ -1841,7 +1841,7 @@ fn write_can_be_skipped(
 
 /// [`initramfs_differs_from_active`] for a target known only by its initramfs
 /// id - an on-disk bundle carries one but is not a manifest `OsBundleRef`.
-pub fn initramfs_id_differs_from_active(
+fn initramfs_id_differs_from_active(
     target_id: Option<&str>,
     active: Option<&crate::manifest::RuntimeManifest>,
 ) -> bool {
