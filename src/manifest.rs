@@ -201,16 +201,31 @@ impl RuntimeManifest {
         Self::load_active_checked(base_dir).ok().flatten()
     }
 
+    /// Read a stat result as presence, keeping "absent" and "unreadable" apart.
+    ///
+    /// Only `NotFound` means the entry is not there. A permission or I/O error
+    /// says the entry could not be examined, which is the same mistake this
+    /// whole change is about: an error read as absence sends the caller down
+    /// the legacy path, and legacy means "merge whatever is lying around".
+    fn presence_from(res: std::io::Result<fs::Metadata>, what: &str) -> Result<bool, String> {
+        match res {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("cannot examine {what}: {e}")),
+        }
+    }
+
     /// Whether the `active` entry exists, WITHOUT following it.
     ///
     /// `Path::exists` follows the link, so a dangling `active` - the entry is
     /// there, its target is gone - reads as "this device has no active
     /// runtime". That is the one thing it does not mean: a device with a
-    /// manifest it cannot resolve is broken, and treating it as a legacy
-    /// device falls through to discovering whatever extensions are lying
-    /// around, with none of the manifest's checks.
-    fn active_entry_present(active_path: &Path) -> bool {
-        fs::symlink_metadata(active_path).is_ok()
+    /// manifest it cannot resolve is broken.
+    fn active_entry_present(active_path: &Path) -> Result<bool, String> {
+        Self::presence_from(
+            fs::symlink_metadata(active_path),
+            &format!("the active link {}", active_path.display()),
+        )
     }
 
     /// Like `load_active`, but an `active` link that is present and does not
@@ -220,10 +235,16 @@ impl RuntimeManifest {
     /// have no `active` link and still get `Ok(None)`.
     pub fn load_active_checked(base_dir: &Path) -> Result<Option<Self>, String> {
         let active_path = base_dir.join(ACTIVE_LINK_NAME);
-        if !Self::active_entry_present(&active_path) {
+        if !Self::active_entry_present(&active_path)? {
             return Ok(None);
         }
-        if !active_path.exists() {
+        // Follows the link: NotFound here means dangling, and anything else is
+        // a link that could not be resolved - both are errors, but they are not
+        // the same error and should not read as one.
+        if !Self::presence_from(
+            fs::metadata(&active_path),
+            &format!("the target of the active link {}", active_path.display()),
+        )? {
             return Err(format!(
                 "the active link {} points at a runtime that is not there. \
                  Refusing to fall back to legacy extension discovery: this device \
@@ -323,6 +344,33 @@ impl RuntimeManifest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_entry_that_cannot_be_examined_is_not_reported_as_absent() {
+        // The mistake this whole change is about, one level down: a permission
+        // or I/O error read as "no active runtime" sends the caller to legacy
+        // discovery, which merges whatever is lying around.
+        use std::io::{Error, ErrorKind};
+        let md = fs::metadata(".").map(Some).unwrap().unwrap();
+        assert_eq!(
+            RuntimeManifest::presence_from(Ok(md), "x"),
+            Ok(true),
+            "a readable entry is present"
+        );
+        assert_eq!(
+            RuntimeManifest::presence_from(Err(Error::from(ErrorKind::NotFound)), "x"),
+            Ok(false),
+            "only NotFound means absent"
+        );
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            let err = RuntimeManifest::presence_from(Err(Error::from(kind)), "the active link")
+                .unwrap_err();
+            assert!(
+                err.contains("cannot examine the active link"),
+                "{kind:?} was swallowed as absence: {err}"
+            );
+        }
+    }
+
     #[test]
     fn a_dangling_active_link_is_an_error_not_an_absent_manifest() {
         // Path::exists follows the link, so a dangling `active` used to read as
