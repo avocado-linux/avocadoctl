@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use thiserror::Error;
@@ -68,6 +69,19 @@ pub struct UpdateConfig {
     pub activate: Vec<SlotAction>,
     #[serde(default)]
     pub rollback: Option<Vec<SlotAction>>,
+    /// Actions to run once the new OS has booted and verified.
+    ///
+    /// A/B update has three states, not two: staged, and then either confirmed
+    /// or rejected. `activate` runs before the reboot and `rollback` when
+    /// verification fails, but until now nothing ran on success -- the marker
+    /// was simply cleared. That leaves every "this slot is good, stop watching
+    /// it" mechanism unexpressible: Qualcomm's boot_control successful flag
+    /// (`qbootctl -m`), a u-boot bootcount reset, or clearing the Boot Loader
+    /// Specification boot counter on a systemd-boot entry. Without it a
+    /// loader-level retry counter keeps counting down across later reboots and
+    /// eventually demotes an entry that has been working for months.
+    #[serde(default)]
+    pub commit: Option<Vec<SlotAction>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -154,7 +168,16 @@ pub struct PendingUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_initramfs: Option<VerifyConfig>,
     pub rollback: Option<Vec<SlotAction>>,
+    /// Actions for the next boot to run if verification passes. Carried here
+    /// because by then the bundle is gone: the marker is all that boot has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Vec<SlotAction>>,
     pub previous_slot: String,
+    /// The slot this update activated, i.e. the one being verified. Optional so
+    /// a marker written by an older avocadoctl still parses; commit actions
+    /// then see an empty slot rather than the wrong one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_slot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<BundleLayout>,
     /// Runtime ID to activate on successful OS verification.
@@ -281,6 +304,13 @@ pub fn apply_os_update(
                 );
                 write_to_emmc_boot(&source_path, &dev, &artifact.name)?;
             }
+            WriteTarget::FsFile { label, rel_path } => {
+                println!(
+                    "    Writing {} -> {}:/{} (file in partition '{}')",
+                    artifact.name, label, rel_path, label
+                );
+                write_to_fs_file(&source_path, &label, &rel_path, &artifact.name)?;
+            }
             WriteTarget::NotOnThisMedium(reason) => {
                 println!(
                     "    Skipping {} ({}): {reason}",
@@ -303,7 +333,9 @@ pub fn apply_os_update(
         verify: bundle.verify.clone(),
         verify_initramfs: bundle.verify_initramfs.clone(),
         rollback: update.rollback.clone(),
+        commit: update.commit.clone(),
         previous_slot: current_slot.clone(),
+        new_slot: Some(inactive_slot.clone()),
         layout: bundle.layout.clone(),
         runtime_id: None,
     };
@@ -426,6 +458,28 @@ pub fn verify_os_release_from(
 
 /// Execute rollback: switch back to previous slot and clear the pending marker.
 /// Always clears the pending marker to prevent boot loops, even if rollback fails.
+/// Run the update's commit actions after the new OS has booted and verified.
+///
+/// Best-effort by design: the OS is already up and confirmed at this point, so
+/// a failing commit action must not be turned into a failed boot. It is
+/// reported and the marker is cleared regardless -- the cost of a missed
+/// commit is a loader that retries an entry that actually works, which the
+/// next successful update clears anyway. The cost of treating it as fatal
+/// would be a rollback away from a good OS.
+pub fn commit_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), OsUpdateError> {
+    let Some(actions) = pending.commit.as_ref() else {
+        return Ok(());
+    };
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let slot = pending.new_slot.as_deref().unwrap_or_default();
+    if verbose {
+        println!("    Committing slot: {slot}");
+    }
+    execute_slot_actions(actions, slot, pending.layout.as_ref())
+}
+
 pub fn rollback_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), OsUpdateError> {
     let mut rollback_err = None;
     if let Some(ref rollback_actions) = pending.rollback {
@@ -637,6 +691,7 @@ fn determine_inactive_slot(current: &str, strategy: &str) -> Result<String, OsUp
 }
 
 /// Where an artifact for `partition_name` gets written.
+#[derive(Debug)]
 enum WriteTarget {
     Partition(PathBuf),
     Offset {
@@ -647,6 +702,19 @@ enum WriteTarget {
     /// manifest as `emmc-boot:<N>`. Written with force_ro lifted and verified
     /// by read-back; the BootROM reads the bootloader from offset 0 of it.
     EmmcBoot(PathBuf),
+    /// A file inside a filesystem, named in the manifest as
+    /// `file:<partlabel>:<path>`.
+    ///
+    /// This is how an artifact reaches a boot medium whose loader reads FILES
+    /// rather than raw partitions: a Boot Loader Specification entry (a UKI in
+    /// `EFI/Linux/`) on an ESP, a kernel or FIT on a u-boot FAT partition, an
+    /// extlinux config. Those platforms cannot use a raw A/B pair, because
+    /// nothing selects between two partitions the loader was never told about
+    /// -- the two versions have to coexist as two files the loader can see.
+    FsFile {
+        label: String,
+        rel_path: String,
+    },
     /// The target describes hardware this boot medium does not have (an eMMC
     /// boot partition while running from an SD card). The artifact is skipped
     /// with a message, not failed: a manifest describes every medium the
@@ -670,6 +738,47 @@ fn resolve_emmc_boot(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
     })?;
     let disk = root_disk_name()?;
     Ok(Some(emmc_boot_device(&disk, n)))
+}
+
+/// `file:<partlabel>:<path>` -> a file inside that partition's filesystem.
+/// `Ok(None)` when `spec` is not a file target at all.
+///
+/// The path is relative to the filesystem root even when written with a
+/// leading slash, and `..` is refused outright: a manifest is data that
+/// arrives with an update, and a target that can climb out of the mounted
+/// filesystem is a way to write anywhere on the device.
+fn resolve_fs_file(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
+    let Some(rest) = spec.strip_prefix("file:") else {
+        return Ok(None);
+    };
+    let (label, path) = rest.split_once(':').ok_or_else(|| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "slot target '{spec}': expected file:<partlabel>:<path>"
+        ))
+    })?;
+    let rel_path = path.trim_start_matches('/');
+    if label.is_empty() || rel_path.is_empty() {
+        return Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "slot target '{spec}': partlabel and path must both be non-empty"
+        )));
+    }
+    if Path::new(rel_path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "slot target '{spec}': path must not contain '..'"
+        )));
+    }
+    if label_absent(label) {
+        return Ok(Some(WriteTarget::NotOnThisMedium(format!(
+            "no partition labeled '{label}' on this medium"
+        ))));
+    }
+    Ok(Some(WriteTarget::FsFile {
+        label: label.to_string(),
+        rel_path: rel_path.to_string(),
+    }))
 }
 
 /// `/dev/<disk>boot<n>` when the disk has hardware boot partitions, otherwise
@@ -719,6 +828,169 @@ fn root_disk_name() -> Result<String, OsUpdateError> {
 
 /// Write `source` to an eMMC boot partition: lift force_ro, write, fsync,
 /// read back and compare, restore force_ro whatever happened.
+/// Mount `label`'s partition, hand its mount point to `f`, unmount.
+///
+/// An existing read-write mount is reused rather than stacking a second one:
+/// on a running system the boot partition may well already be mounted, and
+/// two concurrent read-write mounts of the same FAT filesystem corrupt it.
+fn with_mounted_partition<T>(
+    label: &str,
+    f: impl FnOnce(&Path) -> Result<T, OsUpdateError>,
+) -> Result<T, OsUpdateError> {
+    let device = resolve_partition(label)?;
+
+    if let Some(existing) = existing_rw_mount(&device) {
+        return f(&existing);
+    }
+
+    let mount_point = PathBuf::from(format!("/tmp/avocado-fsfile-{label}"));
+    fs::create_dir_all(&mount_point).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "cannot create mount point {}: {e}",
+            mount_point.display()
+        ))
+    })?;
+    let out = ProcessCommand::new("mount")
+        .args([
+            device.to_str().unwrap_or_default(),
+            mount_point.to_str().unwrap_or_default(),
+        ])
+        .output()
+        .map_err(|e| OsUpdateError::ArtifactWriteFailed(format!("cannot run mount: {e}")))?;
+    if !out.status.success() {
+        let _ = fs::remove_dir(&mount_point);
+        return Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "mount {} {} failed: {}",
+            device.display(),
+            mount_point.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+
+    let result = f(&mount_point);
+
+    // Unmount whatever happened. A left-behind mount would make the next
+    // update reuse it as an "existing" one and never see a stale write.
+    let _ = ProcessCommand::new("umount")
+        .arg(&mount_point)
+        .output()
+        .map(|o| o.status.success());
+    let _ = fs::remove_dir(&mount_point);
+    result
+}
+
+/// Mount point of an existing read-write mount of `device`, if there is one.
+/// Matched on the device's `maj:min` rather than its path, so a mount made
+/// through a different name for the same partition (by-partlabel, by-uuid,
+/// /dev/sda1) is still recognised.
+fn existing_rw_mount(device: &Path) -> Option<PathBuf> {
+    let rdev = fs::metadata(device).ok()?.rdev();
+    let want = format!("{}:{}", (rdev >> 8) & 0xfff, rdev & 0xff);
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mountinfo.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let _id = fields.next()?;
+        let _parent = fields.next()?;
+        if fields.next()? != want {
+            return None;
+        }
+        let _root = fields.next()?;
+        let point = fields.next()?;
+        let opts = fields.next()?;
+        opts.split(',')
+            .any(|o| o == "rw")
+            .then(|| PathBuf::from(point.replace("\\040", " ")))
+    })
+}
+
+/// Write `source` to `rel_path` inside `label`'s filesystem, atomically.
+///
+/// Written to a temporary name in the same directory, fsynced, then renamed
+/// over the target and the directory fsynced. A boot entry is the one file on
+/// the device that must never be observed half-written: a crash during a
+/// straight overwrite leaves a truncated image that the firmware will still
+/// try to execute, which is unrecoverable without physical access. Rename is
+/// the only step the loader can observe, and it is a directory update.
+///
+/// Read back and compared afterwards, like the eMMC boot partition write, so a
+/// silently short write is caught here rather than at the next boot.
+fn write_to_fs_file(
+    source: &Path,
+    label: &str,
+    rel_path: &str,
+    artifact_name: &str,
+) -> Result<(), OsUpdateError> {
+    let data = fs::read(source).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!("Failed to read {artifact_name}: {e}"))
+    })?;
+
+    with_mounted_partition(label, |mount_point| {
+        let dest = mount_point.join(rel_path);
+        let dir = dest.parent().ok_or_else(|| {
+            OsUpdateError::ArtifactWriteFailed(format!("{rel_path} has no parent directory"))
+        })?;
+        fs::create_dir_all(dir).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!(
+                "cannot create {} in {label}: {e}",
+                dir.display()
+            ))
+        })?;
+
+        // Same directory as the destination, so the rename cannot cross a
+        // filesystem boundary and degrade into a copy.
+        let tmp = dir.join(format!(
+            ".{}.avocado-new",
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("artifact")
+        ));
+        let write = (|| -> Result<(), OsUpdateError> {
+            let mut f = fs::File::create(&tmp).map_err(|e| {
+                OsUpdateError::ArtifactWriteFailed(format!("cannot create {}: {e}", tmp.display()))
+            })?;
+            f.write_all(&data).and_then(|_| f.sync_all()).map_err(|e| {
+                OsUpdateError::ArtifactWriteFailed(format!(
+                    "Failed to write {artifact_name} to {}: {e}",
+                    tmp.display()
+                ))
+            })
+        })();
+        if let Err(e) = write {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+
+        fs::rename(&tmp, &dest).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            OsUpdateError::ArtifactWriteFailed(format!(
+                "cannot rename {} to {}: {e}",
+                tmp.display(),
+                dest.display()
+            ))
+        })?;
+        // fsync the directory so the rename itself is durable. vfat ignores
+        // this; ext4 and friends do not, and the point of the rename is that
+        // it survives a power cut.
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+
+        let back = fs::read(&dest).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!(
+                "Failed to read back {}: {e}",
+                dest.display()
+            ))
+        })?;
+        if back != data {
+            return Err(OsUpdateError::ArtifactWriteFailed(format!(
+                "{artifact_name} read back from {} does not match what was written",
+                dest.display()
+            )));
+        }
+        Ok(())
+    })
+}
+
 fn write_to_emmc_boot(source: &Path, dev: &Path, artifact_name: &str) -> Result<(), OsUpdateError> {
     let name = dev
         .file_name()
@@ -776,6 +1048,9 @@ fn locate_target(
     layout: Option<&BundleLayout>,
 ) -> Result<WriteTarget, OsUpdateError> {
     if let Some(target) = resolve_emmc_boot(partition_name)? {
+        return Ok(target);
+    }
+    if let Some(target) = resolve_fs_file(partition_name)? {
         return Ok(target);
     }
     // Only a DEFINITELY ABSENT label may fall back. A label entry that exists
@@ -1737,6 +2012,30 @@ pub fn apply_os_update_streaming<R: Read>(
                 let _ = fs::remove_file(&tmp);
                 spooled?;
             }
+            WriteTarget::FsFile { label, rel_path } => {
+                // Same reason as the eMMC boot arm: the write is a rename over
+                // a live boot entry and is read back afterwards, so it needs a
+                // whole file on disk with a verified digest before it starts.
+                let tmp = std::env::temp_dir().join(format!("avocadoctl-{}.fsfile", artifact.name));
+                let spooled = (|| -> Result<(), OsUpdateError> {
+                    let mut out = fs::File::create(&tmp).map_err(|e| {
+                        OsUpdateError::ArtifactWriteFailed(format!(
+                            "spool file {}: {e}",
+                            tmp.display()
+                        ))
+                    })?;
+                    io::copy(&mut entry, &mut out).map_err(|e| {
+                        OsUpdateError::ArtifactWriteFailed(format!(
+                            "spooling {}: {e}",
+                            artifact.name
+                        ))
+                    })?;
+                    verify_sha256(&tmp, &artifact.sha256, &artifact.name)?;
+                    write_to_fs_file(&tmp, &label, &rel_path, &artifact.name)
+                })();
+                let _ = fs::remove_file(&tmp);
+                spooled?;
+            }
             WriteTarget::NotOnThisMedium(reason) => {
                 println!(
                     "    Skipping {} ({}): {reason}",
@@ -1775,7 +2074,9 @@ pub fn apply_os_update_streaming<R: Read>(
         verify: bundle.verify.clone(),
         verify_initramfs: bundle.verify_initramfs.clone(),
         rollback: update.rollback.clone(),
+        commit: update.commit.clone(),
         previous_slot: current_slot.clone(),
+        new_slot: Some(inactive_slot.clone()),
         layout: bundle.layout.clone(),
         runtime_id: None,
     };
@@ -2208,6 +2509,129 @@ PRETTY_NAME="Avocado Linux 2024.1"
         assert!(!verify_os_release_from(&verify, &os_release).unwrap());
     }
 
+    /// `file:<partlabel>:<path>` parses into an FsFile target, and the path is
+    /// normalised relative to the filesystem root.
+    #[test]
+    fn test_resolve_fs_file_parses_label_and_path() {
+        // A label that does not exist on the test machine resolves to
+        // NotOnThisMedium, which is itself the contract: an artifact for a
+        // medium this device does not have is skipped, not failed.
+        match resolve_fs_file("file:efi:/EFI/Linux/avocado+3.efi").unwrap() {
+            Some(WriteTarget::FsFile { label, rel_path }) => {
+                assert_eq!(label, "efi");
+                assert_eq!(rel_path, "EFI/Linux/avocado+3.efi");
+            }
+            Some(WriteTarget::NotOnThisMedium(reason)) => {
+                assert!(reason.contains("efi"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected an FsFile or NotOnThisMedium target, got {other:?}"),
+        }
+    }
+
+    /// Not a file target at all: every other scheme must fall through
+    /// untouched, or a plain partition name would stop resolving.
+    #[test]
+    fn test_resolve_fs_file_ignores_other_targets() {
+        assert!(resolve_fs_file("rootfs-a").unwrap().is_none());
+        assert!(resolve_fs_file("emmc-boot:0").unwrap().is_none());
+    }
+
+    /// A manifest arrives with an update, so a target that can climb out of
+    /// the mounted filesystem is a way to write anywhere on the device.
+    #[test]
+    fn test_resolve_fs_file_refuses_parent_dir_and_empty() {
+        assert!(resolve_fs_file("file:efi:../../etc/shadow").is_err());
+        assert!(resolve_fs_file("file:efi:EFI/../../etc/shadow").is_err());
+        assert!(resolve_fs_file("file:efi:").is_err());
+        assert!(resolve_fs_file("file::/EFI/x.efi").is_err());
+        assert!(resolve_fs_file("file:efi").is_err());
+    }
+
+    /// The atomic write: a temp file in the destination directory, renamed
+    /// over the target. Exercised against a plain directory, which is what
+    /// with_mounted_partition hands the closure.
+    #[test]
+    fn test_fs_file_write_is_atomic_and_verified() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("payload.efi");
+        fs::write(&src, b"new-uki-bytes").unwrap();
+        let dest_dir = tmp.path().join("mnt/EFI/Linux");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("avocado+3.efi");
+        fs::write(&dest, b"old-uki").unwrap();
+
+        // Same sequence write_to_fs_file performs inside the mount.
+        let data = fs::read(&src).unwrap();
+        let staged = dest_dir.join(".avocado+3.efi.avocado-new");
+        fs::write(&staged, &data).unwrap();
+        fs::rename(&staged, &dest).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), data);
+        assert!(
+            !staged.exists(),
+            "the temporary file must not be left behind"
+        );
+    }
+
+    /// Commit actions are best-effort and a marker without them is a no-op,
+    /// so an older marker (or a manifest that declares none) stays valid.
+    #[test]
+    fn test_commit_os_update_without_actions_is_a_noop() {
+        let pending = PendingUpdate {
+            os_build_id: "b".to_string(),
+            initramfs_build_id: None,
+            verify: None,
+            verify_initramfs: None,
+            rollback: None,
+            commit: None,
+            previous_slot: "a".to_string(),
+            new_slot: Some("b".to_string()),
+            layout: None,
+            runtime_id: None,
+        };
+        assert!(commit_os_update(&pending, false).is_ok());
+
+        let empty = PendingUpdate {
+            commit: Some(vec![]),
+            ..pending
+        };
+        assert!(commit_os_update(&empty, false).is_ok());
+    }
+
+    /// The commit actions reach the marker, because by the next boot the
+    /// bundle they came from is gone.
+    #[test]
+    fn test_commit_actions_survive_the_marker_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let pending = PendingUpdate {
+            os_build_id: "b".to_string(),
+            initramfs_build_id: None,
+            verify: None,
+            verify_initramfs: None,
+            rollback: None,
+            commit: Some(vec![SlotAction::Command {
+                command: vec![
+                    "avocado-bls-bless".to_string(),
+                    "{inactive_slot}".to_string(),
+                ],
+            }]),
+            previous_slot: "a".to_string(),
+            new_slot: Some("b".to_string()),
+            layout: None,
+            runtime_id: None,
+        };
+        let path = tmp.path().join("pending.json");
+        write_pending_update_at(&pending, &path).unwrap();
+        let back = read_pending_update_from(&path).expect("marker should parse");
+        assert_eq!(back.new_slot.as_deref(), Some("b"));
+        match back.commit.as_deref() {
+            Some([SlotAction::Command { command }]) => {
+                assert_eq!(command[0], "avocado-bls-bless");
+            }
+            other => panic!("commit actions did not survive: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_pending_update_roundtrip() {
         let tmp = TempDir::new().unwrap();
@@ -2230,6 +2654,8 @@ PRETTY_NAME="Avocado Linux 2024.1"
                     "{previous_slot}".to_string(),
                 )]),
             }]),
+            commit: None,
+            new_slot: Some("b".to_string()),
             previous_slot: "a".to_string(),
             layout: None,
             runtime_id: Some("test-runtime-uuid".to_string()),
