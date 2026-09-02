@@ -1048,6 +1048,22 @@ fn locate_target(
     partition_name: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<WriteTarget, OsUpdateError> {
+    // An artifact that exists for one slot only.
+    //
+    // Every artifact needs a target for the slot being written or the update
+    // fails, which is right for a typo and wrong for an artifact that is
+    // genuinely per-slot. A boot entry whose kernel command line names its own
+    // rootfs partition is the case that forces it: the two slots need
+    // different BYTES, so they cannot share an image_key, and each of the two
+    // artifacts has nothing to write when the other slot is the target.
+    //
+    // Spelled explicitly rather than inferred from a missing key, so a
+    // misspelled slot name is still an error.
+    if partition_name == "skip" {
+        return Ok(WriteTarget::NotOnThisMedium(
+            "declared 'skip' for this slot".to_string(),
+        ));
+    }
     if let Some(target) = resolve_emmc_boot(partition_name)? {
         return Ok(target);
     }
@@ -2553,6 +2569,16 @@ PRETTY_NAME="Avocado Linux 2024.1"
                 assert!(reason.contains("efi"), "unexpected reason: {reason}");
             }
             other => panic!("expected an FsFile or NotOnThisMedium target, got {other:?}"),
+        }
+    }
+
+    /// A per-slot artifact declares `skip` for the slot it does not apply to,
+    /// and that must not fail the update the way a missing target does.
+    #[test]
+    fn test_skip_target_is_not_an_error() {
+        match locate_target("skip", None).expect("skip must resolve") {
+            WriteTarget::NotOnThisMedium(reason) => assert!(reason.contains("skip")),
+            other => panic!("expected NotOnThisMedium, got {other:?}"),
         }
     }
 
