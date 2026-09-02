@@ -486,9 +486,10 @@ pub fn rollback_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), 
         if verbose {
             println!("    Rolling back to slot: {}", pending.previous_slot);
         }
-        if let Err(e) = execute_slot_actions(
+        if let Err(e) = execute_slot_actions_for(
             rollback_actions,
             &pending.previous_slot,
+            pending.new_slot.as_deref(),
             pending.layout.as_ref(),
         ) {
             rollback_err = Some(OsUpdateError::RollbackFailed(e.to_string()));
@@ -1412,8 +1413,25 @@ pub fn execute_slot_actions(
     slot: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<(), OsUpdateError> {
+    execute_slot_actions_for(actions, slot, None, layout)
+}
+
+/// As `execute_slot_actions`, and `new_slot` additionally names the slot the
+/// update installed.
+///
+/// Rollback needs both: it switches TO the previous slot, and on a platform
+/// where selection comes from sorting rather than a pointer -- systemd-boot
+/// picking the highest-versioned Boot Loader Specification entry, say -- making
+/// the previous slot win means demoting the one that failed, which the actions
+/// cannot name from `{previous_slot}` alone.
+pub fn execute_slot_actions_for(
+    actions: &[SlotAction],
+    slot: &str,
+    new_slot: Option<&str>,
+    layout: Option<&BundleLayout>,
+) -> Result<(), OsUpdateError> {
     for action in actions {
-        execute_slot_action(action, slot, layout)?;
+        execute_slot_action_for(action, slot, new_slot, layout)?;
     }
     Ok(())
 }
@@ -1425,9 +1443,19 @@ pub fn execute_slot_action(
     slot: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<(), OsUpdateError> {
+    execute_slot_action_for(action, slot, None, layout)
+}
+
+pub fn execute_slot_action_for(
+    action: &SlotAction,
+    slot: &str,
+    new_slot: Option<&str>,
+    layout: Option<&BundleLayout>,
+) -> Result<(), OsUpdateError> {
     let replace_placeholders = |s: &str| -> String {
         s.replace("{inactive_slot}", slot)
             .replace("{previous_slot}", slot)
+            .replace("{new_slot}", new_slot.unwrap_or(slot))
     };
 
     match action {
@@ -2571,6 +2599,38 @@ PRETTY_NAME="Avocado Linux 2024.1"
             !staged.exists(),
             "the temporary file must not be left behind"
         );
+    }
+
+    /// A rollback action can name the slot that failed, not just the one being
+    /// returned to. On a platform where selection comes from sorting rather
+    /// than a pointer, returning to the previous slot means demoting the new
+    /// one, which `{previous_slot}` cannot express.
+    #[test]
+    fn test_new_slot_placeholder_is_distinct_from_previous() {
+        let action = SlotAction::Command {
+            command: vec![
+                "avocado-bls".to_string(),
+                "demote".to_string(),
+                "{new_slot}".to_string(),
+            ],
+        };
+        // Resolved the way execute_slot_action_for resolves it.
+        let resolve = |s: &str, slot: &str, new: Option<&str>| -> String {
+            s.replace("{inactive_slot}", slot)
+                .replace("{previous_slot}", slot)
+                .replace("{new_slot}", new.unwrap_or(slot))
+        };
+        let SlotAction::Command { command } = &action else {
+            panic!("expected a command action");
+        };
+        let with_new: Vec<String> = command.iter().map(|c| resolve(c, "a", Some("b"))).collect();
+        assert_eq!(with_new[2], "b", "{{new_slot}} must be the failed slot");
+
+        // With no new_slot recorded -- a marker written by an older avocadoctl
+        // -- it falls back to the slot being switched to rather than expanding
+        // to an empty argument.
+        let without: Vec<String> = command.iter().map(|c| resolve(c, "a", None)).collect();
+        assert_eq!(without[2], "a");
     }
 
     /// Commit actions are best-effort and a marker without them is a no-op,
