@@ -201,6 +201,7 @@ pub fn apply_os_update(
     aos_path: &Path,
     base_dir: &Path,
     _verbose: bool,
+    target: Option<&crate::manifest::OsBundleRef>,
 ) -> Result<bool, OsUpdateError> {
     let staging_dir = base_dir.join(OS_UPDATE_STAGING_DIR);
 
@@ -234,6 +235,7 @@ pub fn apply_os_update(
             rootfs_matches,
             bundle.initramfs_build_id.as_deref(),
             active_manifest(base_dir).as_ref(),
+            target,
         ) {
             println!(
                 "  OS already up to date ({}={}), skipping write",
@@ -1887,6 +1889,7 @@ pub fn apply_os_update_streaming<R: Read>(
     reader: R,
     base_dir: &Path,
     _verbose: bool,
+    target: Option<&crate::manifest::OsBundleRef>,
 ) -> Result<bool, OsUpdateError> {
     // Build streaming pipeline: reader → zstd decoder → tar archive
     let decoder = zstd::stream::Decoder::new(BufReader::new(reader)).map_err(|e| {
@@ -1943,6 +1946,7 @@ pub fn apply_os_update_streaming<R: Read>(
             rootfs_matches,
             bundle.initramfs_build_id.as_deref(),
             active_manifest(base_dir).as_ref(),
+            target,
         ) {
             println!(
                 "  OS already up to date ({}={}), skipping write",
@@ -2232,12 +2236,26 @@ fn read_initramfs_id_file(path: &Path) -> Option<String> {
 /// nothing while every caller upstream has already decided the bundle must be
 /// applied - the runtime then goes active over an initramfs that was never
 /// written. Same rule as [`os_bundle_satisfied`], which is what the callers use.
+///
+/// `target` is the manifest's record of the bundle being written, and when it is
+/// present it settles the question: the caller reached
+/// [`os_bundle_satisfied`] first and is only here because that said to apply.
+/// Re-deriving the decision from `bundle.json` alone gets strictly less
+/// information -- a bundle cannot carry its own hash, so the two build ids are
+/// all this sees -- and a device-tree-only change moves neither, so this skipped
+/// the write, returned `Ok(false)`, and left the caller to activate a runtime
+/// over an ESP that was never touched. The bundle downloaded, the gate upstream
+/// passed, and nothing was written. Only when `target` is `None` -- no caller
+/// does that today, but the function is public -- do the two ids stand alone.
 fn write_can_be_skipped(
     rootfs_matches: bool,
     target_initramfs_id: Option<&str>,
     active: Option<&crate::manifest::RuntimeManifest>,
+    target: Option<&crate::manifest::OsBundleRef>,
 ) -> bool {
-    rootfs_matches && !initramfs_id_differs_from_active(target_initramfs_id, active)
+    rootfs_matches
+        && !initramfs_id_differs_from_active(target_initramfs_id, active)
+        && target.is_none_or(|t| active_bundle_matches(t, active))
 }
 
 /// [`initramfs_differs_from_active`] for a target known only by its initramfs
@@ -2494,27 +2512,29 @@ mod tests {
         // and the runtime goes active over an initramfs that never landed.
         let active = active_with_initramfs(Some("initrd-a"));
         assert!(
-            !write_can_be_skipped(true, Some("initrd-b"), Some(&active)),
+            !write_can_be_skipped(true, Some("initrd-b"), Some(&active), None),
             "rootfs matches but the initramfs differs: the bundle must be written"
         );
         assert!(
-            write_can_be_skipped(true, Some("initrd-a"), Some(&active)),
+            write_can_be_skipped(true, Some("initrd-a"), Some(&active), None),
             "same rootfs and same initramfs is genuinely nothing to do"
         );
         // A rootfs that does not match is written regardless of the initramfs.
         assert!(!write_can_be_skipped(
             false,
             Some("initrd-a"),
-            Some(&active)
+            Some(&active),
+            None
         ));
         // Unknown on either side keeps the old behaviour: never write on a guess.
-        assert!(write_can_be_skipped(true, None, Some(&active)));
+        assert!(write_can_be_skipped(true, None, Some(&active), None));
         assert!(write_can_be_skipped(
             true,
             Some("initrd-b"),
-            Some(&active_with_initramfs(None))
+            Some(&active_with_initramfs(None)),
+            None
         ));
-        assert!(write_can_be_skipped(true, Some("initrd-b"), None));
+        assert!(write_can_be_skipped(true, Some("initrd-b"), None, None));
     }
 
     #[test]
@@ -2563,6 +2583,41 @@ mod tests {
             "a bundle with different content must be applied even though both \
              build ids are unchanged -- this is the device-tree case"
         );
+    }
+
+    /// The writer's own gate must not second-guess the caller. Every caller
+    /// reaches `os_bundle_satisfied` first and is only here because it said to
+    /// apply; re-deriving the answer from bundle.json sees only the two build
+    /// ids, and a device-tree-only change moves neither -- so this returned
+    /// Ok(false), wrote nothing, and the caller activated a runtime over an ESP
+    /// that was never touched. Observed on rb3gen2: bundle downloaded (157 MB
+    /// on disk), runtime activated, ESP unchanged, no reboot.
+    #[test]
+    fn the_writer_does_not_skip_a_bundle_the_caller_already_decided_to_apply() {
+        let active = active_with_initramfs(Some("initrd-a")); // records sha "00"
+
+        // Both build ids match, so the old two-proxy test says "skip".
+        assert!(
+            write_can_be_skipped(true, Some("initrd-a"), Some(&active), None),
+            "with no target to compare, the two ids are all there is"
+        );
+        // Handed the bundle the caller is applying, it must not skip.
+        assert!(
+            !write_can_be_skipped(
+                true,
+                Some("initrd-a"),
+                Some(&active),
+                Some(&bundle_with_sha("ff"))
+            ),
+            "the caller already decided to apply this; the writer must write it"
+        );
+        // ...and still skips a genuine no-op.
+        assert!(write_can_be_skipped(
+            true,
+            Some("initrd-a"),
+            Some(&active),
+            Some(&bundle_with_sha("00"))
+        ));
     }
 
     /// Unknown follows the rootfs rule (repair), not the initramfs rule
@@ -3184,7 +3239,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
         // and the function will try to proceed (and fail on slot detection since we have
         // no uboot). Let's test the parsing path at minimum.
         let reader = std::io::Cursor::new(tar_buf);
-        let result = apply_os_update_streaming(reader, tmp.path(), true);
+        let result = apply_os_update_streaming(reader, tmp.path(), true, None);
 
         // Either succeeds (OS already up to date) or fails on slot detection —
         // both are valid outcomes that prove the streaming pipeline works up to that point.
@@ -3218,7 +3273,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
 
         let reader = std::io::Cursor::new(tar_buf);
         let tmp = TempDir::new().unwrap();
-        let result = apply_os_update_streaming(reader, tmp.path(), false);
+        let result = apply_os_update_streaming(reader, tmp.path(), false, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
