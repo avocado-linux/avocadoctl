@@ -2145,13 +2145,15 @@ pub fn apply_os_update_streaming<R: Read>(
 }
 
 /// Whether the running system already satisfies a manifest's OS bundle, so it
-/// need not be downloaded or applied. The bundle carries the rootfs *and* the
-/// boot FIT (kernel + initramfs); the rootfs is checked against the running
-/// os-release, the initramfs against the currently active runtime's record,
-/// because the running system keeps no trace of its initramfs id. Unknown ids
-/// count as "not satisfied" for the rootfs (an OS rollback must be repaired)
-/// and as "no difference" for the initramfs (never reboot on a guess).
+/// need not be downloaded or applied. Three necessary conditions: the rootfs is
+/// checked against the running os-release, the initramfs against the currently
+/// active runtime's record (because the running system keeps no trace of its
+/// initramfs id), and the bundle as a whole against the hash the active runtime
+/// recorded. Unknown ids count as "not satisfied" for the rootfs (an OS rollback
+/// must be repaired) and as "no difference" for the initramfs (never reboot on a
+/// guess); see [`active_bundle_matches`] for which way the third one goes.
 pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &Path) -> bool {
+    let active = active_manifest(base_dir);
     let rootfs_matches = os_bundle.os_build_id.as_ref().is_some_and(|expected| {
         verify_os_release(&VerifyConfig {
             verify_type: "os-release".to_string(),
@@ -2160,7 +2162,47 @@ pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &
         })
         .unwrap_or(false)
     });
-    rootfs_matches && !initramfs_differs_from_active(os_bundle, active_manifest(base_dir).as_ref())
+    rootfs_matches
+        && !initramfs_differs_from_active(os_bundle, active.as_ref())
+        && active_bundle_matches(os_bundle, active.as_ref())
+}
+
+/// Whether the active runtime recorded the same OS bundle, compared by the
+/// bundle's own content hash.
+///
+/// The two build ids above are proxies for the bundle's payload, and they cover
+/// exactly two of its artifacts. A bundle artifact that is neither the rootfs
+/// nor the initramfs changes the bundle without moving either id, so both
+/// proxies report "satisfied" over a bundle the device has never written:
+///
+///   - the device tree. On a UKI platform it is a section of the UKI; on a FIT
+///     or boot-partition platform it is a file in the boot image (imx8mp-evk's
+///     `boot` FAT carries `imx8mp-evk.dtb` beside `Image` and the initramfs).
+///     Neither location is the rootfs.
+///   - the kernel command line, the bootloader and its configuration, and
+///     anything else a platform packs into its boot artifact.
+///
+/// A kernel bump escapes this only by accident: it also moves the modules in
+/// the rootfs, so `AVOCADO_OS_BUILD_ID` changes and the rootfs proxy catches it.
+/// A device-tree-only change has no such side effect and was undeliverable over
+/// OTA on every platform until this check existed -- the bundle was built
+/// correctly, carried the new artifact, and was skipped before anything read it.
+///
+/// `sha256` is mandatory on `OsBundleRef` and written unconditionally by the
+/// build, so the only unknown is an active runtime with no `os_bundle` at all.
+/// That counts as differing, following the rootfs rule rather than the
+/// initramfs one: a missing initramfs id means an initrd older than the
+/// publisher, a fleet-wide capability gap where a reboot would be a guess,
+/// while a runtime that recorded no bundle simply cannot vouch for what is on
+/// the boot slot. The cost is one apply of identical content, once, on a device
+/// whose active runtime predates this.
+fn active_bundle_matches(
+    target: &crate::manifest::OsBundleRef,
+    active: Option<&crate::manifest::RuntimeManifest>,
+) -> bool {
+    active
+        .and_then(|m| m.os_bundle.as_ref())
+        .is_some_and(|b| b.sha256 == target.sha256)
 }
 
 /// Where the initrd publishes the build id of the initramfs that is actually
@@ -2490,6 +2532,54 @@ mod tests {
         assert!(
             !os_bundle_satisfied(&bundle, tmp.path()),
             "an unverifiable bundle must not count as already running"
+        );
+    }
+
+    fn bundle_with_sha(sha: &str) -> crate::manifest::OsBundleRef {
+        crate::manifest::OsBundleRef {
+            image_id: "img".into(),
+            sha256: sha.into(),
+            os_build_id: Some("os-1".into()),
+            initramfs_build_id: Some("initrd-a".into()),
+        }
+    }
+
+    /// The regression this check exists for: a device-tree-only change moves
+    /// neither `AVOCADO_OS_BUILD_ID` (it is not in the rootfs) nor the
+    /// initramfs id (it is not in the initramfs), so both proxies report
+    /// satisfied and the bundle is skipped before anything reads it. Only the
+    /// bundle's own hash distinguishes the two.
+    #[test]
+    fn a_bundle_whose_only_change_is_outside_the_rootfs_and_initramfs_differs() {
+        // `active_with_initramfs` records sha256 "00".
+        let active = active_with_initramfs(Some("initrd-a"));
+
+        assert!(
+            active_bundle_matches(&bundle_with_sha("00"), Some(&active)),
+            "the same bundle is genuinely nothing to do"
+        );
+        assert!(
+            !active_bundle_matches(&bundle_with_sha("ff"), Some(&active)),
+            "a bundle with different content must be applied even though both \
+             build ids are unchanged -- this is the device-tree case"
+        );
+    }
+
+    /// Unknown follows the rootfs rule (repair), not the initramfs rule
+    /// (never guess): a runtime that recorded no bundle cannot vouch for what
+    /// is on the boot slot.
+    #[test]
+    fn an_active_runtime_with_no_recorded_bundle_does_not_match() {
+        let mut no_bundle = active_with_initramfs(Some("initrd-a"));
+        no_bundle.os_bundle = None;
+
+        assert!(!active_bundle_matches(
+            &bundle_with_sha("00"),
+            Some(&no_bundle)
+        ));
+        assert!(
+            !active_bundle_matches(&bundle_with_sha("00"), None),
+            "no active runtime at all is equally unable to vouch"
         );
     }
 
