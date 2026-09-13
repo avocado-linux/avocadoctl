@@ -409,11 +409,11 @@ fn runtime_requires_os_change(
     }
     println!("  Applying OS update from {}...", aos_path.display());
 
-    crate::os_update::apply_os_update(&aos_path, base_dir, false).map_err(|e| {
-        AvocadoError::StagingFailed {
+    crate::os_update::apply_os_update(&aos_path, base_dir, false, Some(os_bundle)).map_err(
+        |e| AvocadoError::StagingFailed {
             reason: format!("OS update failed: {e}"),
-        }
-    })?;
+        },
+    )?;
 
     // Mark the runtime as pending — it will be promoted to active on next boot
     // after the OS build ID is verified.

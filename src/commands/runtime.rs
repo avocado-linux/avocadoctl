@@ -328,7 +328,9 @@ fn handle_activate(matches: &ArgMatches, config: &Config, output: &OutputManager
                     },
                 );
 
-            if let Err(e) = crate::os_update::apply_os_update(&aos_path, base_path, false) {
+            if let Err(e) =
+                crate::os_update::apply_os_update(&aos_path, base_path, false, Some(os_bundle))
+            {
                 output.error("Runtime Activate", &format!("OS update failed: {e}"));
                 std::process::exit(1);
             }
