@@ -505,7 +505,8 @@ impl vl_hitl::VarlinkInterface for HitlHandler {
         r#serverPort: Option<String>,
         r#extensions: Vec<String>,
     ) -> varlink::Result<()> {
-        match service::hitl::mount(&serverIp, serverPort.as_deref(), &extensions) {
+        let quiet = crate::output::OutputManager::new(false, false);
+        match service::hitl::mount(&serverIp, serverPort.as_deref(), &extensions, &quiet) {
             Ok(()) => call.reply(),
             Err(e) => map_hitl_error!(call, e),
         }
@@ -516,7 +517,8 @@ impl vl_hitl::VarlinkInterface for HitlHandler {
         call: &mut dyn vl_hitl::Call_Unmount,
         r#extensions: Vec<String>,
     ) -> varlink::Result<()> {
-        match service::hitl::unmount(&extensions) {
+        let quiet = crate::output::OutputManager::new(false, false);
+        match service::hitl::unmount(&extensions, &quiet) {
             Ok(()) => call.reply(),
             Err(e) => map_hitl_error!(call, e),
         }

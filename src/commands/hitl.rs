@@ -1,4 +1,3 @@
-use crate::commands::ext;
 use crate::output::OutputManager;
 use clap::{Arg, ArgMatches, Command};
 use std::fs;
@@ -39,6 +38,14 @@ pub fn create_command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("watchdog")
+                .about("Watch a HITL server and fall back to the installed extension if it goes away (started by `hitl mount`)")
+                .hide(true)
+                .arg(Arg::new("server-ip").long("server-ip").value_name("IP").required(true))
+                .arg(Arg::new("server-port").long("server-port").value_name("PORT").required(true))
+                .arg(Arg::new("extension").long("extension").value_name("NAME").required(true)),
+        )
+        .subcommand(
             Command::new("unmount").about("Unmount NFS extensions").arg(
                 Arg::new("extension")
                     .short('e')
@@ -60,6 +67,12 @@ pub fn handle_command(matches: &ArgMatches, output: &OutputManager) {
         Some(("unmount", unmount_matches)) => {
             unmount_extensions(unmount_matches, output);
         }
+        Some(("watchdog", m)) => {
+            let ip = m.get_one::<String>("server-ip").expect("required");
+            let port = m.get_one::<String>("server-port").expect("required");
+            let ext = m.get_one::<String>("extension").expect("required");
+            crate::service::hitl::watchdog(ip, port, ext, output);
+        }
         _ => {
             println!("Use 'avocadoctl hitl --help' for available HITL commands");
         }
@@ -67,369 +80,76 @@ pub fn handle_command(matches: &ArgMatches, output: &OutputManager) {
 }
 
 /// Mount NFS extensions from a remote server
+/// Mount NFS extensions from a remote server.
+///
+/// Thin: the work is `service::hitl::mount`, shared with the varlink daemon.
+/// This path only runs under AVOCADO_TEST_MODE, where the CLI bypasses the
+/// daemon so integration tests can use mock executables.
 fn mount_extensions(matches: &ArgMatches, output: &OutputManager) {
     let server_ip = matches
         .get_one::<String>("server-ip")
         .expect("server-ip is required");
-    let server_port = matches
-        .get_one::<String>("server-port")
-        .expect("server-port has default value");
-    let extensions: Vec<&String> = matches
+    let server_port = matches.get_one::<String>("server-port").map(String::as_str);
+    let extensions: Vec<String> = matches
         .get_many::<String>("extension")
         .expect("at least one extension is required")
+        .cloned()
         .collect();
 
     output.info(
         "HITL Mount",
-        &format!("Mounting extensions from {server_ip}:{server_port}"),
+        &format!(
+            "Mounting {} extension(s) from {server_ip}",
+            extensions.len()
+        ),
     );
-
-    let extensions_base_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        // Use AVOCADO_TEST_TMPDIR if set (to avoid affecting TempDir::new()),
-        // otherwise fall back to TMPDIR, then /tmp
-        let temp_base = std::env::var("AVOCADO_TEST_TMPDIR")
-            .or_else(|_| std::env::var("TMPDIR"))
-            .unwrap_or_else(|_| "/tmp".to_string());
-        format!("{temp_base}/avocado/hitl")
-    } else {
-        "/run/avocado/hitl".to_string()
-    };
-    let mut success = true;
-
-    for extension in &extensions {
-        output.step("HITL Mount", &format!("Setting up extension: {extension}"));
-
-        // Create extension directory
-        let extension_dir = format!("{extensions_base_dir}/{extension}");
-        if let Err(e) = create_extension_directory(&extension_dir, output) {
-            output.error(
-                "HITL Mount",
-                &format!("Failed to create directory {extension_dir}: {e}"),
-            );
-            success = false;
-            continue;
+    match crate::service::hitl::mount(server_ip, server_port, &extensions, output) {
+        Ok(()) => output.success("HITL Mount", "All extensions mounted successfully"),
+        Err(e) => {
+            output.error("HITL Mount", &describe(&e));
+            std::process::exit(1);
         }
-
-        // Mount NFS share
-        if let Err(e) =
-            mount_nfs_extension(server_ip, server_port, extension, &extension_dir, output)
-        {
-            output.error(
-                "HITL Mount",
-                &format!("Failed to mount extension {extension}: {e}"),
-            );
-
-            // Clean up the directory that was created since the mount failed
-            if let Err(cleanup_err) = cleanup_extension_directory(&extension_dir, output) {
-                output.error(
-                    "HITL Mount",
-                    &format!("Failed to cleanup directory for {extension}: {cleanup_err}"),
-                );
-            }
-
-            success = false;
-            continue;
-        }
-
-        // Scan for enabled services and create drop-ins
-        let enabled_services =
-            ext::scan_extension_for_enable_services(Path::new(&extension_dir), extension);
-        if !enabled_services.is_empty() {
-            output.info(
-                "HITL Mount",
-                &format!(
-                    "Found {} enabled service(s) in extension {}: {}",
-                    enabled_services.len(),
-                    extension,
-                    enabled_services.join(", ")
-                ),
-            );
-            if let Err(e) =
-                create_service_dropins(extension, &extension_dir, &enabled_services, output)
-            {
-                output.error(
-                    "HITL Mount",
-                    &format!("Failed to create service drop-ins for {extension}: {e}"),
-                );
-                // Continue even if drop-in creation fails - the mount still succeeded
-            }
-        }
-
-        output.progress(&format!("Successfully mounted extension: {extension}"));
-    }
-
-    if success {
-        // Reload systemd to apply any drop-in changes
-        if let Err(e) = systemd_daemon_reload(output) {
-            output.error(
-                "HITL Mount",
-                &format!("Failed to reload systemd daemon: {e}"),
-            );
-            // Continue even if daemon-reload fails
-        }
-
-        output.success("HITL Mount", "All extensions mounted successfully");
-        output.info(
-            "HITL Mount",
-            "Refreshing extensions to apply mounted changes",
-        );
-        let config = crate::config::Config::default();
-        ext::refresh_extensions(&config, output);
-    } else {
-        output.error("HITL Mount", "Some extensions failed to mount");
-        std::process::exit(1);
     }
 }
 
-/// Create extension directory with proper error handling
-fn create_extension_directory(
-    dir_path: &str,
-    output: &OutputManager,
-) -> Result<(), std::io::Error> {
-    if !Path::new(dir_path).exists() {
-        fs::create_dir_all(dir_path)?;
-        output.progress(&format!("Created directory: {dir_path}"));
-    } else {
-        output.progress(&format!("Directory already exists: {dir_path}"));
+/// Name the extension in the way the user typed it, then the reason.
+fn describe(e: &crate::service::error::AvocadoError) -> String {
+    use crate::service::error::AvocadoError::{MountFailed, UnmountFailed};
+    match e {
+        MountFailed { extension, reason } => {
+            format!("Failed to mount extension {extension}: {reason}")
+        }
+        UnmountFailed { extension, reason } => {
+            format!("Failed to unmount extension {extension}: {reason}")
+        }
+        other => other.to_string(),
     }
-    Ok(())
 }
 
-/// Mount NFS extension using systemd-mount for proper dependency tracking
-/// This ensures the mount is properly tracked by systemd and will be unmounted
-/// in the correct order during shutdown (before network teardown)
-fn mount_nfs_extension(
-    server_ip: &str,
-    server_port: &str,
-    extension: &str,
-    mount_point: &str,
-    output: &OutputManager,
-) -> Result<(), HitlError> {
-    let nfs_source = format!("{server_ip}:/{extension}");
-    let mount_options = format!("port={server_port},vers=4,hard,timeo=600,retrans=2,acregmin=0,acregmax=1,acdirmin=0,acdirmax=1,lookupcache=none");
-
-    output.step(
-        "NFS Mount",
-        &format!("Mounting {nfs_source} to {mount_point} via systemd-mount"),
-    );
-
-    // Check if we're in test mode and should use mock commands
-    let command_name = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        "mock-systemd-mount"
-    } else {
-        "systemd-mount"
-    };
-
-    // systemd-mount creates a transient mount unit that systemd tracks
-    // This ensures proper shutdown ordering (unmount before network goes down)
-    // --no-block allows the command to return immediately
-    // --collect removes the unit after unmounting
-    let result = ProcessCommand::new(command_name)
-        .args([
-            "--no-block",
-            "--collect",
-            "-t",
-            "nfs4",
-            "-o",
-            &mount_options,
-            &nfs_source,
-            mount_point,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| HitlError::Command {
-            command: command_name.to_string(),
-            source: e,
-        })?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(HitlError::Mount {
-            extension: extension.to_string(),
-            mount_point: mount_point.to_string(),
-            error: stderr.to_string(),
-        });
-    }
-
-    Ok(())
-}
-
-/// Unmount NFS extensions
+/// Unmount NFS extensions and restore the installed ones. See `mount_extensions`.
 fn unmount_extensions(matches: &ArgMatches, output: &OutputManager) {
-    let extensions: Vec<&String> = matches
+    let extensions: Vec<String> = matches
         .get_many::<String>("extension")
         .expect("at least one extension is required")
+        .cloned()
         .collect();
 
     output.info(
         "HITL Unmount",
         &format!("Unmounting {} extension(s)", extensions.len()),
     );
-
-    let extensions_base_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        // Use AVOCADO_TEST_TMPDIR if set (to avoid affecting TempDir::new()),
-        // otherwise fall back to TMPDIR, then /tmp
-        let temp_base = std::env::var("AVOCADO_TEST_TMPDIR")
-            .or_else(|_| std::env::var("TMPDIR"))
-            .unwrap_or_else(|_| "/tmp".to_string());
-        format!("{temp_base}/avocado/hitl")
-    } else {
-        "/run/avocado/hitl".to_string()
-    };
-
-    // Step 1: Scan for enabled services before unmerging (while mounts are still accessible)
-    let mut extension_services: Vec<(String, Vec<String>)> = Vec::new();
-    for extension in &extensions {
-        let extension_dir = format!("{extensions_base_dir}/{extension}");
-        let enabled_services =
-            ext::scan_extension_for_enable_services(Path::new(&extension_dir), extension);
-        if !enabled_services.is_empty() {
-            output.info(
-                "HITL Unmount",
-                &format!(
-                    "Found {} enabled service(s) in extension {}: {}",
-                    enabled_services.len(),
-                    extension,
-                    enabled_services.join(", ")
-                ),
-            );
-            extension_services.push((extension.to_string(), enabled_services));
+    match crate::service::hitl::unmount(&extensions, output) {
+        Ok(()) => output.success("HITL Unmount", "All extensions unmounted successfully"),
+        Err(e) => {
+            output.error("HITL Unmount", &describe(&e));
+            std::process::exit(1);
         }
     }
-
-    // Step 2: Unmerge extensions first
-    output.step("HITL Unmount", "Unmerging extensions");
-    ext::unmerge_extensions(false, output);
-
-    // Step 3: Clean up service drop-ins
-    for (extension, services) in &extension_services {
-        if let Err(e) = cleanup_service_dropins(extension, services, output) {
-            output.error(
-                "HITL Unmount",
-                &format!("Failed to cleanup service drop-ins for {extension}: {e}"),
-            );
-            // Continue even if drop-in cleanup fails
-        }
-    }
-
-    // Step 4: Reload systemd to apply drop-in removals
-    if !extension_services.is_empty() {
-        if let Err(e) = systemd_daemon_reload(output) {
-            output.error(
-                "HITL Unmount",
-                &format!("Failed to reload systemd daemon: {e}"),
-            );
-            // Continue even if daemon-reload fails
-        }
-    }
-
-    let mut success = true;
-
-    // Step 5: Unmount NFS shares and clean up directories
-    for extension in &extensions {
-        output.step(
-            "HITL Unmount",
-            &format!("Unmounting extension: {extension}"),
-        );
-
-        let extension_dir = format!("{extensions_base_dir}/{extension}");
-
-        // Unmount NFS share
-        if let Err(e) = unmount_nfs_extension(&extension_dir, output) {
-            output.error(
-                "HITL Unmount",
-                &format!("Failed to unmount extension {extension}: {e}"),
-            );
-            success = false;
-            continue;
-        }
-
-        // Remove the directory
-        if let Err(e) = cleanup_extension_directory(&extension_dir, output) {
-            output.error(
-                "HITL Unmount",
-                &format!("Failed to cleanup directory for {extension}: {e}"),
-            );
-            success = false;
-            continue;
-        }
-
-        output.progress(&format!("Successfully unmounted extension: {extension}"));
-    }
-
-    if success {
-        output.success("HITL Unmount", "All extensions unmounted successfully");
-        output.info("HITL Unmount", "Refreshing extensions to apply changes");
-        // Step 6: Merge remaining extensions
-        let config = crate::config::Config::default();
-        ext::merge_extensions(&config, output);
-    } else {
-        output.error("HITL Unmount", "Some extensions failed to unmount");
-        std::process::exit(1);
-    }
-}
-
-/// Unmount NFS extension using systemd-umount for proper cleanup
-/// This properly stops the transient mount unit created by systemd-mount
-fn unmount_nfs_extension(mount_point: &str, output: &OutputManager) -> Result<(), HitlError> {
-    // Check if the directory is actually mounted
-    if !Path::new(mount_point).exists() {
-        output.progress(&format!("Directory doesn't exist: {mount_point}"));
-        return Ok(());
-    }
-
-    output.step(
-        "NFS Unmount",
-        &format!("Unmounting {mount_point} via systemd-umount"),
-    );
-
-    // Check if we're in test mode and should use mock commands
-    let command_name = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
-        "mock-systemd-umount"
-    } else {
-        "systemd-umount"
-    };
-
-    // systemd-umount stops the mount unit, which properly handles NFS unmounting
-    let result = ProcessCommand::new(command_name)
-        .arg(mount_point)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| HitlError::Command {
-            command: command_name.to_string(),
-            source: e,
-        })?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(HitlError::Unmount {
-            mount_point: mount_point.to_string(),
-            error: stderr.to_string(),
-        });
-    }
-
-    Ok(())
-}
-
-/// Clean up extension directory after unmounting
-fn cleanup_extension_directory(
-    dir_path: &str,
-    output: &OutputManager,
-) -> Result<(), std::io::Error> {
-    if Path::new(dir_path).exists() {
-        fs::remove_dir_all(dir_path)?;
-        output.progress(&format!("Removed directory: {dir_path}"));
-    } else {
-        output.progress(&format!("Directory already removed: {dir_path}"));
-    }
-    Ok(())
 }
 
 /// Convert a mount path to a systemd mount unit name
 /// e.g., /run/avocado/hitl/my-ext -> run-avocado-hitl-my\x2dext.mount
-fn systemd_escape_mount_path(path: &str) -> String {
+pub fn systemd_escape_mount_path(path: &str) -> String {
     // Remove leading slash and replace / with -
     let without_leading_slash = path.trim_start_matches('/');
     // Escape dashes in path components (except separators)
@@ -728,13 +448,22 @@ mod tests {
         let cmd = create_command();
         assert_eq!(cmd.get_name(), "hitl");
 
-        // Check that both mount and unmount subcommands exist
+        // mount, unmount, and the hidden watchdog that mount starts
         let subcommands: Vec<_> = cmd.get_subcommands().collect();
-        assert_eq!(subcommands.len(), 2);
+        assert_eq!(subcommands.len(), 3);
 
         let subcommand_names: Vec<&str> = subcommands.iter().map(|cmd| cmd.get_name()).collect();
         assert!(subcommand_names.contains(&"mount"));
         assert!(subcommand_names.contains(&"unmount"));
+        assert!(subcommand_names.contains(&"watchdog"));
+        let watchdog = subcommands
+            .iter()
+            .find(|c| c.get_name() == "watchdog")
+            .unwrap();
+        assert!(
+            watchdog.is_hide_set(),
+            "watchdog is an implementation detail of mount"
+        );
     }
 
     #[test]

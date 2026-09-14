@@ -31,6 +31,15 @@ struct Extension {
     merge_index: Option<usize>,
 }
 
+/// Where extensions are being merged, for log lines.
+pub(crate) fn environment_label() -> &'static str {
+    if is_running_in_initrd() {
+        "initrd environment"
+    } else {
+        "system environment"
+    }
+}
+
 /// Print a colored info message
 fn print_colored_info(message: &str) {
     // Use auto-detection but fallback gracefully
@@ -590,11 +599,7 @@ pub(crate) fn merge_extensions_internal(
         }
     }
 
-    let environment_info = if is_running_in_initrd() {
-        "initrd environment"
-    } else {
-        "system environment"
-    };
+    let environment_info = environment_label();
     output.info(
         "Extension Merge",
         &format!("Starting extension merge process in {environment_info}"),
@@ -691,11 +696,7 @@ pub(crate) fn unmerge_extensions_internal_with_options(
     unmount: bool,
     output: &OutputManager,
 ) -> Result<(), SystemdError> {
-    let environment_info = if is_running_in_initrd() {
-        "initrd environment"
-    } else {
-        "system environment"
-    };
+    let environment_info = environment_label();
     output.info(
         "Extension Unmerge",
         &format!("Starting extension unmerge process in {environment_info}"),
@@ -1220,11 +1221,7 @@ pub(crate) fn refresh_preflight(config: &Config) -> Result<(), SystemdError> {
 
 /// Refresh extensions (unmerge then merge)
 pub fn refresh_extensions(config: &Config, output: &OutputManager) {
-    let environment_info = if is_running_in_initrd() {
-        "initrd environment"
-    } else {
-        "system environment"
-    };
+    let environment_info = environment_label();
     output.info(
         "Extension Refresh",
         &format!("Starting extension refresh process in {environment_info}"),
@@ -3225,13 +3222,25 @@ fn cleanup_extension_release_staging(output: &OutputManager) -> Result<(), Syste
     if std::env::var("AVOCADO_TEST_MODE").is_err() {
         // Unmount bind mounts over extension-release.d directories.
         // These are bind mounts from the staging dir onto the extension's release dir.
-        let ext_mount_base = "/run/avocado/extensions";
+        //
+        // Under BOTH extension roots. HITL extensions live under
+        // /run/avocado/hitl, and when only /run/avocado/extensions was
+        // searched their binds were left in place while the staging tree
+        // they came from was deleted below. The next merge then bind-mounted
+        // onto a mountpoint whose root was a deleted directory and failed
+        // with `move_mount() ENOENT`, after the unmerge had already run --
+        // so every refresh after the first, with a HITL mount present, took
+        // the device down to zero extensions. The same leftover bind is what
+        // made `hitl unmount` fail EBUSY.
+        let ext_mount_bases = ["/run/avocado/extensions", "/run/avocado/hitl"];
         if let Ok(mounts_content) = fs::read_to_string("/proc/mounts") {
             for line in mounts_content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let mount_point = parts[1];
-                    if mount_point.starts_with(ext_mount_base)
+                    if ext_mount_bases
+                        .iter()
+                        .any(|base| mount_point.starts_with(base))
                         && mount_point.contains("extension-release.d")
                     {
                         let result = ProcessCommand::new("umount")

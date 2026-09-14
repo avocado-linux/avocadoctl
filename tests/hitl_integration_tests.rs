@@ -175,10 +175,10 @@ fn test_hitl_mount_with_mocks() {
         stdout.contains("Extensions refreshed successfully"),
         "Should complete extension refresh"
     );
-    assert!(
-        stdout.contains("Scanning HITL extensions"),
-        "Should scan HITL extensions during refresh"
-    );
+    // Not asserted: the verbose per-source scan lines ("Scanning HITL
+    // extensions in ..."). They come from inside the refresh, which now runs
+    // through the service layer whose output is collected rather than
+    // printed; the success line above is what proves the refresh ran.
 }
 
 /// Test hitl mount with short options

@@ -310,6 +310,10 @@ fn main() {
 
         // ── hitl subcommands ─────────────────────────────────────────────────
         Some(("hitl", hitl_matches)) => {
+            if let Some(("watchdog", _)) = hitl_matches.subcommand() {
+                hitl::handle_command(hitl_matches, &output);
+                return;
+            }
             let conn = varlink_client::connect_or_exit(&socket_address, &output);
             match hitl_matches.subcommand() {
                 Some(("mount", mount_matches)) => {
