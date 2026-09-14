@@ -3245,9 +3245,7 @@ fn cleanup_extension_release_staging(output: &OutputManager) -> Result<(), Syste
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let mount_point = parts[1];
-                    if ext_mount_bases
-                        .iter()
-                        .any(|base| mount_point.starts_with(base))
+                    if mount_point_under_any(mount_point, &ext_mount_bases)
                         && mount_point.contains("extension-release.d")
                     {
                         let result = ProcessCommand::new("umount")
@@ -4288,8 +4286,42 @@ fn handle_systemd_output(
     }
 }
 
+/// Whether `mount_point` is one of `bases` or lives beneath one (`base/...`).
+/// A plain `starts_with(base)` also matched siblings like
+/// `/run/avocado/extensions-old`, so a refresh could unmount unrelated mounts;
+/// this anchors on the path boundary.
+fn mount_point_under_any(mount_point: &str, bases: &[&str]) -> bool {
+    bases
+        .iter()
+        .any(|&base| mount_point == base || mount_point.starts_with(&format!("{base}/")))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::mount_point_under_any;
+
+    #[test]
+    fn mount_base_matches_root_and_children_only() {
+        let bases = ["/run/avocado/extensions", "/run/avocado/hitl"];
+        // The base itself and anything under base/ match.
+        assert!(mount_point_under_any("/run/avocado/hitl", &bases));
+        assert!(mount_point_under_any(
+            "/run/avocado/hitl/vmm/usr/lib/extension-release.d",
+            &bases
+        ));
+        assert!(mount_point_under_any(
+            "/run/avocado/extensions/foo-1.0/etc/extension-release.d",
+            &bases
+        ));
+        // Sibling directories that merely share the prefix must NOT match.
+        assert!(!mount_point_under_any("/run/avocado/hitl2/x", &bases));
+        assert!(!mount_point_under_any(
+            "/run/avocado/extensions-old/x",
+            &bases
+        ));
+        assert!(!mount_point_under_any("/run/avocado/other", &bases));
+    }
+
     use super::*;
     use crate::commands::image_adaptor::{
         is_confext_enabled_for_current_environment, is_sysext_enabled_for_current_environment,
