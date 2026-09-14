@@ -30,16 +30,129 @@ pub fn connect_or_exit(address: &str, output: &OutputManager) -> Arc<RwLock<Conn
 }
 
 /// Print an RPC error and exit with code 1.
+///
+/// The varlink error types are generated, and their `Display` is
+/// `write!(f, "org.avocado.Iface.ErrorName: {:#?}", args)` -- an interface path
+/// followed by a pretty-printed Rust struct. Shown verbatim that reads as a
+/// crash dump ("RPC Error: org.avocado.Runtimes.RuntimeNotFound: Some(
+/// RuntimeNotFound_Args { id: \"x\" })"). [`humanize_rpc_error`] turns it into
+/// a sentence; `--verbose` still gets the raw form for debugging.
 pub fn exit_with_rpc_error(
     err: impl std::fmt::Display + std::fmt::Debug,
     output: &OutputManager,
 ) -> ! {
     if output.is_verbose() {
-        output.error("RPC Error", &format!("{err:?}"));
+        output.error("Error", &format!("{err:?}"));
     } else {
-        output.error("RPC Error", &err.to_string());
+        output.error("Error", &humanize_rpc_error(&err.to_string()));
     }
     std::process::exit(1);
+}
+
+/// Turn a generated varlink error `Display` string into a readable message.
+///
+/// `org.avocado.Runtimes.RuntimeNotFound: Some(RuntimeNotFound_Args { id: "x" })`
+/// becomes `Runtime not found (id: x)`. Anything that does not match the shape
+/// is returned unchanged -- a plain error message passes through as-is.
+pub fn humanize_rpc_error(raw: &str) -> String {
+    // Split "iface.path.ErrorName: <debug struct>" on the first ": ".
+    let (path, body) = match raw.split_once(": ") {
+        Some((p, b)) if p.starts_with("org.avocado.") => (p, b),
+        // Not one of our varlink errors; leave it alone.
+        _ => return raw.to_string(),
+    };
+    let error_name = path.rsplit('.').next().unwrap_or(path);
+    let mut msg = split_camel_case(error_name);
+
+    // Pull the `field: value` pairs out of the debug struct, keeping the ones
+    // that carry information (skip None, empty, and the redundant *_Args tag).
+    let fields = extract_debug_fields(body);
+    if !fields.is_empty() {
+        msg.push_str(" (");
+        msg.push_str(&fields.join(", "));
+        msg.push(')');
+    }
+    msg
+}
+
+/// "RuntimeNotFound" -> "Runtime not found"; "AmbiguousRuntimeId" ->
+/// "Ambiguous runtime id". First word capitalized, the rest lowercased.
+fn split_camel_case(name: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in name.chars() {
+        if c.is_uppercase() && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if i == 0 {
+                let mut cs = w.chars();
+                match cs.next() {
+                    Some(f) => f
+                        .to_uppercase()
+                        .chain(cs.flat_map(char::to_lowercase))
+                        .collect(),
+                    None => w,
+                }
+            } else {
+                w.to_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Extract informative `field: value` pairs from a Rust debug struct body.
+/// Best-effort and shallow: enough to surface `id`, `reason`, `key`, etc.
+fn extract_debug_fields(body: &str) -> Vec<String> {
+    // Trim the `Some(Type_Args { ... })` / `Type { ... }` wrapper to the braces.
+    let inner = match (body.find('{'), body.rfind('}')) {
+        (Some(a), Some(b)) if a < b => &body[a + 1..b],
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for part in split_top_level_commas(inner) {
+        let Some((k, v)) = part.split_once(':') else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v.trim().trim_matches('"');
+        if k.is_empty() || v.is_empty() || v == "None" || v == "[]" {
+            continue;
+        }
+        out.push(format!("{k}: {v}"));
+    }
+    out
+}
+
+/// Split on commas that are not inside brackets/braces/parens/quotes, so a
+/// nested `candidates: [a, b]` stays one field.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let (mut depth, mut in_str, mut start) = (0i32, false, 0usize);
+    let b = s.as_bytes();
+    for i in 0..b.len() {
+        match b[i] {
+            b'"' => in_str = !in_str,
+            b'{' | b'[' | b'(' if !in_str => depth += 1,
+            b'}' | b']' | b')' if !in_str => depth -= 1,
+            b',' if !in_str && depth == 0 => {
+                parts.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].to_string());
+    parts
 }
 
 // ── Log output helpers ───────────────────────────────────────────────────────
@@ -357,5 +470,48 @@ pub fn print_root_authority(info: &Option<vl_ra::RootAuthorityInfo>, output: &Ou
             }
             println!();
         }
+    }
+}
+
+#[cfg(test)]
+mod rpc_error_tests {
+    use super::*;
+
+    #[test]
+    fn humanizes_a_generated_varlink_error() {
+        let raw = r#"org.avocado.Runtimes.RuntimeNotFound: Some(RuntimeNotFound_Args { id: "zzzzz", candidates: None })"#;
+        assert_eq!(humanize_rpc_error(raw), "Runtime not found (id: zzzzz)");
+    }
+
+    #[test]
+    fn multiword_error_and_multiple_fields() {
+        let raw = r#"org.avocado.Runtimes.StagingFailed: Some(StagingFailed_Args { reason: "disk full" })"#;
+        assert_eq!(
+            humanize_rpc_error(raw),
+            "Staging failed (reason: disk full)"
+        );
+        let raw2 = r#"org.avocado.Hitl.MountFailed: Some(MountFailed_Args { extension: "vmm", reason: "no route" })"#;
+        assert_eq!(
+            humanize_rpc_error(raw2),
+            "Mount failed (extension: vmm, reason: no route)"
+        );
+    }
+
+    #[test]
+    fn no_fields_is_just_the_name() {
+        let raw = "org.avocado.Runtimes.RemoveActiveRuntime: None";
+        assert_eq!(humanize_rpc_error(raw), "Remove active runtime");
+    }
+
+    #[test]
+    fn a_plain_message_passes_through() {
+        assert_eq!(
+            humanize_rpc_error("connection refused"),
+            "connection refused"
+        );
+        assert_eq!(
+            humanize_rpc_error("Failed to fetch http://x/y: timeout"),
+            "Failed to fetch http://x/y: timeout"
+        );
     }
 }

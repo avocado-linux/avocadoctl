@@ -10,42 +10,74 @@ use std::sync::mpsc;
 use std::thread;
 
 /// List all available extensions from the extensions directory.
+/// List the extensions the device actually has, by name.
+///
+/// The extension image pool stores each `.raw` under its content-addressed
+/// image id, so listing that directory named the extensions by UUID -- and
+/// listed every image, including the rootfs/initramfs/kernel/os_bundle that are
+/// not extensions at all. The active runtime manifest is the authority on which
+/// images are extensions and what they are called (`runtime inspect` already
+/// reads it), so resolve names and versions from there.
+///
+/// Directory-form extensions under the extensions dir -- HITL mounts and
+/// loose dev extensions, which carry a real name -- are still listed as before,
+/// and never duplicate a manifest entry.
 pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoError> {
+    let base_dir = config.get_avocado_base_dir();
+    let base_path = Path::new(&base_dir);
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // From the active runtime manifest: the real extension names + versions,
+    // each pointing at its image in the pool.
+    if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
+        let images_dir = base_path.join(crate::manifest::IMAGES_DIR_NAME);
+        for ext in &manifest.extensions {
+            let path = match &ext.image_id {
+                Some(id) => images_dir.join(format!("{id}.raw")).display().to_string(),
+                None => String::new(),
+            };
+            seen.insert(ext.name.clone());
+            result.push(ExtensionInfo {
+                name: ext.name.clone(),
+                version: Some(ext.version.clone()),
+                path,
+                is_sysext: true,
+                is_confext: false,
+                is_directory: false,
+            });
+        }
+    }
+
+    // Directory-form extensions (HITL mounts, dev directories) carry their own
+    // name; keep listing them, but do not repeat one the manifest already named.
     let extensions_path = config.get_extensions_dir();
-    let entries = match fs::read_dir(&extensions_path) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    match fs::read_dir(&extensions_path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if seen.insert(name.to_string()) {
+                        result.push(ExtensionInfo {
+                            name: name.to_string(),
+                            version: None,
+                            path: path.display().to_string(),
+                            is_sysext: true,
+                            is_confext: false,
+                            is_directory: true,
+                        });
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(AvocadoError::ConfigurationError {
                 message: format!("Cannot read extensions directory '{extensions_path}': {e}"),
             })
-        }
-    };
-
-    let mut result = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if path.is_dir() {
-                result.push(ExtensionInfo {
-                    name: name.to_string(),
-                    version: None,
-                    path: path.display().to_string(),
-                    is_sysext: true,
-                    is_confext: false,
-                    is_directory: true,
-                });
-            } else if name.ends_with(".raw") {
-                let ext_name = name.strip_suffix(".raw").unwrap_or(name);
-                result.push(ExtensionInfo {
-                    name: ext_name.to_string(),
-                    version: None,
-                    path: path.display().to_string(),
-                    is_sysext: true,
-                    is_confext: false,
-                    is_directory: false,
-                });
-            }
         }
     }
 
