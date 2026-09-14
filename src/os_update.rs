@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use thiserror::Error;
@@ -458,8 +459,6 @@ pub fn verify_os_release_from(
     }
 }
 
-/// Execute rollback: switch back to previous slot and clear the pending marker.
-/// Always clears the pending marker to prevent boot loops, even if rollback fails.
 /// Run the update's commit actions after the new OS has booted and verified.
 ///
 /// Best-effort by design: the OS is already up and confirmed at this point, so
@@ -743,6 +742,19 @@ fn resolve_emmc_boot(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
     Ok(Some(emmc_boot_device(&disk, n)))
 }
 
+/// Whether `s` is a single, safe path component: non-empty, no `/`, not `.`
+/// or `..`, and no control characters. Used to keep a partlabel or an
+/// artifact name from being interpreted as path syntax when it is
+/// interpolated into a filesystem path.
+fn is_single_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.chars().any(|c| c.is_control())
+}
+
 /// `file:<partlabel>:<path>` -> a file inside that partition's filesystem.
 /// `Ok(None)` when `spec` is not a file target at all.
 ///
@@ -763,6 +775,15 @@ fn resolve_fs_file(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
     if label.is_empty() || rel_path.is_empty() {
         return Err(OsUpdateError::ArtifactWriteFailed(format!(
             "slot target '{spec}': partlabel and path must both be non-empty"
+        )));
+    }
+    // The label is interpolated into /dev/disk/by-partlabel/<label>, so it has
+    // to be a single path component: a label like `../../sda1` would climb out
+    // of by-partlabel/ and select an arbitrary device. A partlabel is never a
+    // path -- reject any separator, dot-component, or control character.
+    if !is_single_path_component(label) {
+        return Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "slot target '{spec}': partlabel '{label}' must be a single name, not a path"
         )));
     }
     if Path::new(rel_path)
@@ -829,6 +850,64 @@ fn root_disk_name() -> Result<String, OsUpdateError> {
         })
 }
 
+/// Root-only scratch root for this updater. `/run` is a root-owned tmpfs, so
+/// unlike world-writable `/tmp` an unprivileged user cannot pre-plant a
+/// symlink at a path we are about to create.
+fn run_avocado_dir() -> Result<PathBuf, OsUpdateError> {
+    let dir = PathBuf::from("/run/avocado");
+    fs::create_dir_all(&dir).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!("cannot create {}: {e}", dir.display()))
+    })?;
+    Ok(dir)
+}
+
+/// An exclusive, whole-disk-partition lock held for a mount/write/unmount.
+///
+/// Keyed on the partition's `maj:min`, so two runtime activations racing to
+/// write the same boot partition serialize here instead of both mounting the
+/// same FAT read-write (which corrupts it) or racing the same mount point.
+/// `flock` is released by the kernel if this process dies, so a crashed
+/// updater never wedges the next one -- unlike a lock *file* left on disk.
+struct DeviceLock(#[allow(dead_code)] fs::File);
+
+impl DeviceLock {
+    fn acquire(device: &Path) -> Result<Self, OsUpdateError> {
+        let rdev = fs::metadata(device)
+            .map_err(|e| {
+                OsUpdateError::ArtifactWriteFailed(format!(
+                    "cannot stat {} for locking: {e}",
+                    device.display()
+                ))
+            })?
+            .rdev();
+        let path = run_avocado_dir()?.join(format!(
+            "os-update-{}:{}.lock",
+            (rdev >> 8) & 0xfff,
+            rdev & 0xff
+        ));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| {
+                OsUpdateError::ArtifactWriteFailed(format!(
+                    "cannot open lock {}: {e}",
+                    path.display()
+                ))
+            })?;
+        // Blocking exclusive lock; released when `file` drops or the process dies.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(OsUpdateError::ArtifactWriteFailed(format!(
+                "cannot lock {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(DeviceLock(file))
+    }
+}
+
 /// Write `source` to an eMMC boot partition: lift force_ro, write, fsync,
 /// read back and compare, restore force_ro whatever happened.
 /// Mount `label`'s partition, hand its mount point to `f`, unmount.
@@ -842,12 +921,17 @@ fn with_mounted_partition<T>(
 ) -> Result<T, OsUpdateError> {
     let device = resolve_partition(label)?;
 
+    // Serialize all writers to this partition for the whole mount/write/unmount.
+    let _lock = DeviceLock::acquire(&device)?;
+
     if let Some(existing) = existing_rw_mount(&device) {
         return f(&existing);
     }
 
-    let mount_point = PathBuf::from(format!("/tmp/avocado-fsfile-{label}"));
-    fs::create_dir_all(&mount_point).map_err(|e| {
+    // A unique directory in the root-only scratch root, created exclusively so
+    // it cannot be a pre-planted symlink to somewhere else.
+    let mount_point = run_avocado_dir()?.join(format!("mnt-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&mount_point).map_err(|e| {
         OsUpdateError::ArtifactWriteFailed(format!(
             "cannot create mount point {}: {e}",
             mount_point.display()
@@ -928,70 +1012,106 @@ fn write_to_fs_file(
     })?;
 
     with_mounted_partition(label, |mount_point| {
-        let dest = mount_point.join(rel_path);
-        let dir = dest.parent().ok_or_else(|| {
-            OsUpdateError::ArtifactWriteFailed(format!("{rel_path} has no parent directory"))
-        })?;
-        fs::create_dir_all(dir).map_err(|e| {
-            OsUpdateError::ArtifactWriteFailed(format!(
-                "cannot create {} in {label}: {e}",
-                dir.display()
-            ))
-        })?;
-
-        // Same directory as the destination, so the rename cannot cross a
-        // filesystem boundary and degrade into a copy.
-        let tmp = dir.join(format!(
-            ".{}.avocado-new",
-            dest.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("artifact")
-        ));
-        let write = (|| -> Result<(), OsUpdateError> {
-            let mut f = fs::File::create(&tmp).map_err(|e| {
-                OsUpdateError::ArtifactWriteFailed(format!("cannot create {}: {e}", tmp.display()))
-            })?;
-            f.write_all(&data).and_then(|_| f.sync_all()).map_err(|e| {
-                OsUpdateError::ArtifactWriteFailed(format!(
-                    "Failed to write {artifact_name} to {}: {e}",
-                    tmp.display()
-                ))
-            })
-        })();
-        if let Err(e) = write {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-
-        fs::rename(&tmp, &dest).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            OsUpdateError::ArtifactWriteFailed(format!(
-                "cannot rename {} to {}: {e}",
-                tmp.display(),
-                dest.display()
-            ))
-        })?;
-        // fsync the directory so the rename itself is durable. vfat ignores
-        // this; ext4 and friends do not, and the point of the rename is that
-        // it survives a power cut.
-        if let Ok(d) = fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-
-        let back = fs::read(&dest).map_err(|e| {
-            OsUpdateError::ArtifactWriteFailed(format!(
-                "Failed to read back {}: {e}",
-                dest.display()
-            ))
-        })?;
-        if back != data {
-            return Err(OsUpdateError::ArtifactWriteFailed(format!(
-                "{artifact_name} read back from {} does not match what was written",
-                dest.display()
-            )));
-        }
-        Ok(())
+        write_data_into_mount(mount_point, rel_path, &data, label, artifact_name)
     })
+}
+
+/// The atomic write itself, given a mounted directory: temp file in the
+/// destination dir (created exclusively, no symlink followed), fsync, rename
+/// over the target, dir fsync, read back and compare. Split out from
+/// [`write_to_fs_file`] so it can be exercised against a plain directory
+/// without a real mount.
+fn write_data_into_mount(
+    mount_point: &Path,
+    rel_path: &str,
+    data: &[u8],
+    label: &str,
+    artifact_name: &str,
+) -> Result<(), OsUpdateError> {
+    let dest = mount_point.join(rel_path);
+    let dir = dest.parent().ok_or_else(|| {
+        OsUpdateError::ArtifactWriteFailed(format!("{rel_path} has no parent directory"))
+    })?;
+    // Refuse to write through a symlinked path component: an existing `EFI`
+    // symlink could redirect the create/rename off the mounted partition.
+    // (`rel_path` has already been checked for `..`.) FAT holds no symlinks,
+    // so this never fires on a real ESP; it guards non-FAT FsFile targets.
+    if let Ok(rel_dir) = dir.strip_prefix(mount_point) {
+        let mut probe = mount_point.to_path_buf();
+        for comp in rel_dir.components() {
+            probe.push(comp);
+            if probe
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(OsUpdateError::ArtifactWriteFailed(format!(
+                    "refusing to write through symlinked component {}",
+                    probe.display()
+                )));
+            }
+        }
+    }
+    fs::create_dir_all(dir).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "cannot create {} in {label}: {e}",
+            dir.display()
+        ))
+    })?;
+
+    // Same directory as the destination, so the rename cannot cross a
+    // filesystem boundary and degrade into a copy.
+    let tmp = dir.join(format!(
+        ".{}.avocado-new",
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact")
+    ));
+    // Under the per-device lock no concurrent writer exists, so a leftover
+    // `.avocado-new` is stale from a crashed run: clear it, then create the
+    // temp exclusively so a planted symlink is never followed or truncated.
+    let _ = fs::remove_file(&tmp);
+    let write = (|| -> Result<(), OsUpdateError> {
+        let mut f = fs::File::create_new(&tmp).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!("cannot create {}: {e}", tmp.display()))
+        })?;
+        f.write_all(data).and_then(|_| f.sync_all()).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!(
+                "Failed to write {artifact_name} to {}: {e}",
+                tmp.display()
+            ))
+        })
+    })();
+    if let Err(e) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    fs::rename(&tmp, &dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "cannot rename {} to {}: {e}",
+            tmp.display(),
+            dest.display()
+        ))
+    })?;
+    // fsync the directory so the rename itself is durable. vfat ignores
+    // this; ext4 and friends do not, and the point of the rename is that
+    // it survives a power cut.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+
+    let back = fs::read(&dest).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!("Failed to read back {}: {e}", dest.display()))
+    })?;
+    if back != data {
+        return Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "{artifact_name} read back from {} does not match what was written",
+            dest.display()
+        )));
+    }
+    Ok(())
 }
 
 fn write_to_emmc_boot(source: &Path, dev: &Path, artifact_name: &str) -> Result<(), OsUpdateError> {
@@ -1464,17 +1584,23 @@ pub fn execute_slot_action(
     execute_slot_action_for(action, slot, None, layout)
 }
 
+/// Resolve the slot placeholders in one argument string. `{inactive_slot}` and
+/// `{previous_slot}` are both the slot in hand; `{new_slot}` is the slot the
+/// action is *about* (on rollback, the slot being demoted -- distinct from the
+/// one returned to), falling back to `slot` when the marker did not record one.
+fn resolve_slot_placeholders(s: &str, slot: &str, new_slot: Option<&str>) -> String {
+    s.replace("{inactive_slot}", slot)
+        .replace("{previous_slot}", slot)
+        .replace("{new_slot}", new_slot.unwrap_or(slot))
+}
+
 pub fn execute_slot_action_for(
     action: &SlotAction,
     slot: &str,
     new_slot: Option<&str>,
     layout: Option<&BundleLayout>,
 ) -> Result<(), OsUpdateError> {
-    let replace_placeholders = |s: &str| -> String {
-        s.replace("{inactive_slot}", slot)
-            .replace("{previous_slot}", slot)
-            .replace("{new_slot}", new_slot.unwrap_or(slot))
-    };
+    let replace_placeholders = |s: &str| resolve_slot_placeholders(s, slot, new_slot);
 
     match action {
         SlotAction::UbootEnv { set } => {
@@ -2003,6 +2129,17 @@ pub fn apply_os_update_streaming<R: Read>(
             None => continue,
         };
 
+        // A bundle artifact name is a plain token, not a path. Spool files are
+        // named by UUID rather than by this name, so it no longer reaches the
+        // filesystem, but reject a pathological name up front regardless: the
+        // bundle is TUF-signed, so this is belt-and-suspenders.
+        if !is_single_path_component(&artifact.name) {
+            return Err(OsUpdateError::ArtifactWriteFailed(format!(
+                "artifact name '{}' must be a single name, not a path",
+                artifact.name
+            )));
+        }
+
         let target = artifact.slot_targets.get(&inactive_slot).ok_or_else(|| {
             OsUpdateError::ArtifactWriteFailed(format!(
                 "No slot target for slot '{}' in artifact '{}'",
@@ -2040,9 +2177,9 @@ pub fn apply_os_update_streaming<R: Read>(
                 // A few MiB and it needs read-back verification: spool to a
                 // file and take the staged path.
                 let tmp =
-                    std::env::temp_dir().join(format!("avocadoctl-{}.emmc-boot", artifact.name));
+                    run_avocado_dir()?.join(format!("spool-{}.emmc-boot", uuid::Uuid::new_v4()));
                 let spooled = (|| -> Result<(), OsUpdateError> {
-                    let mut out = fs::File::create(&tmp).map_err(|e| {
+                    let mut out = fs::File::create_new(&tmp).map_err(|e| {
                         OsUpdateError::ArtifactWriteFailed(format!(
                             "spool file {}: {e}",
                             tmp.display()
@@ -2064,9 +2201,9 @@ pub fn apply_os_update_streaming<R: Read>(
                 // Same reason as the eMMC boot arm: the write is a rename over
                 // a live boot entry and is read back afterwards, so it needs a
                 // whole file on disk with a verified digest before it starts.
-                let tmp = std::env::temp_dir().join(format!("avocadoctl-{}.fsfile", artifact.name));
+                let tmp = run_avocado_dir()?.join(format!("spool-{}.fsfile", uuid::Uuid::new_v4()));
                 let spooled = (|| -> Result<(), OsUpdateError> {
-                    let mut out = fs::File::create(&tmp).map_err(|e| {
+                    let mut out = fs::File::create_new(&tmp).map_err(|e| {
                         OsUpdateError::ArtifactWriteFailed(format!(
                             "spool file {}: {e}",
                             tmp.display()
@@ -2744,6 +2881,11 @@ PRETTY_NAME="Avocado Linux 2024.1"
         assert!(resolve_fs_file("file:efi:").is_err());
         assert!(resolve_fs_file("file::/EFI/x.efi").is_err());
         assert!(resolve_fs_file("file:efi").is_err());
+        // The partlabel is interpolated into /dev/disk/by-partlabel/<label>, so
+        // it must be a single component too, not a path that escapes it.
+        assert!(resolve_fs_file("file:x/../../../sda1:/boot/x.efi").is_err());
+        assert!(resolve_fs_file("file:..:/boot/x.efi").is_err());
+        assert!(resolve_fs_file("file:a/b:/boot/x.efi").is_err());
     }
 
     /// The atomic write: a temp file in the destination directory, renamed
@@ -2759,17 +2901,27 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let dest = dest_dir.join("avocado+3.efi");
         fs::write(&dest, b"old-uki").unwrap();
 
-        // Same sequence write_to_fs_file performs inside the mount.
+        // Exercise the real production writer against the mount directory.
+        let mount = tmp.path().join("mnt");
         let data = fs::read(&src).unwrap();
-        let staged = dest_dir.join(".avocado+3.efi.avocado-new");
-        fs::write(&staged, &data).unwrap();
-        fs::rename(&staged, &dest).unwrap();
+        write_data_into_mount(&mount, "EFI/Linux/avocado+3.efi", &data, "efi", "uki").unwrap();
 
         assert_eq!(fs::read(&dest).unwrap(), data);
+        let staged = dest_dir.join(".avocado+3.efi.avocado-new");
         assert!(
             !staged.exists(),
             "the temporary file must not be left behind"
         );
+
+        // A symlinked path component is refused rather than followed off-mount.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let mount2 = tmp.path().join("mnt2");
+        fs::create_dir_all(&mount2).unwrap();
+        std::os::unix::fs::symlink(&outside, mount2.join("EFI")).unwrap();
+        let err = write_data_into_mount(&mount2, "EFI/x.efi", &data, "efi", "uki");
+        assert!(err.is_err(), "symlinked component must be refused");
+        assert!(!outside.join("x.efi").exists(), "must not write off-mount");
     }
 
     /// A rollback action can name the slot that failed, not just the one being
@@ -2785,22 +2937,23 @@ PRETTY_NAME="Avocado Linux 2024.1"
                 "{new_slot}".to_string(),
             ],
         };
-        // Resolved the way execute_slot_action_for resolves it.
-        let resolve = |s: &str, slot: &str, new: Option<&str>| -> String {
-            s.replace("{inactive_slot}", slot)
-                .replace("{previous_slot}", slot)
-                .replace("{new_slot}", new.unwrap_or(slot))
-        };
         let SlotAction::Command { command } = &action else {
             panic!("expected a command action");
         };
-        let with_new: Vec<String> = command.iter().map(|c| resolve(c, "a", Some("b"))).collect();
+        // The production resolver, not a copy of it.
+        let with_new: Vec<String> = command
+            .iter()
+            .map(|c| resolve_slot_placeholders(c, "a", Some("b")))
+            .collect();
         assert_eq!(with_new[2], "b", "{{new_slot}} must be the failed slot");
 
         // With no new_slot recorded -- a marker written by an older avocadoctl
         // -- it falls back to the slot being switched to rather than expanding
         // to an empty argument.
-        let without: Vec<String> = command.iter().map(|c| resolve(c, "a", None)).collect();
+        let without: Vec<String> = command
+            .iter()
+            .map(|c| resolve_slot_placeholders(c, "a", None))
+            .collect();
         assert_eq!(without[2], "a");
     }
 
