@@ -87,6 +87,21 @@ pub fn watchdog_log(extension: &str) -> String {
     format!("/run/avocado/hitl-watchdog-{extension}.log")
 }
 
+/// Whether `name` is a safe HITL extension name: a single path component. It
+/// becomes a directory under the HITL root and the NFS export path, and this
+/// service runs in the privileged daemon, so a value like `../../../etc` would
+/// mount the export over an arbitrary local path (the same value also reaches
+/// the watchdog unit and log paths). Reject separators, dot-components,
+/// empties, and control characters.
+fn is_valid_extension_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(|c| c.is_control())
+}
+
 /// Where HITL mounts live. `/run` so a reboot forgets them: the device then
 /// boots the installed extension, which is the safe default.
 fn base_dir() -> String {
@@ -112,6 +127,14 @@ pub fn mount(
     extensions: &[String],
     output: &OutputManager,
 ) -> Result<(), AvocadoError> {
+    for extension in extensions {
+        if !is_valid_extension_name(extension) {
+            return Err(AvocadoError::MountFailed {
+                extension: extension.clone(),
+                reason: "invalid extension name: must be a single path component".to_string(),
+            });
+        }
+    }
     let port = server_port.unwrap_or(DEFAULT_PORT);
     let base = base_dir();
     output.info(
@@ -290,6 +313,14 @@ fn unmount_with(
     force: bool,
     output: &OutputManager,
 ) -> Result<(), AvocadoError> {
+    for extension in extensions {
+        if !is_valid_extension_name(extension) {
+            return Err(AvocadoError::UnmountFailed {
+                extension: extension.clone(),
+                reason: "invalid extension name: must be a single path component".to_string(),
+            });
+        }
+    }
     let base = base_dir();
     if force {
         eprintln!(
@@ -487,6 +518,13 @@ fn unmount_one(
 pub fn watchdog(server_ip: &str, port: &str, extension: &str, output: &OutputManager) {
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    if !is_valid_extension_name(extension) {
+        output.progress(&format!(
+            "HITL watchdog: refusing invalid extension name '{extension}'"
+        ));
+        return;
+    }
 
     let dir = format!("{}/{extension}", base_dir());
     let addr: Option<SocketAddr> = format!("{server_ip}:{port}").parse().ok();
@@ -829,6 +867,21 @@ pub fn mount_dir(extension: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_name_must_be_a_single_component() {
+        // Ordinary names are accepted.
+        assert!(is_valid_extension_name("vmm"));
+        assert!(is_valid_extension_name("my-ext_1.2.3"));
+        // A privileged caller cannot escape the HITL root or the export path.
+        assert!(!is_valid_extension_name("../../../etc"));
+        assert!(!is_valid_extension_name("a/b"));
+        assert!(!is_valid_extension_name(".."));
+        assert!(!is_valid_extension_name("."));
+        assert!(!is_valid_extension_name(""));
+        assert!(!is_valid_extension_name("a\\b"));
+        assert!(!is_valid_extension_name("bad\nname"));
+    }
 
     const MOUNTS: &str = "\
 10.10.0.10:/vmm /run/avocado/hitl/vmm nfs4 rw,relatime 0 0
