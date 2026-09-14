@@ -117,6 +117,7 @@ dependencies = [
  "base64",
  "clap",
  "ed25519-compact",
+ "libc",
  "serde",
  "serde_derive",
  "serde_json",
