@@ -277,6 +277,15 @@ fn main() {
                                 reply.missing,
                             );
                             output.success("Extension Override", &msg);
+                            // The override is recorded but not applied: the
+                            // merged /usr only changes on the next merge. Say so
+                            // -- a bare "enabled" reads as "it took effect".
+                            if reply.updated > 0 {
+                                output.info(
+                                    "Extension Override",
+                                    "Run 'avocadoctl ext refresh' to apply.",
+                                );
+                            }
                         }
                         Err(e) => varlink_client::exit_with_rpc_error(e, &output),
                     }
@@ -297,6 +306,15 @@ fn main() {
                                 reply.missing,
                             );
                             output.success("Extension Override", &msg);
+                            // The override is recorded but not applied: the
+                            // merged /usr only changes on the next merge. Say so
+                            // -- a bare "disabled" reads as "it took effect".
+                            if reply.updated > 0 {
+                                output.info(
+                                    "Extension Override",
+                                    "Run 'avocadoctl ext refresh' to apply.",
+                                );
+                            }
                         }
                         Err(e) => varlink_client::exit_with_rpc_error(e, &output),
                     }
