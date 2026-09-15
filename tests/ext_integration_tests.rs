@@ -664,20 +664,18 @@ fn test_ext_refresh_with_mocks() {
     );
 
     // Verify depmod is only called once at the end (during merge phase)
-    let depmod_count = stdout.matches("Running command: depmod").count()
-        + stdout.matches("[INFO] Running depmod").count();
+    let depmod_count = stdout.matches("post-merge: running: depmod").count();
     assert_eq!(
         depmod_count, 1,
         "Should call depmod exactly once during refresh (only during merge phase)"
     );
     assert!(
-        stdout.contains("Running command: depmod") || stdout.contains("[INFO] Running depmod"),
-        "Should show depmod running message"
+        stdout.contains("post-merge: running: depmod"),
+        "Should show depmod running (verbose step detail)"
     );
     assert!(
-        stdout.contains("Command 'depmod' completed successfully")
-            || stdout.contains("[SUCCESS] depmod completed successfully"),
-        "Should show depmod completion"
+        stdout.contains("Rebuilt module dependencies"),
+        "Should show the module-dependency rebuild summary"
     );
 }
 
@@ -760,13 +758,12 @@ fn test_ext_merge_with_depmod_processing() {
     );
     // Should show depmod being executed in the new generic command execution
     assert!(
-        stdout.contains("Running command: depmod") || stdout.contains("[INFO] Running depmod"),
-        "Should show depmod running message"
+        stdout.contains("post-merge: running: depmod"),
+        "Should show depmod running (verbose step detail)"
     );
     assert!(
-        stdout.contains("Command 'depmod' completed successfully")
-            || stdout.contains("[SUCCESS] depmod completed successfully"),
-        "Should show depmod completion"
+        stdout.contains("Rebuilt module dependencies"),
+        "Should show the module-dependency rebuild summary"
     );
 }
 
@@ -795,8 +792,7 @@ fn test_ext_merge_multiple_extensions_single_depmod() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Verify depmod is called exactly once
-    let depmod_count = stdout.matches("Running command: depmod").count()
-        + stdout.matches("[INFO] Running depmod").count();
+    let depmod_count = stdout.matches("post-merge: running: depmod").count();
     assert_eq!(
         depmod_count, 1,
         "Should call depmod exactly once even with multiple extensions requiring it"
@@ -804,8 +800,8 @@ fn test_ext_merge_multiple_extensions_single_depmod() {
 
     // Verify all modules from all extensions are loaded
     assert!(
-        stdout.contains("[INFO] Loading kernel modules:"),
-        "Should show module loading message"
+        stdout.contains("post-merge: loading kernel modules:"),
+        "Should show module loading (verbose step detail)"
     );
 
     // Check that modules from multiple extensions are included
@@ -826,8 +822,8 @@ fn test_ext_merge_multiple_extensions_single_depmod() {
     );
 
     assert!(
-        stdout.contains("[SUCCESS] Module loading completed"),
-        "Should show module loading completion"
+        stdout.contains("Loaded ") && stdout.contains(" kernel module"),
+        "Should show the kernel-module load summary"
     );
 }
 
@@ -863,21 +859,20 @@ fn test_ext_merge_with_modprobe_processing() {
         "Should show merge success"
     );
     assert!(
-        stdout.contains("Running command: depmod") || stdout.contains("[INFO] Running depmod"),
-        "Should show depmod running message"
+        stdout.contains("post-merge: running: depmod"),
+        "Should show depmod running (verbose step detail)"
     );
     assert!(
-        stdout.contains("Command 'depmod' completed successfully")
-            || stdout.contains("[SUCCESS] depmod completed successfully"),
-        "Should show depmod completion"
+        stdout.contains("Rebuilt module dependencies"),
+        "Should show the module-dependency rebuild summary"
     );
     assert!(
-        stdout.contains("[INFO] Loading kernel modules:"),
-        "Should show module loading message"
+        stdout.contains("post-merge: loading kernel modules:"),
+        "Should show module loading (verbose step detail)"
     );
     assert!(
-        stdout.contains("[SUCCESS] Module loading completed"),
-        "Should show module loading completion"
+        stdout.contains("Loaded ") && stdout.contains(" kernel module"),
+        "Should show the kernel-module load summary"
     );
 
     // Check that specific modules are being loaded (from our test fixtures)
@@ -1003,13 +998,13 @@ fn test_ext_merge_with_multiple_on_merge_commands() {
 
     // Verify that multiple commands are executed
     assert!(
-        stdout.contains("Executing") && stdout.contains("post-merge commands"),
+        stdout.contains("post-merge: executing"),
         "Should show execution of post-merge commands"
     );
 
     // Should see depmod being executed
     assert!(
-        stdout.contains("Running command: depmod") || stdout.contains("[INFO] Running depmod"),
+        stdout.contains("post-merge: running: depmod"),
         "Should execute depmod command"
     );
 }
@@ -1054,7 +1049,7 @@ fn test_ext_merge_with_quoted_commands() {
 
     // Should execute commands with arguments
     assert!(
-        stdout.contains("post-merge commands"),
+        stdout.contains("post-merge: executing"),
         "Should show execution of post-merge commands"
     );
 }
@@ -1101,7 +1096,7 @@ fn test_ext_unmerge_does_not_execute_on_merge_commands() {
     // Should NOT execute post-merge commands during unmerge
     // (pre-unmerge commands ARE executed, which is correct behavior)
     assert!(
-        !stdout.contains("post-merge commands"),
+        !stdout.contains("post-merge: executing"),
         "Should NOT execute AVOCADO_ON_MERGE commands during unmerge"
     );
 }
@@ -1141,8 +1136,7 @@ fn test_avocado_on_merge_command_deduplication() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Count how many times depmod is called - should be only once despite multiple extensions having it
-    let depmod_execution_count = stdout.matches("Running command: depmod").count()
-        + stdout.matches("[INFO] Running depmod").count();
+    let depmod_execution_count = stdout.matches("post-merge: running: depmod").count();
 
     // We should see depmod executed, but due to deduplication it should appear in consolidated command execution
     assert!(
@@ -1215,7 +1209,7 @@ fn test_ext_merge_with_confext_commands() {
 
     // Should execute commands from both sysext and confext
     assert!(
-        stdout.contains("post-merge commands"),
+        stdout.contains("post-merge: executing"),
         "Should show execution of post-merge commands"
     );
 }

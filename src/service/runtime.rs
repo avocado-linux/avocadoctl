@@ -94,6 +94,9 @@ pub fn add_from_url_streaming(
 ) -> Result<StreamHandle, AvocadoError> {
     let base_dir = config.get_avocado_base_dir();
     let base_path = Path::new(&base_dir);
+    // Capture the currently-active runtime BEFORE perform_update activates the new
+    // one, so the refresh can narrate the extension diff (old → new).
+    let previous = RuntimeManifest::load_active(base_path);
     let outcome = update::perform_update(
         url,
         base_path,
@@ -102,7 +105,11 @@ pub fn add_from_url_streaming(
         config.stream_os_to_partition(),
         false,
         config.get_spot_check_bytes(),
-    )?;
+    )
+    .map_err(|e| {
+        eprintln!("✗ Update failed: {e}");
+        e
+    })?;
 
     match outcome {
         UpdateOutcome::RebootRequired => Ok(reboot_streaming(
@@ -118,7 +125,9 @@ pub fn add_from_url_streaming(
             if config.auto_gc() {
                 let _ = garbage_collect(config);
             }
-            Ok(super::ext::refresh_extensions_streaming(config))
+            Ok(super::ext::refresh_extensions_streaming_with_previous(
+                config, previous, true,
+            ))
         }
     }
 }
@@ -153,11 +162,14 @@ pub fn add_from_manifest_streaming(
         let _ = cache.save(&runtime_dir);
     }
 
+    let previous = RuntimeManifest::load_active(base_path);
     staging::activate_runtime(&manifest.id, base_path)?;
     if config.auto_gc() {
         let _ = garbage_collect(config);
     }
-    Ok(super::ext::refresh_extensions_streaming(config))
+    Ok(super::ext::refresh_extensions_streaming_with_previous(
+        config, previous, true,
+    ))
 }
 
 /// Activate a staged runtime by ID (or prefix) with streaming output.
@@ -192,8 +204,11 @@ pub fn activate_runtime_streaming(
         false,
     )?;
 
+    let previous = RuntimeManifest::load_active(base_path);
     staging::activate_runtime(&matched.id, base_path)?;
-    Ok(Some(super::ext::refresh_extensions_streaming(config)))
+    Ok(Some(
+        super::ext::refresh_extensions_streaming_with_previous(config, previous, true),
+    ))
 }
 
 // ── Batch service functions ──────────────────────────────────────────────────
@@ -208,6 +223,8 @@ pub fn add_from_url(
 ) -> Result<Vec<String>, AvocadoError> {
     let base_dir = config.get_avocado_base_dir();
     let base_path = Path::new(&base_dir);
+    // Capture the active runtime before activation so the refresh can diff old → new.
+    let previous = RuntimeManifest::load_active(base_path);
     let outcome = update::perform_update(
         url,
         base_path,
@@ -216,7 +233,11 @@ pub fn add_from_url(
         config.stream_os_to_partition(),
         false,
         config.get_spot_check_bytes(),
-    )?;
+    )
+    .map_err(|e| {
+        eprintln!("✗ Update failed: {e}");
+        e
+    })?;
 
     match outcome {
         UpdateOutcome::RebootRequired => {
@@ -231,7 +252,7 @@ pub fn add_from_url(
             "Runtime already at target version, nothing to do.".to_string(),
         ]),
         UpdateOutcome::Activated => {
-            let result = super::ext::refresh_extensions(config);
+            let result = super::ext::refresh_extensions_with_previous(config, previous, true);
             if config.auto_gc() {
                 let _ = garbage_collect(config);
             }
@@ -270,8 +291,9 @@ pub fn add_from_manifest(
         let _ = cache.save(&runtime_dir);
     }
 
+    let previous = RuntimeManifest::load_active(base_path);
     staging::activate_runtime(&manifest.id, base_path)?;
-    let result = super::ext::refresh_extensions(config);
+    let result = super::ext::refresh_extensions_with_previous(config, previous, true);
     if config.auto_gc() {
         let _ = garbage_collect(config);
     }
@@ -321,8 +343,9 @@ pub fn activate_runtime(id_prefix: &str, config: &Config) -> Result<Vec<String>,
         false,
     )?;
 
+    let previous = RuntimeManifest::load_active(base_path);
     staging::activate_runtime(&matched.id, base_path)?;
-    super::ext::refresh_extensions(config)
+    super::ext::refresh_extensions_with_previous(config, previous, true)
 }
 
 /// Inspect a runtime's details by ID (or prefix).
