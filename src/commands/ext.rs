@@ -371,6 +371,7 @@ pub(crate) fn merge_extensions_internal(
     config: &Config,
     output: &OutputManager,
 ) -> Result<(), SystemdError> {
+    let started = std::time::Instant::now();
     // Check for pending OS update — verify the new OS booted correctly.
     // If a runtime_id is set, the runtime hasn't been activated yet and depends
     // on OS verification. On success, promote the pending runtime to active.
@@ -644,25 +645,60 @@ pub(crate) fn merge_extensions_internal(
     };
     let confext_mutable_arg = format!("--mutable={confext_mutability}");
 
-    // Merge system extensions
+    // Merge system extensions (sysext: /usr, /opt) then configuration
+    // extensions (confext: /etc). These are two independent systemd operations;
+    // a single Avocado extension may contribute to both.
     let sysext_result = run_systemd_command(
         "systemd-sysext",
         &["merge", &sysext_mutable_arg, "--json=short"],
     )?;
-    handle_systemd_output("systemd-sysext merge", &sysext_result, output)?;
-
-    // Merge configuration extensions
     let confext_result = run_systemd_command(
         "systemd-confext",
         &["merge", &confext_mutable_arg, "--json=short"],
     )?;
-    handle_systemd_output("systemd-confext merge", &confext_result, output)?;
+
+    let sysext_n = parse_merged_count(&sysext_result);
+    let confext_n = parse_merged_count(&confext_result);
+    // Only report merges that actually happened; on a no-op re-merge (everything
+    // already merged) systemd reports 0, and "Merged 0 …" reads oddly next to the
+    // "N extensions live" summary below.
+    if sysext_n > 0 || confext_n > 0 {
+        output.log_info(&format!(
+            "Merged {sysext_n} system extension{}, {confext_n} config extension{}",
+            plural(sysext_n),
+            plural(confext_n),
+        ));
+    }
+    // Full systemd JSON stays available under --verbose for debugging.
+    output.raw(&format!("systemd-sysext merge: {sysext_result}"));
+    output.raw(&format!("systemd-confext merge: {confext_result}"));
 
     // Process post-merge tasks for enabled extensions, with daemon-reload
     // happening after depmod/ldconfig/modprobe but before service commands.
     // This ensures kernel modules and shared libraries are available when
     // systemd re-evaluates units during daemon-reload.
     process_post_merge_tasks_for_extensions(&enabled_extensions, output)?;
+
+    // Final one-line summary: active runtime + live extension count + elapsed.
+    // Neutral wording ("Merge complete") so it reads correctly for both an OTA
+    // update and a plain boot-time re-merge.
+    if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
+        output.log_success(&format!(
+            "✓ Merge complete — \"{}\" {} active, {} extension{} live ({:.1}s)",
+            manifest.runtime.name,
+            manifest.runtime.version,
+            enabled_extensions.len(),
+            plural(enabled_extensions.len()),
+            started.elapsed().as_secs_f64(),
+        ));
+    } else {
+        output.log_success(&format!(
+            "✓ Merge complete — {} extension{} live ({:.1}s)",
+            enabled_extensions.len(),
+            plural(enabled_extensions.len()),
+            started.elapsed().as_secs_f64(),
+        ));
+    }
 
     Ok(())
 }
@@ -3723,6 +3759,113 @@ fn is_pre_daemon_reload_command(command: &str) -> bool {
     PRE_DAEMON_RELOAD_COMMANDS.contains(&first_word)
 }
 
+/// Pluralization helper for narration summaries ("" for 1, "s" otherwise).
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Count the extensions reported merged by a `systemd-sysext/confext merge
+/// --json=short` run. Defensive so an unexpected/empty shape never panics or
+/// aborts a merge:
+///   - object with an `"extensions"` array (systemd's shape) → that array's length;
+///   - a bare JSON array → its element count;
+///   - anything else / empty / unparseable → 0.
+fn parse_merged_count(json_output: &str) -> usize {
+    let trimmed = json_output.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map)) => match map.get("extensions") {
+            Some(serde_json::Value::Array(exts)) => exts.len(),
+            _ => 0,
+        },
+        Ok(serde_json::Value::Array(items)) => items.len(),
+        _ => 0,
+    }
+}
+
+/// Extract systemd unit base-names from `systemctl start|restart … X.service`
+/// post-merge commands, for a compact "Started N services: …" summary.
+/// Best-effort: non-systemctl or non-start commands are ignored, duplicates
+/// removed, order preserved.
+fn extract_service_names(commands: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for command in commands {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        if tokens.first() != Some(&"systemctl") {
+            continue;
+        }
+        let is_activating = tokens.iter().any(|t| {
+            matches!(
+                *t,
+                "start" | "restart" | "reload-or-restart" | "try-restart"
+            )
+        });
+        if !is_activating {
+            continue;
+        }
+        for token in &tokens {
+            if let Some(unit) = token.strip_suffix(".service") {
+                let unit = unit.to_string();
+                if !names.contains(&unit) {
+                    names.push(unit);
+                }
+            }
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod narration_tests {
+    use super::{extract_service_names, parse_merged_count, plural};
+
+    #[test]
+    fn plural_suffix() {
+        assert_eq!(plural(1), "");
+        assert_eq!(plural(0), "s");
+        assert_eq!(plural(3), "s");
+    }
+
+    #[test]
+    fn parse_count_systemd_object_array_and_garbage() {
+        // systemd's shape: object carrying an "extensions" array.
+        assert_eq!(
+            parse_merged_count(
+                r#"{"action":"merge","type":"sysext","status":"success","extensions":["a","b"]}"#
+            ),
+            2
+        );
+        // Bare array fallback.
+        assert_eq!(parse_merged_count(r#"[{"h":"/usr"},{"h":"/opt"}]"#), 2);
+        // Object with no extensions array → 0, not the key count.
+        assert_eq!(parse_merged_count(r#"{"status":"success"}"#), 0);
+        assert_eq!(parse_merged_count(""), 0);
+        assert_eq!(parse_merged_count("not json"), 0);
+        assert_eq!(parse_merged_count("[]"), 0);
+    }
+
+    #[test]
+    fn service_names_extracted_and_deduped() {
+        let cmds = vec![
+            "systemctl start --no-block avocado-conn.service".to_string(),
+            "systemctl restart avocado-rat.service".to_string(),
+            "systemctl start --no-block avocado-conn.service".to_string(), // dup
+            "depmod -a".to_string(),                                       // ignored
+            "systemctl daemon-reload".to_string(),                         // no unit
+        ];
+        assert_eq!(
+            extract_service_names(&cmds),
+            vec!["avocado-conn".to_string(), "avocado-rat".to_string()]
+        );
+    }
+}
+
 fn process_post_merge_tasks_for_extensions(
     enabled_extensions: &[Extension],
     output: &OutputManager,
@@ -3743,14 +3886,21 @@ fn process_post_merge_tasks_for_extensions(
         .into_iter()
         .partition(|cmd| is_pre_daemon_reload_command(cmd));
 
-    // Phase 1: Run depmod/ldconfig so modules and libraries are available
+    // Phase 1: Run depmod/ldconfig so modules and libraries are available.
+    // Per-command detail is verbose-only; the summary line is the headline.
     if !pre_reload.is_empty() {
         run_avocado_on_merge_commands(&pre_reload, output)?;
+        output.log_info("Rebuilt module dependencies and shared libraries");
     }
 
     // Phase 2: Load kernel modules (requires depmod to have run first)
     if !modprobe_modules.is_empty() {
         run_modprobe(&modprobe_modules, output)?;
+        output.log_info(&format!(
+            "Loaded {} kernel module{}",
+            modprobe_modules.len(),
+            plural(modprobe_modules.len())
+        ));
     }
 
     // Phase 3: Reload systemd's unit database now that modules and libraries
@@ -3760,7 +3910,7 @@ fn process_post_merge_tasks_for_extensions(
         .output()
     {
         Ok(result) if result.status.success() => {
-            output.log_info("Reloaded systemd daemon after extension merge");
+            output.log_info("Reloaded systemd");
         }
         Ok(result) => {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -3771,9 +3921,19 @@ fn process_post_merge_tasks_for_extensions(
         }
     }
 
-    // Phase 4: Run remaining post-merge commands (service restarts, etc.)
+    // Phase 4: Run remaining post-merge commands (service restarts, etc.).
+    // Summarize the services touched rather than logging each command.
     if !post_reload.is_empty() {
         run_avocado_on_merge_commands(&post_reload, output)?;
+        let services = extract_service_names(&post_reload);
+        if !services.is_empty() {
+            output.log_info(&format!(
+                "Started {} service{}: {}",
+                services.len(),
+                plural(services.len()),
+                services.join(", ")
+            ));
+        }
     }
 
     Ok(())
@@ -4061,7 +4221,10 @@ fn run_modprobe(modules: &[String], out: &OutputManager) -> Result<(), SystemdEr
         return Ok(());
     }
 
-    out.log_info(&format!("Loading kernel modules: {}", modules.join(", ")));
+    out.step(
+        "post-merge",
+        &format!("loading kernel modules: {}", modules.join(", ")),
+    );
 
     for module in modules {
         // Check if we're in test mode and should use mock commands
@@ -4087,11 +4250,11 @@ fn run_modprobe(modules: &[String], out: &OutputManager) -> Result<(), SystemdEr
             // Don't fail the entire operation for individual module failures
             // Just log the warning and continue with other modules
         } else {
-            out.log_success(&format!("Module {module} loaded successfully."));
+            out.step("post-merge", &format!("module {module} loaded"));
         }
     }
 
-    out.log_success("Module loading completed.");
+    out.step("post-merge", "module loading completed");
     Ok(())
 }
 
@@ -4151,7 +4314,7 @@ fn execute_single_command(command_str: &str, out: &OutputManager) -> Result<(), 
         // Log warning but don't fail the entire operation
         // This matches the behavior of modprobe failures
     } else {
-        out.log_success(&format!("Command '{command_str}' completed successfully"));
+        out.step("post-merge", &format!("{command_str} ok"));
     }
 
     Ok(())
@@ -4166,10 +4329,13 @@ fn run_avocado_on_merge_commands(
         return Ok(());
     }
 
-    out.log_info(&format!("Executing {} post-merge commands", commands.len()));
+    out.step(
+        "post-merge",
+        &format!("executing {} command(s)", commands.len()),
+    );
 
     for command_str in commands {
-        out.log_info(&format!("Running command: {command_str}"));
+        out.step("post-merge", &format!("running: {command_str}"));
 
         // Check if the command contains shell operators like semicolons
         if command_str.contains(';') {
@@ -4178,7 +4344,7 @@ fn run_avocado_on_merge_commands(
 
             for sub_command in sub_commands {
                 if !sub_command.is_empty() {
-                    out.log_info(&format!("Running sub-command: {sub_command}"));
+                    out.step("post-merge", &format!("running sub-command: {sub_command}"));
                     execute_single_command(sub_command, out)?;
                 }
             }
@@ -4188,7 +4354,6 @@ fn run_avocado_on_merge_commands(
         }
     }
 
-    out.log_success("Post-merge command execution completed.");
     Ok(())
 }
 

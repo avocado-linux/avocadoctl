@@ -205,6 +205,11 @@ impl OutputManager {
     pub fn log_info(&self, message: &str) {
         if let Some(ref tx) = self.sender {
             let _ = tx.send(format!("[INFO] {message}"));
+            // Tee to stdout so the daemon's journal captures the narration even for
+            // non-streaming (batch/nudge) callers that discard the reply string.
+            if !self.json {
+                println!("{message}");
+            }
         } else if !self.json {
             self.print_colored_prefix("INFO", Color::Blue, message);
         }
@@ -213,12 +218,28 @@ impl OutputManager {
     /// Log a success message.
     ///
     /// In normal mode: prints to stdout with color (always, regardless of verbosity).
-    /// In streaming mode: sends through channel immediately.
+    /// In streaming mode: sends through channel immediately and tees to stdout.
     pub fn log_success(&self, message: &str) {
         if let Some(ref tx) = self.sender {
             let _ = tx.send(format!("[SUCCESS] {message}"));
+            if !self.json {
+                println!("{message}");
+            }
         } else if !self.json {
             self.print_colored_prefix("SUCCESS", Color::Green, message);
+        }
+    }
+
+    /// Log an error line that must reach both the streaming client and the
+    /// daemon journal. Unlike [`Self::error`], this routes through the streaming
+    /// channel when present so a watching operator sees the failure, and tees to
+    /// stderr so `journalctl` captures it for a bystander.
+    pub fn log_error(&self, message: &str) {
+        if let Some(ref tx) = self.sender {
+            let _ = tx.send(format!("[ERROR] {message}"));
+            eprintln!("{message}");
+        } else {
+            eprintln!("[ERROR] {message}");
         }
     }
 }

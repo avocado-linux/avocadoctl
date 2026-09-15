@@ -209,33 +209,89 @@ pub fn refresh_extensions_streaming(
     mpsc::Receiver<String>,
     thread::JoinHandle<Result<(), AvocadoError>>,
 ) {
+    refresh_extensions_streaming_with_previous(config, None, false)
+}
+
+/// Refresh with streaming output, optionally narrating the extension diff against
+/// `previous` (the runtime that was active *before* this update activated the new
+/// one). `show_diff` gates the diff block so a plain boot-time re-merge stays quiet;
+/// update/activate flows pass `show_diff = true`. On failure a single clean
+/// `✗ Update failed` line is emitted to the same stream (and the journal via the tee).
+pub fn refresh_extensions_streaming_with_previous(
+    config: &Config,
+    previous: Option<crate::manifest::RuntimeManifest>,
+    show_diff: bool,
+) -> (
+    mpsc::Receiver<String>,
+    thread::JoinHandle<Result<(), AvocadoError>>,
+) {
     let (tx, rx) = mpsc::sync_channel(4);
     let config = config.clone();
     let handle = thread::spawn(move || {
         let output = OutputManager::new_streaming(tx);
-
-        // Same gate as the CLI refresh: refuse before the unmerge, so a manifest
-        // this build cannot honor leaves the running extensions in place.
-        if let Err(e) = ext::refresh_preflight(&config) {
-            output.error(
-                "Extension Refresh",
-                &format!("Refusing to refresh (extensions left as they are): {e}"),
-            );
-            return Err(AvocadoError::from(e));
+        let result = run_refresh(&config, previous.as_ref(), show_diff, &output);
+        if let Err(e) = &result {
+            output.log_error(&format!("✗ Update failed: {e}"));
         }
-
-        // First unmerge (skip depmod since we'll call it after merge, don't unmount loops —
-        // the caller may be running from a loop-mounted extension like avocado-connect)
-        ext::unmerge_extensions_internal_with_options(false, false, &output)
-            .map_err(AvocadoError::from)?;
-
-        // Invalidate NFS caches for any HITL-mounted extensions
-        ext::invalidate_hitl_caches(&output);
-
-        // Then merge (this will call depmod via post-merge processing)
-        ext::merge_extensions_internal(&config, &output).map_err(AvocadoError::from)
+        result
     });
     (rx, handle)
+}
+
+/// Shared refresh body: optional diff → unmerge → invalidate HITL caches → merge.
+fn run_refresh(
+    config: &Config,
+    previous: Option<&crate::manifest::RuntimeManifest>,
+    show_diff: bool,
+    output: &OutputManager,
+) -> Result<(), AvocadoError> {
+    // Same gate as the CLI refresh: refuse before the unmerge, so a manifest
+    // this build cannot honor leaves the running extensions in place.
+    if let Err(e) = ext::refresh_preflight(config) {
+        output.error(
+            "Extension Refresh",
+            &format!("Refusing to refresh (extensions left as they are): {e}"),
+        );
+        return Err(AvocadoError::from(e));
+    }
+
+    // The diff is emitted first so it reads as the headline of the update, before
+    // the unmerge/merge mechanics.
+    if show_diff {
+        emit_extension_diff(config, previous, output);
+    }
+
+    // First unmerge (skip depmod since we'll call it after merge, don't unmount loops —
+    // the caller may be running from a loop-mounted extension like avocado-connect)
+    ext::unmerge_extensions_internal_with_options(false, false, output)
+        .map_err(AvocadoError::from)?;
+
+    // Invalidate NFS caches for any HITL-mounted extensions
+    ext::invalidate_hitl_caches(output);
+
+    // Then merge (this will call depmod via post-merge processing)
+    ext::merge_extensions_internal(config, output).map_err(AvocadoError::from)
+}
+
+/// Load the now-active runtime manifest, diff it against `previous`, and narrate
+/// the change block. Best-effort: if the active manifest can't be read, emit
+/// nothing rather than fail the refresh. `previous = None` renders the compact
+/// first-install phrasing.
+fn emit_extension_diff(
+    config: &Config,
+    previous: Option<&crate::manifest::RuntimeManifest>,
+    output: &OutputManager,
+) {
+    let base_dir = config.get_avocado_base_dir();
+    let base_path = Path::new(&base_dir);
+    if let Some(new) = crate::manifest::RuntimeManifest::load_active(base_path) {
+        let changes = crate::ext_diff::diff_extensions(previous, &new);
+        if let Some(lines) = crate::ext_diff::render_diff(&changes, previous.is_none()) {
+            for line in lines {
+                output.log_info(&line);
+            }
+        }
+    }
 }
 
 // ── Batch service functions (used by non-streaming clients and tests) ────────
@@ -270,6 +326,24 @@ pub fn unmerge_extensions(unmount: bool) -> Result<Vec<String>, AvocadoError> {
 /// Returns log messages produced during the operation.
 pub fn refresh_extensions(config: &Config) -> Result<Vec<String>, AvocadoError> {
     let (rx, handle) = refresh_extensions_streaming(config);
+    let messages: Vec<String> = rx.into_iter().collect();
+    handle.join().unwrap_or_else(|_| {
+        Err(AvocadoError::MergeFailed {
+            reason: "internal panic".into(),
+        })
+    })?;
+    Ok(messages)
+}
+
+/// Batch refresh that narrates the extension diff against `previous`. Used by the
+/// non-streaming (nudge) update path so the diff still reaches the daemon journal
+/// via the tee, even though the caller discards the returned messages.
+pub fn refresh_extensions_with_previous(
+    config: &Config,
+    previous: Option<crate::manifest::RuntimeManifest>,
+    show_diff: bool,
+) -> Result<Vec<String>, AvocadoError> {
+    let (rx, handle) = refresh_extensions_streaming_with_previous(config, previous, show_diff);
     let messages: Vec<String> = rx.into_iter().collect();
     handle.join().unwrap_or_else(|_| {
         Err(AvocadoError::MergeFailed {
