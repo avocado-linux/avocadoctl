@@ -24,6 +24,22 @@ use std::thread;
 /// Split a legacy raw-image stem `<name>-<version>` into its parts. The version
 /// is only taken when the text after the last dash looks like one (digits or
 /// dots), matching the legacy raw scanner.
+/// Whether `s` is a content-addressed image id (a UUID: 8-4-4-4-12 hex). Those
+/// live in the image pool and are described by the manifest; a loose dev
+/// extension is named `<name>-<version>`, never a UUID. Used to keep the
+/// loose-.raw scan from listing pool images when the extensions dir is the pool.
+fn looks_like_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, &c)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+}
+
 fn split_name_version(stem: &str) -> (&str, Option<String>) {
     if let Some(dash) = stem.rfind('-') {
         let v = &stem[dash + 1..];
@@ -116,6 +132,11 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
                         .and_then(|n| n.to_str())
                         .and_then(|n| n.strip_suffix(".raw"))
                     {
+                        // A UUID-stemmed .raw is a content-addressed pool image,
+                        // not a loose dev extension; the manifest describes those.
+                        if looks_like_uuid(stem) {
+                            continue;
+                        }
                         let (name, version) = split_name_version(stem);
                         // Dedup on the full `<name>-<version>` stem: foo-1.0 and
                         // foo-2.0 are distinct extensions and must both list.
@@ -600,6 +621,12 @@ mod list_tests {
         let images = base.join("images");
         std::fs::create_dir_all(&images).unwrap();
         std::fs::write(images.join(format!("{uuid}.raw")), b"x").unwrap();
+        // An orphan pool image (not in the manifest) must also be skipped.
+        std::fs::write(
+            images.join("deadbeef-0000-4000-8000-000000000000.raw"),
+            b"x",
+        )
+        .unwrap();
 
         std::env::set_var("AVOCADO_BASE_DIR", base);
         std::env::set_var("AVOCADO_EXTENSIONS_PATH", &images);
