@@ -169,8 +169,19 @@ pub fn mount(
             );
             let _ = hitl::create_service_dropins(extension, &dir, &services, output);
         }
+        // The watchdog is the dead-server safety net; a mount with no watchdog
+        // is the exact hazard this feature prevents. If it will not start, roll
+        // back THIS extension (drop-ins + mount) and fail, rather than return a
+        // mount that cannot recover.
+        if let Err(e) = start_watchdog(server_ip, port, extension, output) {
+            let services = ext::scan_extension_for_enable_services(Path::new(&dir), extension);
+            if !services.is_empty() {
+                let _ = hitl::cleanup_service_dropins(extension, &services, output);
+            }
+            let _ = unmount_one(extension, &dir, false, output);
+            return Err(e);
+        }
         output.progress(&format!("Successfully mounted extension: {extension}"));
-        start_watchdog(server_ip, port, extension, output);
     }
 
     // Everything is merged at this point, so a reload is safe.
@@ -663,9 +674,14 @@ fn services_from_dropins(extension: &str) -> Vec<String> {
 
 /// Start the watchdog as a transient unit so it outlives this call and the
 /// daemon's socket-activated lifetime. `--collect` removes it when it exits.
-fn start_watchdog(server_ip: &str, port: &str, extension: &str, output: &OutputManager) {
+fn start_watchdog(
+    server_ip: &str,
+    port: &str,
+    extension: &str,
+    output: &OutputManager,
+) -> Result<(), AvocadoError> {
     if test_mode() {
-        return;
+        return Ok(());
     }
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -704,12 +720,21 @@ fn start_watchdog(server_ip: &str, port: &str, extension: &str, output: &OutputM
         ])
         .output();
     match r {
-        Ok(o) if o.status.success() => output.progress(&format!("Started {unit}")),
-        Ok(o) => output.progress(&format!(
-            "Warning: could not start {unit}: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Err(e) => output.progress(&format!("Warning: could not start {unit}: {e}")),
+        Ok(o) if o.status.success() => {
+            output.progress(&format!("Started {unit}"));
+            Ok(())
+        }
+        Ok(o) => Err(AvocadoError::MountFailed {
+            extension: extension.to_string(),
+            reason: format!(
+                "could not start watchdog {unit}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+        }),
+        Err(e) => Err(AvocadoError::MountFailed {
+            extension: extension.to_string(),
+            reason: format!("could not start watchdog {unit}: {e}"),
+        }),
     }
 }
 
