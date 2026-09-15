@@ -78,11 +78,21 @@ pub fn humanize_rpc_error(raw: &str) -> String {
 /// "RuntimeNotFound" -> "Runtime not found"; "AmbiguousRuntimeId" ->
 /// "Ambiguous runtime id". First word capitalized, the rest lowercased.
 fn split_camel_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for c in name.chars() {
+    for (i, &c) in chars.iter().enumerate() {
+        // Start a new word before an uppercase letter that either follows a
+        // lowercase/digit (`aB` -> `a|B`) or begins a Word after an acronym
+        // (`NFSFailed` -> `NFS|Failed`: the F is upper, follows an upper, and is
+        // followed by a lowercase). This keeps runs of capitals (acronyms)
+        // together instead of splitting them into single letters.
         if c.is_uppercase() && !cur.is_empty() {
-            words.push(std::mem::take(&mut cur));
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if !prev.is_uppercase() || next_lower {
+                words.push(std::mem::take(&mut cur));
+            }
         }
         cur.push(c);
     }
@@ -93,7 +103,12 @@ fn split_camel_case(name: &str) -> String {
         .into_iter()
         .enumerate()
         .map(|(i, w)| {
-            if i == 0 {
+            // Preserve an all-caps acronym (NFS, TPM) as-is; otherwise the first
+            // word is capitalized and the rest lowercased for readability.
+            let is_acronym = w.chars().count() > 1 && w.chars().all(|c| c.is_uppercase());
+            if is_acronym {
+                w
+            } else if i == 0 {
                 let mut cs = w.chars();
                 match cs.next() {
                     Some(f) => f
@@ -496,6 +511,13 @@ pub fn print_root_authority(info: &Option<vl_ra::RootAuthorityInfo>, output: &Ou
 #[cfg(test)]
 mod rpc_error_tests {
     use super::*;
+
+    #[test]
+    fn acronyms_are_not_split_into_single_letters() {
+        assert_eq!(split_camel_case("MountNFSFailed"), "Mount NFS failed");
+        assert_eq!(split_camel_case("RuntimeNotFound"), "Runtime not found");
+        assert_eq!(split_camel_case("TPMError"), "TPM error");
+    }
 
     #[test]
     fn literal_none_string_value_is_kept_not_dropped() {
