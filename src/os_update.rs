@@ -264,6 +264,28 @@ pub fn apply_os_update(
 
     println!("    Current slot: {current_slot}, inactive slot: {inactive_slot}");
 
+    // Write the pending-update marker BEFORE any artifact is written. On a
+    // sorting loader (systemd-boot picks the highest-versioned UKI) the `file:`
+    // artifact write IS the activation -- there is no later pointer flip -- so a
+    // marker written after the write loop would leave a window where a crash, a
+    // full partition, an EBUSY unmount, or a failed later artifact activates the
+    // new OS with no breadcrumb for the next boot to verify or roll it back.
+    // Writing it first means the next boot always has a marker to act on; a
+    // failed update that never really activated just costs one verify/rollback.
+    let pending = PendingUpdate {
+        os_build_id: bundle.os_build_id.clone(),
+        initramfs_build_id: bundle.initramfs_build_id.clone(),
+        verify: bundle.verify.clone(),
+        verify_initramfs: bundle.verify_initramfs.clone(),
+        rollback: update.rollback.clone(),
+        commit: update.commit.clone(),
+        previous_slot: current_slot.clone(),
+        new_slot: Some(inactive_slot.clone()),
+        layout: bundle.layout.clone(),
+        runtime_id: None,
+    };
+    write_pending_update(&pending, base_dir)?;
+
     // Write each artifact to the inactive slot's partition
     for artifact in &update.artifacts {
         let target = artifact.slot_targets.get(&inactive_slot).ok_or_else(|| {
@@ -326,32 +348,17 @@ pub fn apply_os_update(
     // Patch BLS entries if needed (sdboot-ab: fix rootfs PARTLABEL in boot partition)
     maybe_patch_bls_entries(update, &inactive_slot)?;
 
-    // The marker goes down BEFORE the slot flip. It is the only breadcrumb the
-    // next boot has to verify the new OS and roll back a bad one, so flipping
-    // first leaves a window where a crash - or a failed marker write - boots an
-    // unverified OS with nothing to roll back from.
-    let pending = PendingUpdate {
-        os_build_id: bundle.os_build_id.clone(),
-        initramfs_build_id: bundle.initramfs_build_id.clone(),
-        verify: bundle.verify.clone(),
-        verify_initramfs: bundle.verify_initramfs.clone(),
-        rollback: update.rollback.clone(),
-        commit: update.commit.clone(),
-        previous_slot: current_slot.clone(),
-        new_slot: Some(inactive_slot.clone()),
-        layout: bundle.layout.clone(),
-        runtime_id: None,
-    };
-    write_pending_update(&pending, base_dir)?;
-
-    // Activate the new slot
+    // Activate the new slot. The marker is already on disk (written before the
+    // write loop above).
     println!("    Activating slot: {inactive_slot}");
     if let Err(e) = execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref()) {
-        // The flip failed, so the marker now describes an update that is not
-        // happening. Leaving it would have the next boot verify the running OS
-        // against the new one's id, call that a failure, and roll back a slot
-        // that was never changed.
-        let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
+        // Only a pointer loader can safely clear here: the flip is its sole
+        // activation, so a failed flip means nothing changed. On a sorting
+        // loader (sdboot-ab) the `file:` write already activated, so the marker
+        // must persist for the next boot to verify and roll back.
+        if update.strategy != "sdboot-ab" {
+            let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
+        }
         return Err(e);
     }
 
@@ -795,9 +802,14 @@ fn resolve_fs_file(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
         )));
     }
     if label_absent(label) {
-        return Ok(Some(WriteTarget::NotOnThisMedium(format!(
-            "no partition labeled '{label}' on this medium"
-        ))));
+        // Unlike an eMMC boot target (the disk decides whether it exists), a
+        // file: partlabel is a string the manifest author typed. Silently
+        // skipping an absent one turns a typo (file:esp on a board labeled ESP)
+        // into a success that writes nothing and reboots onto the old OS -- the
+        // silent no-op this change exists to remove. Fail loudly instead.
+        return Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "slot target '{spec}': no partition labeled '{label}' on this device"
+        )));
     }
     Ok(Some(WriteTarget::FsFile {
         label: label.to_string(),
@@ -2142,6 +2154,24 @@ pub fn apply_os_update_streaming<R: Read>(
 
     println!("    Current slot: {current_slot}, inactive slot: {inactive_slot}");
 
+    // Write the pending-update marker BEFORE streaming any artifact, for the
+    // same reason as the staged path: on a sorting loader the `file:` write is
+    // the activation, so a marker written after the loop leaves a window where a
+    // failure activates an unverified OS with no breadcrumb to roll back.
+    let pending = PendingUpdate {
+        os_build_id: bundle.os_build_id.clone(),
+        initramfs_build_id: bundle.initramfs_build_id.clone(),
+        verify: bundle.verify.clone(),
+        verify_initramfs: bundle.verify_initramfs.clone(),
+        rollback: update.rollback.clone(),
+        commit: update.commit.clone(),
+        previous_slot: current_slot.clone(),
+        new_slot: Some(inactive_slot.clone()),
+        layout: bundle.layout.clone(),
+        runtime_id: None,
+    };
+    write_pending_update(&pending, base_dir)?;
+
     // 4. Build lookup: archive path → artifact metadata
     let artifact_map: HashMap<&str, &Artifact> = update
         .artifacts
@@ -2292,31 +2322,16 @@ pub fn apply_os_update_streaming<R: Read>(
     // 7. Patch BLS entries if needed (sdboot-ab: fix rootfs PARTLABEL in boot partition)
     maybe_patch_bls_entries(update, &inactive_slot)?;
 
-    // 8. Write the pending-update marker BEFORE flipping, for the same reason as
-    // the staged path: it is the only breadcrumb the next boot has to verify
-    // this OS and roll a bad one back, so a crash between flip and marker would
-    // boot an unverified OS with no way back.
-    let pending = PendingUpdate {
-        os_build_id: bundle.os_build_id.clone(),
-        initramfs_build_id: bundle.initramfs_build_id.clone(),
-        verify: bundle.verify.clone(),
-        verify_initramfs: bundle.verify_initramfs.clone(),
-        rollback: update.rollback.clone(),
-        commit: update.commit.clone(),
-        previous_slot: current_slot.clone(),
-        new_slot: Some(inactive_slot.clone()),
-        layout: bundle.layout.clone(),
-        runtime_id: None,
-    };
-    write_pending_update(&pending, base_dir)?;
-
-    // 9. Activate the new slot
+    // 9. Activate the new slot. The marker is already on disk (written before
+    // the stream loop above).
     println!("    Activating slot: {inactive_slot}");
     if let Err(e) = execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref()) {
-        // The flip failed, so the marker describes an update that is not
-        // happening: clear it rather than have the next boot verify the running
-        // OS against the new one's id and roll back a slot nothing changed.
-        let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
+        // Only a pointer loader can safely clear: the flip is its sole
+        // activation. On a sorting loader (sdboot-ab) the `file:` write already
+        // activated, so the marker must persist for next-boot verify/rollback.
+        if update.strategy != "sdboot-ab" {
+            let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
+        }
         return Err(e);
     }
 
@@ -2878,22 +2893,20 @@ PRETTY_NAME="Avocado Linux 2024.1"
         assert!(!verify_os_release_from(&verify, &os_release).unwrap());
     }
 
-    /// `file:<partlabel>:<path>` parses into an FsFile target, and the path is
-    /// normalised relative to the filesystem root.
+    /// `file:<partlabel>:<path>` parses into an FsFile target with the path
+    /// normalised relative to the filesystem root; an absent label is a loud
+    /// error (a typo must not be a silent skip), not NotOnThisMedium.
     #[test]
     fn test_resolve_fs_file_parses_label_and_path() {
-        // A label that does not exist on the test machine resolves to
-        // NotOnThisMedium, which is itself the contract: an artifact for a
-        // medium this device does not have is skipped, not failed.
-        match resolve_fs_file("file:efi:/EFI/Linux/avocado+3.efi").unwrap() {
-            Some(WriteTarget::FsFile { label, rel_path }) => {
+        match resolve_fs_file("file:efi:/EFI/Linux/avocado+3.efi") {
+            Ok(Some(WriteTarget::FsFile { label, rel_path })) => {
                 assert_eq!(label, "efi");
                 assert_eq!(rel_path, "EFI/Linux/avocado+3.efi");
             }
-            Some(WriteTarget::NotOnThisMedium(reason)) => {
-                assert!(reason.contains("efi"), "unexpected reason: {reason}");
-            }
-            other => panic!("expected an FsFile or NotOnThisMedium target, got {other:?}"),
+            // On a machine without an `efi` partition the label is absent, which
+            // is now an error rather than a skipped NotOnThisMedium target.
+            Err(e) => assert!(e.to_string().contains("efi"), "unexpected error: {e}"),
+            other => panic!("expected an FsFile target or an absent-label error, got {other:?}"),
         }
     }
 
