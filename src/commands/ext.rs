@@ -3237,12 +3237,16 @@ fn cleanup_extension_release_staging(output: &OutputManager) -> Result<(), Syste
             for line in mounts_content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    let mount_point = parts[1];
-                    if mount_point_under_any(mount_point, &ext_mount_bases)
+                    // /proc/mounts escapes spaces/tabs/newlines/backslashes as
+                    // octal (e.g. `\040`); decode before matching or umounting,
+                    // or a HITL extension whose name has a space would be passed
+                    // to umount as a literal backslash path and never unmounted.
+                    let mount_point = crate::service::hitl::unescape_mount_path(parts[1]);
+                    if mount_point_under_any(&mount_point, &ext_mount_bases)
                         && mount_point.contains("extension-release.d")
                     {
                         let result = ProcessCommand::new("umount")
-                            .arg(mount_point)
+                            .arg(&mount_point)
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
                             .output();

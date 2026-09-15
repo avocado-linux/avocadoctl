@@ -384,16 +384,27 @@ fn unmount_with(
         detach_sysext_overlays(output);
     }
 
+    let mut first_error: Option<AvocadoError> = None;
+
     output.step("HITL Unmount", "Unmerging extensions");
     if force {
         eprintln!("{} fallback: unmerge", stamp());
     }
-    forward(output, crate::service::ext::unmerge_extensions(false))?;
+    // Do NOT bail on an unmerge error: this function's invariant is that it
+    // always ends with the installed extensions merged back. A `?` here would
+    // skip the unmount loop AND the final merge, leaving the board unmerged --
+    // the exact failure the forced path exists to prevent. Record it, keep going.
+    if let Err(e) = forward(output, crate::service::ext::unmerge_extensions(false)) {
+        output.error(
+            "HITL Unmount",
+            &format!("unmerge failed, continuing to restore: {e}"),
+        );
+        first_error.get_or_insert(e);
+    }
     if force {
         eprintln!("{} fallback: unmerged; unmounting", stamp());
     }
 
-    let mut first_error: Option<AvocadoError> = None;
     for extension in extensions {
         let dir = format!("{base}/{extension}");
         output.step(
@@ -433,8 +444,10 @@ fn unmount_with(
     let merge_result = forward(output, crate::service::ext::merge_extensions(&config));
     if merge_result.is_ok() {
         output.success("Extension Merge", "Extensions merged successfully");
+        // Reload only after a SUCCESSFUL merge. A reload while still unmerged,
+        // with a confext's socket unit files absent, drops the listener for good.
+        let _ = hitl::systemd_daemon_reload(output);
     }
-    let _ = hitl::systemd_daemon_reload(output);
 
     match first_error {
         Some(e) => Err(e),
@@ -839,7 +852,7 @@ fn nested_mounts(proc_mounts: &str, root: &str) -> Vec<String> {
 }
 
 /// `/proc/mounts` escapes space, tab, newline and backslash as `\ooo`.
-fn unescape_mount_path(s: &str) -> String {
+pub(crate) fn unescape_mount_path(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -987,6 +1000,9 @@ tmpfs /run/avocado/hitl/with\\040space tmpfs rw 0 0
     /// from the (dead) mount.
     #[test]
     fn forced_unmount_reads_services_from_dropins() {
+        // Serialize with every other test that toggles process-global env vars;
+        // this test sets AVOCADO_TEST_MODE/TMPDIR, which others read.
+        let _guard = crate::commands::test_env::ENV_VAR_MUTEX.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         std::env::set_var("AVOCADO_TEST_MODE", "1");
         std::env::set_var("AVOCADO_TEST_TMPDIR", tmp.path());
