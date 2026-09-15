@@ -850,6 +850,13 @@ fn root_disk_name() -> Result<String, OsUpdateError> {
         })
 }
 
+/// The kernel `maj:min` for a device's rdev, decoded the way
+/// `/proc/*/mountinfo` prints it. `rdev & 0xff` alone drops the high minor
+/// bits, so e.g. major 8 minor 257 would alias minor 1.
+fn dev_maj_min(rdev: u64) -> String {
+    format!("{}:{}", libc::major(rdev), libc::minor(rdev))
+}
+
 /// Root-only scratch root for this updater. `/run` is a root-owned tmpfs, so
 /// unlike world-writable `/tmp` an unprivileged user cannot pre-plant a
 /// symlink at a path we are about to create.
@@ -880,11 +887,7 @@ impl DeviceLock {
                 ))
             })?
             .rdev();
-        let path = run_avocado_dir()?.join(format!(
-            "os-update-{}:{}.lock",
-            (rdev >> 8) & 0xfff,
-            rdev & 0xff
-        ));
+        let path = run_avocado_dir()?.join(format!("os-update-{}.lock", dev_maj_min(rdev)));
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -980,7 +983,7 @@ fn with_mounted_partition<T>(
 /// /dev/sda1) is still recognised.
 fn existing_rw_mount(device: &Path) -> Option<PathBuf> {
     let rdev = fs::metadata(device).ok()?.rdev();
-    let want = format!("{}:{}", (rdev >> 8) & 0xfff, rdev & 0xff);
+    let want = dev_maj_min(rdev);
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
     mountinfo.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -989,7 +992,12 @@ fn existing_rw_mount(device: &Path) -> Option<PathBuf> {
         if fields.next()? != want {
             return None;
         }
-        let _root = fields.next()?;
+        // `rel_path` is relative to the filesystem root, so only a mount of the
+        // whole filesystem (root `/`) addresses it correctly; a bind/subtree
+        // mount (root `/sub`) would send the write to the wrong directory.
+        if fields.next()? != "/" {
+            return None;
+        }
         let point = fields.next()?;
         let opts = fields.next()?;
         opts.split(',')
@@ -1108,11 +1116,16 @@ fn write_data_into_mount(
             dest.display()
         ))
     })?;
-    // fsync the directory so the rename itself is durable. vfat ignores
-    // this; ext4 and friends do not, and the point of the rename is that
-    // it survives a power cut.
-    if let Ok(d) = fs::File::open(dir) {
-        let _ = d.sync_all();
+    // fsync the directory so the rename itself is durable. On vfat (the ESP)
+    // directory fsync is unavailable and returns an error; there durability
+    // comes from the file's own fsync plus the rename, so this is best-effort.
+    // Log rather than fail, so a real error on a fsync-capable filesystem is at
+    // least visible instead of silently swallowed.
+    if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        eprintln!(
+            "note: directory fsync of {} unavailable or failed: {e}",
+            dir.display()
+        );
     }
 
     // Read back and compare by streaming hash, so neither the source nor the
@@ -1856,8 +1869,18 @@ fn maybe_patch_bls_entries(
     for artifact in &update.artifacts {
         if artifact.name == "boot" {
             if let Some(target) = artifact.slot_targets.get(inactive_slot) {
-                println!("    Patching BLS entry on partition: {}", target.partition);
-                patch_bls_entry_for_slot(&target.partition, inactive_slot)?;
+                // BLS patching rewrites root=PARTLABEL= in a loader/entries/*.conf
+                // and needs a real boot PARTITION label. A `file:` target is a
+                // UKI (cmdline embedded, no .conf to patch) and `skip` isn't on
+                // this medium; passing either to resolve_partition would fail the
+                // update after the file was already written.
+                let p = &target.partition;
+                if p == "skip" || p.starts_with("file:") {
+                    println!("    Boot target {p}: no BLS entry to patch, skipping");
+                    continue;
+                }
+                println!("    Patching BLS entry on partition: {p}");
+                patch_bls_entry_for_slot(p, inactive_slot)?;
             }
         }
     }
@@ -2911,6 +2934,14 @@ PRETTY_NAME="Avocado Linux 2024.1"
     /// The atomic write: a temp file in the destination directory, renamed
     /// over the target. Exercised against a plain directory, which is what
     /// with_mounted_partition hands the closure.
+    #[test]
+    fn dev_maj_min_keeps_high_minor_bits() {
+        // makedev(8, 257): the high minor bit must survive, not alias to 8:1.
+        let rdev = ((8u64) << 8) | (257u64 & 0xff) | (((257u64) >> 8) << 20);
+        assert_eq!(dev_maj_min(rdev), "8:257");
+        assert_eq!(dev_maj_min(((8u64) << 8) | 1), "8:1");
+    }
+
     #[test]
     fn test_fs_file_write_is_atomic_and_verified() {
         let tmp = TempDir::new().unwrap();
