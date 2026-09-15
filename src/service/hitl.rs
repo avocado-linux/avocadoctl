@@ -221,6 +221,38 @@ fn forward(
     Ok(())
 }
 
+/// Every extension with a live HITL NFS mount right now, read from
+/// `/proc/mounts`. The dead-server fallback recovers ALL of them in one pass:
+/// each watchdog handling only its own mount left the others' dead mounts in
+/// place while it re-merged, which blocked the merge on the dead server.
+fn mounted_hitl_extensions() -> Vec<String> {
+    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+    mounted_hitl_extensions_in(&mounts, &base_dir())
+}
+
+/// Pure over the mounts text and base dir, so it is testable without /proc.
+fn mounted_hitl_extensions_in(proc_mounts: &str, base: &str) -> Vec<String> {
+    let prefix = format!("{base}/");
+    let mut v: Vec<String> = Vec::new();
+    for line in proc_mounts.lines() {
+        let mut f = line.split_whitespace();
+        let _dev = f.next();
+        let Some(mp) = f.next() else { continue };
+        let mp = unescape_mount_path(mp);
+        let fstype = f.next().unwrap_or("");
+        if !fstype.starts_with("nfs") {
+            continue;
+        }
+        if let Some(rest) = mp.strip_prefix(&prefix) {
+            let name = rest.split('/').next().unwrap_or("");
+            if !name.is_empty() && !v.iter().any(|e| e == name) {
+                v.push(name.to_string());
+            }
+        }
+    }
+    v
+}
+
 /// Mount one export and prove it is live. On any failure the mount point is
 /// left unmounted (so the caller can remove the directory) and the error
 /// carries the reason the mount unit gave, not just "Job failed".
@@ -383,6 +415,21 @@ fn unmount_with(
     // extensions from one dead server) cannot interleave and leave the board
     // unmerged. Held for the whole function.
     let _fallback_lock = FallbackLock::acquire();
+    // Another watchdog may have swept everything while we waited for the lock.
+    if force {
+        let base = base_dir();
+        let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+        if !extensions
+            .iter()
+            .any(|e| is_mounted(&mounts, &format!("{base}/{e}")))
+        {
+            eprintln!(
+                "{} fallback: already recovered by another watchdog",
+                stamp()
+            );
+            return Ok(());
+        }
+    }
     for extension in extensions {
         if !is_valid_extension_name(extension) {
             return Err(AvocadoError::UnmountFailed {
@@ -647,10 +694,22 @@ pub fn watchdog(server_ip: &str, port: &str, extension: &str, output: &OutputMan
             // fallback against a dead server stalls.
             let _ = output;
             let loud = OutputManager::new(true, false);
-            match unmount_lost(&[extension.to_string()], &loud) {
+            // Recover EVERY live HITL mount in one pass, not just this one: the
+            // unmerge/merge is global, so leaving a sibling's dead mount in place
+            // blocks the merge on the dead server. The flock in unmount_with
+            // still serializes two watchdogs; the second finds nothing mounted
+            // and returns immediately.
+            let all = mounted_hitl_extensions();
+            let targets = if all.is_empty() {
+                vec![extension.to_string()]
+            } else {
+                all
+            };
+            match unmount_lost(&targets, &loud) {
                 Ok(()) => eprintln!(
-                    "{} {extension}: fallback complete, installed extension restored",
-                    stamp()
+                    "{} {extension}: fallback complete, installed extensions restored ({})",
+                    stamp(),
+                    targets.join(", ")
                 ),
                 Err(e) => eprintln!("{} {extension}: fallback FAILED: {e}", stamp()),
             }
@@ -970,6 +1029,14 @@ pub fn mount_dir(extension: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mounted_hitl_extensions_finds_nfs_only() {
+        // MOUNTS has one nfs4 mount (vmm) plus tmpfs release binds and an erofs
+        // pool image; only the nfs export counts, once.
+        let v = mounted_hitl_extensions_in(MOUNTS, "/run/avocado/hitl");
+        assert_eq!(v, vec!["vmm".to_string()]);
+    }
 
     #[test]
     fn host_port_brackets_ipv6_only() {
