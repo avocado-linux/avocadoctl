@@ -62,12 +62,18 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
             // The resolver knows the fallback `<name>-<version>` naming and the
             // `.kab` vs `.raw` distinction; reconstructing `<id>.raw` by hand
             // reported a nonexistent path for both cases.
-            let path = ext.resolve_path(base_path).display().to_string();
-            // Seed both the bare name and the versioned form: directory-form
-            // extensions are named `<name>-<version>`, so deduping on the bare
-            // name alone would list a manifest extension twice.
+            let resolved = ext.resolve_path(base_path);
+            // Seed the bare name, the `<name>-<version>` form (directory-form
+            // extensions are named that way), AND the image file's stem. The
+            // last one matters when the extensions dir IS the image pool: the
+            // loose-.raw scan below would otherwise re-list every pool image by
+            // its UUID (the exact thing listing by manifest name replaced).
             seen.insert(ext.name.clone());
             seen.insert(format!("{}-{}", ext.name, ext.version));
+            if let Some(stem) = resolved.file_stem().and_then(|s| s.to_str()) {
+                seen.insert(stem.to_string());
+            }
+            let path = resolved.display().to_string();
             result.push(ExtensionInfo {
                 name: ext.name.clone(),
                 version: Some(ext.version.clone()),
@@ -571,6 +577,44 @@ mod list_tests {
             .find(|e| e.name == "loose")
             .expect("loose .raw listed with a manifest present");
         assert_eq!(loose.version.as_deref(), Some("9.9.9"));
+    }
+
+    /// When the extensions dir IS the image pool (as on some devices), the
+    /// loose-.raw scan must not re-list manifest images by their UUID stem.
+    #[test]
+    fn list_extensions_does_not_relist_pool_images_by_uuid() {
+        let _guard = ENV_VAR_MUTEX.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let rt = base.join("runtimes").join("uuid-1");
+        std::fs::create_dir_all(&rt).unwrap();
+        let uuid = "a1b2c3d4-e5f6-5789-abcd-ef0123456789";
+        let manifest = serde_json::json!({
+            "manifest_version": 1, "id": "uuid-1", "built_at": "2026-02-18T15:00:00Z",
+            "runtime": { "name": "dev", "version": "0.1.0" },
+            "extensions": [ { "name": "vmm", "version": "0.1.6", "image_id": uuid, "enabled": true } ]
+        });
+        std::fs::write(rt.join("manifest.json"), manifest.to_string()).unwrap();
+        std::os::unix::fs::symlink("runtimes/uuid-1", base.join("active")).unwrap();
+        // The extensions dir points AT the image pool (the board's layout).
+        let images = base.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join(format!("{uuid}.raw")), b"x").unwrap();
+
+        std::env::set_var("AVOCADO_BASE_DIR", base);
+        std::env::set_var("AVOCADO_EXTENSIONS_PATH", &images);
+        let result = list_extensions(&Config::default());
+        std::env::remove_var("AVOCADO_BASE_DIR");
+        std::env::remove_var("AVOCADO_EXTENSIONS_PATH");
+        let exts = result.expect("list ok");
+
+        assert_eq!(
+            exts.len(),
+            1,
+            "pool image must not be double-listed: {exts:?}"
+        );
+        assert_eq!(exts[0].name, "vmm");
+        assert_eq!(exts[0].version.as_deref(), Some("0.1.6"));
     }
 
     /// With no active manifest, loose `<name>-<version>.raw` images are still
