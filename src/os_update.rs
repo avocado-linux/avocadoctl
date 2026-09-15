@@ -908,8 +908,6 @@ impl DeviceLock {
     }
 }
 
-/// Write `source` to an eMMC boot partition: lift force_ro, write, fsync,
-/// read back and compare, restore force_ro whatever happened.
 /// Mount `label`'s partition, hand its mount point to `f`, unmount.
 ///
 /// An existing read-write mount is reused rather than stacking a second one:
@@ -956,14 +954,24 @@ fn with_mounted_partition<T>(
 
     let result = f(&mount_point);
 
-    // Unmount whatever happened. A left-behind mount would make the next
-    // update reuse it as an "existing" one and never see a stale write.
-    let _ = ProcessCommand::new("umount")
+    // Unmount the mount we created. A left-behind rw mount would be reused by
+    // the next update as an "existing" one (never seeing a stale write) and
+    // defeats the no-concurrent-rw-mount invariant, so a failed unmount is an
+    // error -- but it must never mask the original write error.
+    let umount_ok = ProcessCommand::new("umount")
         .arg(&mount_point)
         .output()
-        .map(|o| o.status.success());
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     let _ = fs::remove_dir(&mount_point);
-    result
+    match result {
+        Err(e) => Err(e),
+        Ok(v) if umount_ok => Ok(v),
+        Ok(_) => Err(OsUpdateError::ArtifactWriteFailed(format!(
+            "failed to unmount {} after writing; refusing to leave a stale mount",
+            mount_point.display()
+        ))),
+    }
 }
 
 /// Mount point of an existing read-write mount of `device`, if there is one.
@@ -1007,12 +1015,8 @@ fn write_to_fs_file(
     rel_path: &str,
     artifact_name: &str,
 ) -> Result<(), OsUpdateError> {
-    let data = fs::read(source).map_err(|e| {
-        OsUpdateError::ArtifactWriteFailed(format!("Failed to read {artifact_name}: {e}"))
-    })?;
-
     with_mounted_partition(label, |mount_point| {
-        write_data_into_mount(mount_point, rel_path, &data, label, artifact_name)
+        write_data_into_mount(mount_point, rel_path, source, label, artifact_name)
     })
 }
 
@@ -1024,7 +1028,7 @@ fn write_to_fs_file(
 fn write_data_into_mount(
     mount_point: &Path,
     rel_path: &str,
-    data: &[u8],
+    source: &Path,
     label: &str,
     artifact_name: &str,
 ) -> Result<(), OsUpdateError> {
@@ -1072,14 +1076,23 @@ fn write_data_into_mount(
     // temp exclusively so a planted symlink is never followed or truncated.
     let _ = fs::remove_file(&tmp);
     let write = (|| -> Result<(), OsUpdateError> {
+        // Stream source -> tmp in bounded chunks: a boot artifact can be
+        // hundreds of MB, and loading it (plus a read-back copy) into memory
+        // risks OOM on a constrained board.
+        let mut src = BufReader::new(fs::File::open(source).map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!("Failed to open {artifact_name}: {e}"))
+        })?);
         let mut f = fs::File::create_new(&tmp).map_err(|e| {
             OsUpdateError::ArtifactWriteFailed(format!("cannot create {}: {e}", tmp.display()))
         })?;
-        f.write_all(data).and_then(|_| f.sync_all()).map_err(|e| {
+        io::copy(&mut src, &mut f).map_err(|e| {
             OsUpdateError::ArtifactWriteFailed(format!(
                 "Failed to write {artifact_name} to {}: {e}",
                 tmp.display()
             ))
+        })?;
+        f.sync_all().map_err(|e| {
+            OsUpdateError::ArtifactWriteFailed(format!("Failed to flush {}: {e}", tmp.display()))
         })
     })();
     if let Err(e) = write {
@@ -1102,10 +1115,15 @@ fn write_data_into_mount(
         let _ = d.sync_all();
     }
 
-    let back = fs::read(&dest).map_err(|e| {
+    // Read back and compare by streaming hash, so neither the source nor the
+    // destination is held whole in memory.
+    let want = sha256_of(source).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!("Failed to hash source {artifact_name}: {e}"))
+    })?;
+    let got = sha256_of(&dest).map_err(|e| {
         OsUpdateError::ArtifactWriteFailed(format!("Failed to read back {}: {e}", dest.display()))
     })?;
-    if back != data {
+    if got != want {
         return Err(OsUpdateError::ArtifactWriteFailed(format!(
             "{artifact_name} read back from {} does not match what was written",
             dest.display()
@@ -1114,6 +1132,8 @@ fn write_data_into_mount(
     Ok(())
 }
 
+/// Write `source` to an eMMC boot partition: lift force_ro, write, fsync,
+/// read back and compare, restore force_ro whatever happened.
 fn write_to_emmc_boot(source: &Path, dev: &Path, artifact_name: &str) -> Result<(), OsUpdateError> {
     let name = dev
         .file_name()
@@ -1257,25 +1277,25 @@ fn resolve_partition(partition_name: &str) -> Result<PathBuf, OsUpdateError> {
     })
 }
 
-fn verify_sha256(path: &Path, expected: &str, artifact_name: &str) -> Result<(), OsUpdateError> {
-    let file = fs::File::open(path).map_err(|e| {
-        OsUpdateError::ArtifactWriteFailed(format!("Failed to open artifact {artifact_name}: {e}"))
-    })?;
-    let mut reader = BufReader::new(file);
+/// Streaming SHA-256 of a file, in bounded memory.
+fn sha256_of(path: &Path) -> io::Result<String> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut buf).map_err(|e| {
-            OsUpdateError::ArtifactWriteFailed(format!(
-                "Failed to read artifact {artifact_name}: {e}"
-            ))
-        })?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
-    let actual = format!("{:x}", hasher.finalize());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_sha256(path: &Path, expected: &str, artifact_name: &str) -> Result<(), OsUpdateError> {
+    let actual = sha256_of(path).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!("Failed to read artifact {artifact_name}: {e}"))
+    })?;
     if actual != expected {
         return Err(OsUpdateError::Sha256Mismatch {
             artifact: artifact_name.to_string(),
@@ -2904,7 +2924,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
         // Exercise the real production writer against the mount directory.
         let mount = tmp.path().join("mnt");
         let data = fs::read(&src).unwrap();
-        write_data_into_mount(&mount, "EFI/Linux/avocado+3.efi", &data, "efi", "uki").unwrap();
+        write_data_into_mount(&mount, "EFI/Linux/avocado+3.efi", &src, "efi", "uki").unwrap();
 
         assert_eq!(fs::read(&dest).unwrap(), data);
         let staged = dest_dir.join(".avocado+3.efi.avocado-new");
@@ -2919,7 +2939,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let mount2 = tmp.path().join("mnt2");
         fs::create_dir_all(&mount2).unwrap();
         std::os::unix::fs::symlink(&outside, mount2.join("EFI")).unwrap();
-        let err = write_data_into_mount(&mount2, "EFI/x.efi", &data, "efi", "uki");
+        let err = write_data_into_mount(&mount2, "EFI/x.efi", &src, "efi", "uki");
         assert!(err.is_err(), "symlinked component must be refused");
         assert!(!outside.join("x.efi").exists(), "must not write off-mount");
     }
