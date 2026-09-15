@@ -36,6 +36,7 @@ use crate::config::Config;
 use crate::output::OutputManager;
 use crate::service::error::AvocadoError;
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -308,6 +309,60 @@ fn mount_one(server_ip: &str, port: &str, extension: &str, dir: &str) -> Result<
 ///
 /// Errors are collected, not returned early: whatever happened, the merge at
 /// the end runs. Leaving the board unmerged because one umount failed is how
+/// Build a `host:port` authority that `to_socket_addrs` accepts, bracketing a
+/// bare IPv6 literal (`fe80::1` -> `[fe80::1]:port`). A hostname or IPv4 passes
+/// through unchanged.
+fn host_port(server_ip: &str, port: &str) -> String {
+    if server_ip.contains(':') && !server_ip.starts_with('[') {
+        format!("[{server_ip}]:{port}")
+    } else {
+        format!("{server_ip}:{port}")
+    }
+}
+
+/// A process-wide lock for the HITL unmerge/merge lifecycle. Two extensions
+/// mounted from one server each get a watchdog; when that server dies both hit
+/// the failure threshold on the same tick and call `unmount_lost`. The
+/// unmerge/merge is global and `systemd-sysext` is all-or-nothing, so without
+/// serialization the two interleave and the board can finish UNMERGED (sshd
+/// rides an extension -> off the network, serial-console recovery). `flock`
+/// makes the second wait; it then re-runs against an already-restored system.
+/// Released when the guard drops or the process dies.
+struct FallbackLock(#[allow(dead_code)] fs::File);
+
+impl FallbackLock {
+    fn acquire() -> Option<Self> {
+        let path = format!("{}/hitl-fallback.lock", run_dir());
+        if let Some(dir) = Path::new(&path).parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .ok()?;
+        // Best-effort: if the lock cannot be taken, attempting recovery unlocked
+        // beats blocking a dead-server fallback forever.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return None;
+        }
+        Some(FallbackLock(file))
+    }
+}
+
+/// Directory for HITL lock files -- test-mode redirects it out of /run.
+fn run_dir() -> String {
+    if test_mode() {
+        let base = std::env::var("AVOCADO_TEST_TMPDIR")
+            .or_else(|_| std::env::var("TMPDIR"))
+            .unwrap_or_else(|_| "/tmp".to_string());
+        format!("{base}/run/avocado")
+    } else {
+        "/run/avocado".to_string()
+    }
+}
+
 /// it lost sshd.
 pub fn unmount(extensions: &[String], output: &OutputManager) -> Result<(), AvocadoError> {
     unmount_with(extensions, false, output)
@@ -324,6 +379,10 @@ fn unmount_with(
     force: bool,
     output: &OutputManager,
 ) -> Result<(), AvocadoError> {
+    // Serialize the global unmerge/merge lifecycle so two watchdogs (two
+    // extensions from one dead server) cannot interleave and leave the board
+    // unmerged. Held for the whole function.
+    let _fallback_lock = FallbackLock::acquire();
     for extension in extensions {
         if !is_valid_extension_name(extension) {
             return Err(AvocadoError::UnmountFailed {
@@ -540,7 +599,7 @@ fn unmount_one(
 /// not complete a handshake. Soft mount options bounded that but did not
 /// prevent it: one stuck RPC queues everything behind it.
 pub fn watchdog(server_ip: &str, port: &str, extension: &str, output: &OutputManager) {
-    use std::net::SocketAddr;
+    use std::net::ToSocketAddrs;
     use std::time::Duration;
 
     if !is_valid_extension_name(extension) {
@@ -551,7 +610,7 @@ pub fn watchdog(server_ip: &str, port: &str, extension: &str, output: &OutputMan
     }
 
     let dir = format!("{}/{extension}", base_dir());
-    let addr: Option<SocketAddr> = format!("{server_ip}:{port}").parse().ok();
+    let authority = host_port(server_ip, port);
     let mut failures = 0u32;
     loop {
         std::thread::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS));
@@ -560,7 +619,13 @@ pub fn watchdog(server_ip: &str, port: &str, extension: &str, output: &OutputMan
             eprintln!("{} {extension}: no longer mounted, exiting", stamp());
             return;
         }
-        let up = addr
+        // Resolve each probe (hostnames + IPv6, not just IP literals): the
+        // mount already succeeded via mount.nfs4's own resolution, so a name
+        // here is expected to resolve, and re-resolving tolerates DNS changes.
+        let up = authority
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
             .map(|a| nfs_null_probe(a, Duration::from_secs(2)))
             .unwrap_or(false);
         if up {
@@ -905,6 +970,14 @@ pub fn mount_dir(extension: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_port_brackets_ipv6_only() {
+        assert_eq!(host_port("10.10.0.10", "12049"), "10.10.0.10:12049");
+        assert_eq!(host_port("myhost.local", "12049"), "myhost.local:12049");
+        assert_eq!(host_port("fe80::1", "12049"), "[fe80::1]:12049");
+        assert_eq!(host_port("[fe80::1]", "12049"), "[fe80::1]:12049");
+    }
 
     #[test]
     fn extension_name_must_be_a_single_component() {
