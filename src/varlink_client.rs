@@ -138,9 +138,17 @@ fn extract_debug_fields(body: &str) -> Vec<String> {
 fn split_top_level_commas(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let (mut depth, mut in_str, mut start) = (0i32, false, 0usize);
+    let mut escaped = false;
     let b = s.as_bytes();
     for i in 0..b.len() {
+        // A backslash-escaped byte inside a string is data, never a delimiter:
+        // `reason: "a \", b"` is one field, not two.
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match b[i] {
+            b'\\' if in_str => escaped = true,
             b'"' => in_str = !in_str,
             b'{' | b'[' | b'(' if !in_str => depth += 1,
             b'}' | b']' | b')' if !in_str => depth -= 1,
@@ -476,6 +484,16 @@ pub fn print_root_authority(info: &Option<vl_ra::RootAuthorityInfo>, output: &Ou
 #[cfg(test)]
 mod rpc_error_tests {
     use super::*;
+
+    #[test]
+    fn escaped_quote_in_a_field_is_not_a_split_point() {
+        // The comma lives inside an escaped-quote run within the value, so the
+        // field must stay whole rather than split at that comma.
+        let parts = split_top_level_commas(r#"reason: "route \"a, b\" failed", id: 7"#);
+        assert_eq!(parts.len(), 2, "got {parts:?}");
+        assert_eq!(parts[0].trim(), r#"reason: "route \"a, b\" failed""#);
+        assert_eq!(parts[1].trim(), "id: 7");
+    }
 
     #[test]
     fn humanizes_a_generated_varlink_error() {
