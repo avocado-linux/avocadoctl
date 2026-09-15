@@ -99,7 +99,9 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
                         .and_then(|n| n.strip_suffix(".raw"))
                     {
                         let (name, version) = split_name_version(stem);
-                        if seen.insert(name.to_string()) {
+                        // Dedup on the full `<name>-<version>` stem: foo-1.0 and
+                        // foo-2.0 are distinct extensions and must both list.
+                        if seen.insert(stem.to_string()) {
                             result.push(ExtensionInfo {
                                 name: name.to_string(),
                                 version,
@@ -560,6 +562,7 @@ mod list_tests {
         let ext_dir = tmp.path().join("ext");
         std::fs::create_dir_all(&ext_dir).unwrap();
         std::fs::write(ext_dir.join("foo-0.3.0.raw"), b"x").unwrap();
+        std::fs::write(ext_dir.join("foo-0.4.0.raw"), b"x").unwrap();
 
         std::env::set_var("AVOCADO_BASE_DIR", tmp.path());
         std::env::set_var("AVOCADO_EXTENSIONS_PATH", &ext_dir);
@@ -568,7 +571,10 @@ mod list_tests {
         std::env::remove_var("AVOCADO_EXTENSIONS_PATH");
         let exts = result.expect("list ok");
 
-        let foo = exts.iter().find(|e| e.name == "foo").expect("foo listed");
-        assert_eq!(foo.version.as_deref(), Some("0.3.0"));
+        let foos: Vec<_> = exts.iter().filter(|e| e.name == "foo").collect();
+        assert_eq!(foos.len(), 2, "both versions must list: {foos:?}");
+        let mut versions: Vec<_> = foos.iter().filter_map(|e| e.version.clone()).collect();
+        versions.sort();
+        assert_eq!(versions, vec!["0.3.0".to_string(), "0.4.0".to_string()]);
     }
 }
