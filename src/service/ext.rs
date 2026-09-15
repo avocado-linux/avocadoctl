@@ -31,12 +31,11 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
     // From the active runtime manifest: the real extension names + versions,
     // each pointing at its image in the pool.
     if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
-        let images_dir = base_path.join(crate::manifest::IMAGES_DIR_NAME);
         for ext in &manifest.extensions {
-            let path = match &ext.image_id {
-                Some(id) => images_dir.join(format!("{id}.raw")).display().to_string(),
-                None => String::new(),
-            };
+            // The resolver knows the fallback `<name>-<version>` naming and the
+            // `.kab` vs `.raw` distinction; reconstructing `<id>.raw` by hand
+            // reported a nonexistent path for both cases.
+            let path = ext.resolve_path(base_path).display().to_string();
             seen.insert(ext.name.clone());
             result.push(ExtensionInfo {
                 name: ext.name.clone(),

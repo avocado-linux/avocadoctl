@@ -281,9 +281,8 @@ fn main() {
                             // merged /usr only changes on the next merge. Say so
                             // -- a bare "enabled" reads as "it took effect".
                             if reply.updated > 0 {
-                                output.info(
-                                    "Extension Override",
-                                    "Run 'avocadoctl ext refresh' to apply.",
+                                output.log_info(
+                                    "Run 'avocadoctl ext refresh' to apply the override.",
                                 );
                             }
                         }
@@ -310,9 +309,8 @@ fn main() {
                             // merged /usr only changes on the next merge. Say so
                             // -- a bare "disabled" reads as "it took effect".
                             if reply.updated > 0 {
-                                output.info(
-                                    "Extension Override",
-                                    "Run 'avocadoctl ext refresh' to apply.",
+                                output.log_info(
+                                    "Run 'avocadoctl ext refresh' to apply the override.",
                                 );
                             }
                         }
