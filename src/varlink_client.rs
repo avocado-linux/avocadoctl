@@ -124,8 +124,20 @@ fn extract_debug_fields(body: &str) -> Vec<String> {
             continue;
         };
         let k = k.trim();
-        let v = v.trim().trim_matches('"');
+        let v = v.trim();
+        // Check the sentinels on the raw debug token, before unquoting: `None`
+        // and `[]` appear unquoted, so a real string value `"None"` / `"[]"`
+        // must not be discarded as absent.
         if k.is_empty() || v.is_empty() || v == "None" || v == "[]" {
+            continue;
+        }
+        // Strip at most one surrounding quote pair (the debug quoting of a
+        // string), leaving inner and escaped quotes intact.
+        let v = v
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(v);
+        if v.is_empty() {
             continue;
         }
         out.push(format!("{k}: {v}"));
@@ -484,6 +496,13 @@ pub fn print_root_authority(info: &Option<vl_ra::RootAuthorityInfo>, output: &Ou
 #[cfg(test)]
 mod rpc_error_tests {
     use super::*;
+
+    #[test]
+    fn literal_none_string_value_is_kept_not_dropped() {
+        // `id: "None"` is a real string value, not the Option::None sentinel.
+        let raw = r#"org.avocado.Runtimes.RuntimeNotFound: Some(RuntimeNotFound_Args { id: "None", candidates: None })"#;
+        assert_eq!(humanize_rpc_error(raw), "Runtime not found (id: None)");
+    }
 
     #[test]
     fn escaped_quote_in_a_field_is_not_a_split_point() {

@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
-/// List all available extensions from the extensions directory.
 /// List the extensions the device actually has, by name.
 ///
 /// The extension image pool stores each `.raw` under its content-addressed
@@ -22,6 +21,19 @@ use std::thread;
 /// Directory-form extensions under the extensions dir -- HITL mounts and
 /// loose dev extensions, which carry a real name -- are still listed as before,
 /// and never duplicate a manifest entry.
+/// Split a legacy raw-image stem `<name>-<version>` into its parts. The version
+/// is only taken when the text after the last dash looks like one (digits or
+/// dots), matching the legacy raw scanner.
+fn split_name_version(stem: &str) -> (&str, Option<String>) {
+    if let Some(dash) = stem.rfind('-') {
+        let v = &stem[dash + 1..];
+        if v.chars().any(|c| c.is_ascii_digit() || c == '.') {
+            return (&stem[..dash], Some(v.to_string()));
+        }
+    }
+    (stem, None)
+}
+
 pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoError> {
     let base_dir = config.get_avocado_base_dir();
     let base_path = Path::new(&base_dir);
@@ -29,14 +41,23 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
     let mut seen = std::collections::HashSet::new();
 
     // From the active runtime manifest: the real extension names + versions,
-    // each pointing at its image in the pool.
-    if let Some(manifest) = crate::manifest::RuntimeManifest::load_active(base_path) {
+    // each pointing at its image in the pool. A present-but-unreadable active
+    // runtime is an error, not "no manifest" -- otherwise a broken device would
+    // silently fall through to legacy directory discovery.
+    let active = crate::manifest::RuntimeManifest::load_active_checked(base_path)
+        .map_err(|message| AvocadoError::ConfigurationError { message })?;
+    let had_manifest = active.is_some();
+    if let Some(manifest) = active {
         for ext in &manifest.extensions {
             // The resolver knows the fallback `<name>-<version>` naming and the
             // `.kab` vs `.raw` distinction; reconstructing `<id>.raw` by hand
             // reported a nonexistent path for both cases.
             let path = ext.resolve_path(base_path).display().to_string();
+            // Seed both the bare name and the versioned form: directory-form
+            // extensions are named `<name>-<version>`, so deduping on the bare
+            // name alone would list a manifest extension twice.
             seen.insert(ext.name.clone());
+            seen.insert(format!("{}-{}", ext.name, ext.version));
             result.push(ExtensionInfo {
                 name: ext.name.clone(),
                 version: Some(ext.version.clone()),
@@ -55,19 +76,39 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if seen.insert(name.to_string()) {
-                        result.push(ExtensionInfo {
-                            name: name.to_string(),
-                            version: None,
-                            path: path.display().to_string(),
-                            is_sysext: true,
-                            is_confext: false,
-                            is_directory: true,
-                        });
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if seen.insert(name.to_string()) {
+                            result.push(ExtensionInfo {
+                                name: name.to_string(),
+                                version: None,
+                                path: path.display().to_string(),
+                                is_sysext: true,
+                                is_confext: false,
+                                is_directory: true,
+                            });
+                        }
+                    }
+                } else if !had_manifest {
+                    // Legacy manifest-less devices carry loose
+                    // `<name>-<version>.raw` images here; when a manifest exists
+                    // it is authoritative and these are ignored.
+                    if let Some(stem) = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.strip_suffix(".raw"))
+                    {
+                        let (name, version) = split_name_version(stem);
+                        if seen.insert(name.to_string()) {
+                            result.push(ExtensionInfo {
+                                name: name.to_string(),
+                                version,
+                                path: path.display().to_string(),
+                                is_sysext: true,
+                                is_confext: false,
+                                is_directory: false,
+                            });
+                        }
                     }
                 }
             }
@@ -448,4 +489,86 @@ pub fn set_extensions_enabled(
         })?;
 
     Ok(SetEnabledResult { updated, missing })
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+    use crate::commands::test_env::ENV_VAR_MUTEX;
+    use std::os::unix::fs as unix_fs;
+    use tempfile::TempDir;
+
+    /// The active-manifest path: names+versions come from the manifest, the path
+    /// is the resolver's, and a versioned directory for the same extension is
+    /// deduped away while an unrelated directory extension still lists.
+    #[test]
+    fn list_extensions_uses_active_manifest_and_dedups_versioned_dir() {
+        let _guard = ENV_VAR_MUTEX.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        let rt = base.join("runtimes").join("uuid-1");
+        std::fs::create_dir_all(&rt).unwrap();
+        let manifest = serde_json::json!({
+            "manifest_version": 1,
+            "id": "uuid-1",
+            "built_at": "2026-02-18T15:00:00Z",
+            "runtime": { "name": "dev", "version": "0.1.0" },
+            "extensions": [
+                { "name": "app", "version": "1.2.3",
+                  "image_id": "a1b2c3d4-e5f6-5789-abcd-ef0123456789", "enabled": true }
+            ]
+        });
+        std::fs::write(rt.join("manifest.json"), manifest.to_string()).unwrap();
+        unix_fs::symlink("runtimes/uuid-1", base.join("active")).unwrap();
+        let images = base.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let img = images.join("a1b2c3d4-e5f6-5789-abcd-ef0123456789.raw");
+        std::fs::write(&img, b"x").unwrap();
+
+        let ext_dir = base.join("ext");
+        std::fs::create_dir_all(ext_dir.join("app-1.2.3")).unwrap();
+        std::fs::create_dir_all(ext_dir.join("hitlmount")).unwrap();
+
+        std::env::set_var("AVOCADO_BASE_DIR", base);
+        std::env::set_var("AVOCADO_EXTENSIONS_PATH", &ext_dir);
+        let result = list_extensions(&Config::default());
+        std::env::remove_var("AVOCADO_BASE_DIR");
+        std::env::remove_var("AVOCADO_EXTENSIONS_PATH");
+        let exts = result.expect("list ok");
+
+        let app = exts.iter().find(|e| e.name == "app").expect("app listed");
+        assert_eq!(app.version.as_deref(), Some("1.2.3"));
+        assert_eq!(app.path, img.display().to_string());
+        assert!(!app.is_directory);
+        assert_eq!(
+            exts.iter()
+                .filter(|e| e.name == "app" || e.name == "app-1.2.3")
+                .count(),
+            1,
+            "versioned dir must not double-list the manifest extension"
+        );
+        assert!(exts.iter().any(|e| e.name == "hitlmount" && e.is_directory));
+    }
+
+    /// With no active manifest, loose `<name>-<version>.raw` images are still
+    /// listed (legacy device behavior), not silently dropped.
+    #[test]
+    fn list_extensions_lists_raw_files_when_no_manifest() {
+        let _guard = ENV_VAR_MUTEX.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let ext_dir = tmp.path().join("ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("foo-0.3.0.raw"), b"x").unwrap();
+
+        std::env::set_var("AVOCADO_BASE_DIR", tmp.path());
+        std::env::set_var("AVOCADO_EXTENSIONS_PATH", &ext_dir);
+        let result = list_extensions(&Config::default());
+        std::env::remove_var("AVOCADO_BASE_DIR");
+        std::env::remove_var("AVOCADO_EXTENSIONS_PATH");
+        let exts = result.expect("list ok");
+
+        let foo = exts.iter().find(|e| e.name == "foo").expect("foo listed");
+        assert_eq!(foo.version.as_deref(), Some("0.3.0"));
+    }
 }
