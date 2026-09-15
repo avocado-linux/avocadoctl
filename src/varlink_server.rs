@@ -484,7 +484,10 @@ impl vl_rt::VarlinkInterface for RuntimesHandler {
 pub struct HitlHandler;
 
 macro_rules! map_hitl_error {
-    ($call:expr, $err:expr) => {
+    // `$fallback` is the reply used for any error that is neither MountFailed nor
+    // UnmountFailed, so an unmount call reports unmount failures (not mount ones)
+    // for merge/unmerge/I/O errors from its lifecycle.
+    ($call:expr, $err:expr, $fallback:ident) => {
         match $err {
             AvocadoError::MountFailed { extension, reason } => {
                 $call.reply_mount_failed(extension, reason)
@@ -492,7 +495,7 @@ macro_rules! map_hitl_error {
             AvocadoError::UnmountFailed { extension, reason } => {
                 $call.reply_unmount_failed(extension, reason)
             }
-            e => $call.reply_mount_failed("unknown".to_string(), e.to_string()),
+            e => $call.$fallback("unknown".to_string(), e.to_string()),
         }
     };
 }
@@ -508,7 +511,7 @@ impl vl_hitl::VarlinkInterface for HitlHandler {
         let quiet = crate::output::OutputManager::new(false, false);
         match service::hitl::mount(&serverIp, serverPort.as_deref(), &extensions, &quiet) {
             Ok(()) => call.reply(),
-            Err(e) => map_hitl_error!(call, e),
+            Err(e) => map_hitl_error!(call, e, reply_mount_failed),
         }
     }
 
@@ -520,7 +523,7 @@ impl vl_hitl::VarlinkInterface for HitlHandler {
         let quiet = crate::output::OutputManager::new(false, false);
         match service::hitl::unmount(&extensions, &quiet) {
             Ok(()) => call.reply(),
-            Err(e) => map_hitl_error!(call, e),
+            Err(e) => map_hitl_error!(call, e, reply_unmount_failed),
         }
     }
 }
