@@ -872,6 +872,22 @@ fn dev_maj_min(rdev: u64) -> String {
 /// Root-only scratch root for this updater. `/run` is a root-owned tmpfs, so
 /// unlike world-writable `/tmp` an unprivileged user cannot pre-plant a
 /// symlink at a path we are about to create.
+/// Persistent spool directory for streamed boot artifacts, under `base_dir`
+/// (`/var/lib/avocado`, on the big `/var` partition). Unlike `/run` (tmpfs), a
+/// 50-150 MB UKI spooled here does not consume RAM and cannot ENOSPC on a small
+/// board; and `base_dir` is root-owned, so it keeps the not-world-writable
+/// property that moved these spools off `/tmp`.
+fn os_update_spool_dir(base_dir: &Path) -> Result<PathBuf, OsUpdateError> {
+    let dir = base_dir.join(OS_UPDATE_STAGING_DIR);
+    fs::create_dir_all(&dir).map_err(|e| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "cannot create spool dir {}: {e}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
 fn run_avocado_dir() -> Result<PathBuf, OsUpdateError> {
     let dir = PathBuf::from("/run/avocado");
     fs::create_dir_all(&dir).map_err(|e| {
@@ -2249,8 +2265,8 @@ pub fn apply_os_update_streaming<R: Read>(
             WriteTarget::EmmcBoot(dev) => {
                 // A few MiB and it needs read-back verification: spool to a
                 // file and take the staged path.
-                let tmp =
-                    run_avocado_dir()?.join(format!("spool-{}.emmc-boot", uuid::Uuid::new_v4()));
+                let tmp = os_update_spool_dir(base_dir)?
+                    .join(format!("spool-{}.emmc-boot", uuid::Uuid::new_v4()));
                 let spooled = (|| -> Result<(), OsUpdateError> {
                     let mut out = fs::File::create_new(&tmp).map_err(|e| {
                         OsUpdateError::ArtifactWriteFailed(format!(
@@ -2274,7 +2290,8 @@ pub fn apply_os_update_streaming<R: Read>(
                 // Same reason as the eMMC boot arm: the write is a rename over
                 // a live boot entry and is read back afterwards, so it needs a
                 // whole file on disk with a verified digest before it starts.
-                let tmp = run_avocado_dir()?.join(format!("spool-{}.fsfile", uuid::Uuid::new_v4()));
+                let tmp = os_update_spool_dir(base_dir)?
+                    .join(format!("spool-{}.fsfile", uuid::Uuid::new_v4()));
                 let spooled = (|| -> Result<(), OsUpdateError> {
                     let mut out = fs::File::create_new(&tmp).map_err(|e| {
                         OsUpdateError::ArtifactWriteFailed(format!(
