@@ -41,12 +41,22 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
     let mut seen = std::collections::HashSet::new();
 
     // From the active runtime manifest: the real extension names + versions,
-    // each pointing at its image in the pool. A present-but-unreadable active
-    // runtime is an error, not "no manifest" -- otherwise a broken device would
-    // silently fall through to legacy directory discovery.
-    let active = crate::manifest::RuntimeManifest::load_active_checked(base_path)
-        .map_err(|message| AvocadoError::ConfigurationError { message })?;
-    let had_manifest = active.is_some();
+    // each pointing at its image in the pool. `list` is read-only and is the
+    // command you reach for to diagnose a broken device -- e.g. a
+    // version-above-ceiling manifest after an avocadoctl downgrade -- so a
+    // manifest that cannot be read must NOT fail it: warn and fall back to
+    // directory listing. (merge stays strict via load_active_checked, where a
+    // wrong answer merges the wrong files.)
+    let active = match crate::manifest::RuntimeManifest::load_active_checked(base_path) {
+        Ok(m) => m,
+        Err(message) => {
+            eprintln!(
+                "warning: active runtime manifest could not be read ({message}); \
+                 listing directory extensions only"
+            );
+            None
+        }
+    };
     if let Some(manifest) = active {
         for ext in &manifest.extensions {
             // The resolver knows the fallback `<name>-<version>` naming and the
@@ -89,10 +99,12 @@ pub fn list_extensions(config: &Config) -> Result<Vec<ExtensionInfo>, AvocadoErr
                             });
                         }
                     }
-                } else if !had_manifest {
-                    // Legacy manifest-less devices carry loose
-                    // `<name>-<version>.raw` images here; when a manifest exists
-                    // it is authoritative and these are ignored.
+                } else {
+                    // Loose `<name>-<version>.raw` images in the extensions dir
+                    // are real extensions: `enable` resolves `{name}.raw` here
+                    // whether or not a manifest exists, so `list` must show them
+                    // too (deduped against manifest entries by stem) or the two
+                    // commands would disagree about what the device has.
                     if let Some(stem) = path
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -531,6 +543,9 @@ mod list_tests {
         let ext_dir = base.join("ext");
         std::fs::create_dir_all(ext_dir.join("app-1.2.3")).unwrap();
         std::fs::create_dir_all(ext_dir.join("hitlmount")).unwrap();
+        // A loose .raw NOT in the manifest: `enable` would accept it, so `list`
+        // must show it too even though a manifest is present.
+        std::fs::write(ext_dir.join("loose-9.9.9.raw"), b"x").unwrap();
 
         std::env::set_var("AVOCADO_BASE_DIR", base);
         std::env::set_var("AVOCADO_EXTENSIONS_PATH", &ext_dir);
@@ -551,6 +566,11 @@ mod list_tests {
             "versioned dir must not double-list the manifest extension"
         );
         assert!(exts.iter().any(|e| e.name == "hitlmount" && e.is_directory));
+        let loose = exts
+            .iter()
+            .find(|e| e.name == "loose")
+            .expect("loose .raw listed with a manifest present");
+        assert_eq!(loose.version.as_deref(), Some("9.9.9"));
     }
 
     /// With no active manifest, loose `<name>-<version>.raw` images are still
