@@ -144,10 +144,31 @@ pub enum SlotAction {
         devpath: String,
         slot_layouts: HashMap<String, Vec<String>>,
     },
+    /// On `activate` and `rollback` this writes BootNext; on `commit` it
+    /// writes BootOrder. See `EfiBootVariable`.
     #[serde(rename = "efibootmgr")]
     Efibootmgr {
         slot_entries: HashMap<String, String>,
     },
+}
+
+/// The UEFI variable an `efibootmgr` slot action writes.
+///
+/// `BootNext` is a one-shot: the firmware boots the entry once and then falls
+/// back to BootOrder, which is what makes an activation safe to try. It is also
+/// why an update never sticks on its own - the reboot after a verified boot
+/// follows BootOrder straight back to the old slot. `BootOrder` is the
+/// permanent choice, made only by `commit`.
+///
+/// The phase picks the variable rather than a manifest field because the
+/// pending marker is written by the avocadoctl that applied the update, i.e.
+/// the previous release: a field it does not know would be dropped on the way
+/// through, and the first update would commit with BootNext and silently
+/// revert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EfiBootVariable {
+    BootNext,
+    BootOrder,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -485,7 +506,26 @@ pub fn commit_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), Os
     if verbose {
         println!("    Committing slot: {slot}");
     }
-    execute_slot_actions(actions, slot, pending.layout.as_ref())
+    commit_slot_actions(&SystemEfiHost, actions, slot, pending.layout.as_ref())
+}
+
+/// Run commit actions for `slot`. An efibootmgr action commits by moving the
+/// slot to the head of BootOrder; every other action runs as it would anywhere.
+fn commit_slot_actions(
+    host: &impl EfiBootHost,
+    actions: &[SlotAction],
+    slot: &str,
+    layout: Option<&BundleLayout>,
+) -> Result<(), OsUpdateError> {
+    for action in actions {
+        match action {
+            SlotAction::Efibootmgr { slot_entries } => {
+                apply_efibootmgr_action(host, slot_entries, EfiBootVariable::BootOrder, slot)?
+            }
+            other => execute_slot_action(other, slot, layout)?,
+        }
+    }
+    Ok(())
 }
 
 pub fn rollback_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), OsUpdateError> {
@@ -1717,54 +1757,151 @@ pub fn execute_slot_action_for(
             })?;
             write_mbr_partition_table(devpath, partition_names, layout)
         }
-        SlotAction::Efibootmgr { slot_entries } => {
-            let entry_label = slot_entries.get(slot).ok_or_else(|| {
+        SlotAction::Efibootmgr { slot_entries } => apply_efibootmgr_action(
+            &SystemEfiHost,
+            slot_entries,
+            EfiBootVariable::BootNext,
+            slot,
+        ),
+    }
+}
+
+/// The removable-media loader path, which is where Avocado's ESPs carry their
+/// bootloader, so an entry created for a slot boots the same binary the
+/// firmware's own fallback would.
+#[cfg(target_arch = "x86_64")]
+const EFI_REMOVABLE_LOADER: &str = "\\EFI\\BOOT\\BOOTX64.EFI";
+#[cfg(target_arch = "aarch64")]
+const EFI_REMOVABLE_LOADER: &str = "\\EFI\\BOOT\\BOOTAA64.EFI";
+#[cfg(target_arch = "riscv64")]
+const EFI_REMOVABLE_LOADER: &str = "\\EFI\\BOOT\\BOOTRISCV64.EFI";
+#[cfg(target_arch = "arm")]
+const EFI_REMOVABLE_LOADER: &str = "\\EFI\\BOOT\\BOOTARM.EFI";
+#[cfg(target_arch = "x86")]
+const EFI_REMOVABLE_LOADER: &str = "\\EFI\\BOOT\\BOOTIA32.EFI";
+
+/// What the efibootmgr slot action needs from the machine. A seam so the
+/// NVRAM writes it issues can be asserted without touching real firmware.
+trait EfiBootHost {
+    /// Run efibootmgr with `args`, returning its stdout.
+    fn efibootmgr(&self, args: &[&str]) -> Result<String, OsUpdateError>;
+    /// The whole-disk device and GPT partition number of the partition whose
+    /// GPT name is `label`.
+    fn locate_partition(&self, label: &str) -> Result<(String, u32), OsUpdateError>;
+}
+
+struct SystemEfiHost;
+
+impl EfiBootHost for SystemEfiHost {
+    fn efibootmgr(&self, args: &[&str]) -> Result<String, OsUpdateError> {
+        let shown = args.join(" ");
+        let output = ProcessCommand::new("efibootmgr")
+            .args(args)
+            .output()
+            .map_err(|e| {
+                OsUpdateError::ActivationFailed(format!("Failed to run efibootmgr {shown}: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(OsUpdateError::ActivationFailed(format!(
+                "efibootmgr {shown} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn locate_partition(&self, label: &str) -> Result<(String, u32), OsUpdateError> {
+        // Resolved through /dev/disk/by-partlabel exactly as the artifact
+        // writer resolves its targets, so the entry points at the partition
+        // the update actually wrote. With two disks carrying the same labels
+        // both follow udev's single symlink; neither can pick the other disk.
+        if !is_single_path_component(label) {
+            return Err(OsUpdateError::ActivationFailed(format!(
+                "EFI boot entry label '{label}' is not a partition name"
+            )));
+        }
+        let dev = resolve_partition(label).map_err(|_| {
+            OsUpdateError::ActivationFailed(format!(
+                "no partition labeled '{label}' to create an EFI boot entry for"
+            ))
+        })?;
+        let part = dev.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let (disk, number) =
+            partition_location(Path::new("/sys/class/block"), part).ok_or_else(|| {
                 OsUpdateError::ActivationFailed(format!(
-                    "No EFI boot entry label for slot '{slot}'"
+                    "cannot find the disk and partition number of {}",
+                    dev.display()
                 ))
             })?;
+        Ok((format!("/dev/{disk}"), number))
+    }
+}
 
-            // Find the boot entry number matching this label via efibootmgr -v
-            let output = ProcessCommand::new("efibootmgr")
-                .arg("-v")
-                .output()
-                .map_err(|e| {
-                    OsUpdateError::ActivationFailed(format!("Failed to run efibootmgr: {e}"))
-                })?;
-            if !output.status.success() {
-                return Err(OsUpdateError::ActivationFailed(format!(
-                    "efibootmgr -v failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
+/// Point the firmware at `slot`'s boot entry through `variable`, creating the
+/// entry first when NVRAM has none.
+///
+/// Firmware owns NVRAM and may wipe it (a setup-defaults reset, a CMOS clear),
+/// and nothing else re-creates Avocado's entries once the system is running,
+/// so an activation that required them to exist would fail on exactly the
+/// boards where recovery matters most. The entry label doubles as the GPT
+/// name of the slot's ESP, which is how the partition to point it at is found.
+fn apply_efibootmgr_action(
+    host: &impl EfiBootHost,
+    slot_entries: &HashMap<String, String>,
+    variable: EfiBootVariable,
+    slot: &str,
+) -> Result<(), OsUpdateError> {
+    let label = slot_entries.get(slot).ok_or_else(|| {
+        OsUpdateError::ActivationFailed(format!("No EFI boot entry label for slot '{slot}'"))
+    })?;
 
-            let efi_output = String::from_utf8_lossy(&output.stdout);
-            let boot_num = parse_efi_boot_num(&efi_output, entry_label).ok_or_else(|| {
+    let mut listing = host.efibootmgr(&["-v"])?;
+    let boot_num = match parse_efi_boot_num(&listing, label) {
+        Some(num) => num,
+        None => {
+            listing = create_efi_boot_entry(host, label)?;
+            parse_efi_boot_num(&listing, label).ok_or_else(|| {
                 OsUpdateError::ActivationFailed(format!(
-                    "No EFI boot entry found with label '{entry_label}'. \
-                     efibootmgr output:\n{efi_output}"
+                    "created EFI boot entry '{label}', but efibootmgr does not list it:\n{listing}"
                 ))
-            })?;
+            })?
+        }
+    };
 
-            // Set BootNext to boot the target slot on next reboot
-            let output = ProcessCommand::new("efibootmgr")
-                .args(["-n", &boot_num])
-                .output()
-                .map_err(|e| {
-                    OsUpdateError::ActivationFailed(format!(
-                        "Failed to run efibootmgr -n {boot_num}: {e}"
-                    ))
-                })?;
-            if !output.status.success() {
-                return Err(OsUpdateError::ActivationFailed(format!(
-                    "efibootmgr -n {boot_num} failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
+    match variable {
+        EfiBootVariable::BootNext => {
+            host.efibootmgr(&["-n", &boot_num])?;
+        }
+        EfiBootVariable::BootOrder => {
+            let order = parse_boot_order(&listing);
+            let promoted = promoted_boot_order(&order, &boot_num);
+            if promoted != order {
+                host.efibootmgr(&["-o", &promoted.join(",")])?;
             }
-
-            Ok(())
         }
     }
+    Ok(())
+}
+
+/// Create the boot entry `label` and return the fresh `efibootmgr -v` listing.
+///
+/// `-C` creates without touching BootOrder. `-c` would prepend the entry,
+/// making an unverified slot the permanent default the moment it is created.
+fn create_efi_boot_entry(host: &impl EfiBootHost, label: &str) -> Result<String, OsUpdateError> {
+    let (disk, partition) = host.locate_partition(label)?;
+    host.efibootmgr(&[
+        "-q",
+        "-C",
+        "-d",
+        &disk,
+        "-p",
+        &partition.to_string(),
+        "-L",
+        label,
+        "-l",
+        EFI_REMOVABLE_LOADER,
+    ])?;
+    host.efibootmgr(&["-v"])
 }
 
 /// Parse efibootmgr -v output to find the boot entry number for a given label.
@@ -1792,6 +1929,49 @@ fn parse_efi_boot_num(efibootmgr_output: &str, label: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The `BootOrder:` line of efibootmgr output, as entry numbers. Empty when
+/// the variable is unset.
+fn parse_boot_order(efibootmgr_output: &str) -> Vec<String> {
+    efibootmgr_output
+        .lines()
+        .find_map(|line| line.strip_prefix("BootOrder:"))
+        .map(|order| {
+            order
+                .split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `order` with `boot_num` first and every other entry kept in its place, so
+/// the firmware still has the old slot and its own entries to fall back to.
+fn promoted_boot_order(order: &[String], boot_num: &str) -> Vec<String> {
+    std::iter::once(boot_num.to_string())
+        .chain(order.iter().filter(|n| *n != boot_num).cloned())
+        .collect()
+}
+
+/// Whole-disk name and GPT partition number of the partition device `part`
+/// (e.g. `sda2` -> (`sda`, 2)), read from a sysfs block class directory.
+/// `<sysblock>/<part>` links into its disk's directory, so `..` is the disk.
+fn partition_location(sysblock: &Path, part: &str) -> Option<(String, u32)> {
+    let dir = sysblock.join(part);
+    let number = fs::read_to_string(dir.join("partition"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let disk = fs::canonicalize(dir.join(".."))
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .to_string();
+    Some((disk, number))
 }
 
 /// Patch the BLS entry on a boot partition to reference the correct rootfs slot.
@@ -3538,5 +3718,322 @@ PRETTY_NAME="Avocado Linux 2024.1"
         }"#;
         let artifact: Artifact = serde_json::from_str(json_no_size).unwrap();
         assert_eq!(artifact.size, None);
+    }
+
+    // --- efibootmgr slot action ---
+
+    const R8000_SLOTS: &str = include_str!("../tests/fixtures/efibootmgr/r8000-slots.txt");
+    const R8000_FIRMWARE_ONLY: &str =
+        include_str!("../tests/fixtures/efibootmgr/r8000-firmware-only.txt");
+    const R8000_AFTER_CREATE_ONLY_B: &str =
+        include_str!("../tests/fixtures/efibootmgr/r8000-after-create-only-boot-b.txt");
+
+    fn order(s: &str) -> Vec<String> {
+        s.split(',').map(str::to_string).collect()
+    }
+
+    fn slot_entries() -> HashMap<String, String> {
+        HashMap::from([
+            ("a".to_string(), "boot-a".to_string()),
+            ("b".to_string(), "boot-b".to_string()),
+        ])
+    }
+
+    /// Stands in for efibootmgr and the partition lookup. Each `-v` returns the
+    /// next scripted listing (the last one repeats); every call is recorded so
+    /// a test can assert exactly which NVRAM writes were issued. `fail_on`
+    /// makes every call carrying that flag fail.
+    struct FakeEfiHost {
+        listings: Vec<&'static str>,
+        partition: Result<(String, u32), String>,
+        fail_on: Option<&'static str>,
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl FakeEfiHost {
+        fn new(listings: Vec<&'static str>) -> Self {
+            Self {
+                listings,
+                partition: Ok(("/dev/sda".to_string(), 2)),
+                fail_on: None,
+                calls: Default::default(),
+                reads: Default::default(),
+            }
+        }
+
+        fn writes(&self) -> Vec<Vec<String>> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.as_slice() != ["-v"])
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl EfiBootHost for FakeEfiHost {
+        fn efibootmgr(&self, args: &[&str]) -> Result<String, OsUpdateError> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            if self.fail_on.is_some_and(|flag| args.contains(&flag)) {
+                return Err(OsUpdateError::ActivationFailed(format!(
+                    "efibootmgr {} failed: Read-only file system",
+                    args.join(" ")
+                )));
+            }
+            if args == ["-v"] {
+                let i = self.reads.get().min(self.listings.len() - 1);
+                self.reads.set(self.reads.get() + 1);
+                return Ok(self.listings[i].to_string());
+            }
+            Ok(String::new())
+        }
+
+        fn locate_partition(&self, _label: &str) -> Result<(String, u32), OsUpdateError> {
+            self.partition
+                .clone()
+                .map_err(OsUpdateError::ActivationFailed)
+        }
+    }
+
+    fn w(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn create_b() -> Vec<String> {
+        w(&[
+            "-q",
+            "-C",
+            "-d",
+            "/dev/sda",
+            "-p",
+            "2",
+            "-L",
+            "boot-b",
+            "-l",
+            EFI_REMOVABLE_LOADER,
+        ])
+    }
+
+    fn efibootmgr_commit() -> Vec<SlotAction> {
+        vec![SlotAction::Efibootmgr {
+            slot_entries: slot_entries(),
+        }]
+    }
+
+    #[test]
+    fn boot_order_is_read_from_the_r8000_listing() {
+        assert_eq!(parse_boot_order(R8000_SLOTS), order("0001,0000,0002"));
+    }
+
+    #[test]
+    fn a_listing_without_boot_order_yields_an_empty_order() {
+        assert!(parse_boot_order("BootCurrent: 0001\nBoot0001* boot-a\tHD()\n").is_empty());
+    }
+
+    #[test]
+    fn slot_labels_resolve_on_the_r8000_listing_despite_dp_lines() {
+        assert_eq!(
+            parse_efi_boot_num(R8000_SLOTS, "boot-b").as_deref(),
+            Some("0000")
+        );
+        assert_eq!(
+            parse_efi_boot_num(R8000_SLOTS, "boot-a").as_deref(),
+            Some("0001")
+        );
+        assert_eq!(parse_efi_boot_num(R8000_FIRMWARE_ONLY, "boot-a"), None);
+    }
+
+    #[test]
+    fn promoting_moves_the_entry_first_and_keeps_the_rest_in_order() {
+        assert_eq!(
+            promoted_boot_order(&order("0001,0000,0002"), "0000"),
+            order("0000,0001,0002")
+        );
+    }
+
+    #[test]
+    fn promoting_the_first_entry_changes_nothing() {
+        assert_eq!(
+            promoted_boot_order(&order("0000,0001,0002"), "0000"),
+            order("0000,0001,0002")
+        );
+    }
+
+    #[test]
+    fn promoting_an_entry_missing_from_boot_order_prepends_it() {
+        assert_eq!(
+            promoted_boot_order(&order("0001,0002"), "0000"),
+            order("0000,0001,0002")
+        );
+    }
+
+    #[test]
+    fn the_manifest_efibootmgr_action_keeps_its_existing_shape() {
+        let action: SlotAction = serde_json::from_str(
+            r#"{"type":"efibootmgr","slot_entries":{"a":"boot-a","b":"boot-b"}}"#,
+        )
+        .unwrap();
+        match action {
+            SlotAction::Efibootmgr { slot_entries: e } => assert_eq!(e, slot_entries()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_writes_only_boot_next_for_an_existing_entry() {
+        let host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b").unwrap();
+        assert_eq!(host.writes(), vec![w(&["-n", "0000"])]);
+    }
+
+    #[test]
+    fn commit_promotes_the_verified_slot_in_boot_order() {
+        let host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
+        assert_eq!(host.writes(), vec![w(&["-o", "0000,0001,0002"])]);
+    }
+
+    #[test]
+    fn commit_of_the_slot_already_first_writes_nothing() {
+        let host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        commit_slot_actions(&host, &efibootmgr_commit(), "a", None).unwrap();
+        assert!(host.writes().is_empty());
+    }
+
+    #[test]
+    fn a_missing_entry_is_created_outside_boot_order_and_tried_once() {
+        let host = FakeEfiHost::new(vec![R8000_FIRMWARE_ONLY, R8000_AFTER_CREATE_ONLY_B]);
+        apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b").unwrap();
+        assert_eq!(host.writes(), vec![create_b(), w(&["-n", "0000"])]);
+    }
+
+    #[test]
+    fn a_missing_entry_at_commit_is_created_and_put_first() {
+        let host = FakeEfiHost::new(vec![R8000_FIRMWARE_ONLY, R8000_AFTER_CREATE_ONLY_B]);
+        commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
+        assert_eq!(
+            host.writes(),
+            vec![create_b(), w(&["-o", "0000,0002,0003"])]
+        );
+    }
+
+    #[test]
+    fn commit_with_boot_order_unset_writes_just_the_slot() {
+        let host = FakeEfiHost::new(vec![
+            "BootCurrent: 0001\nBoot0001* boot-a\tHD(1,GPT,x)\n",
+            "BootCurrent: 0001\nBoot0000* boot-b\tHD(2,GPT,y)\nBoot0001* boot-a\tHD(1,GPT,x)\n",
+        ]);
+        commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
+        assert_eq!(host.writes(), vec![create_b(), w(&["-o", "0000"])]);
+    }
+
+    #[test]
+    fn a_slot_without_a_label_fails_before_touching_nvram() {
+        let host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        let err = apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "c")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            OsUpdateError::ActivationFailed("No EFI boot entry label for slot 'c'".into())
+                .to_string()
+        );
+        assert!(host.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_missing_entry_with_no_partition_fails_without_creating() {
+        let mut host = FakeEfiHost::new(vec![R8000_FIRMWARE_ONLY]);
+        host.partition = Err("no partition labeled 'boot-b'".to_string());
+        let err = apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b")
+            .unwrap_err();
+        assert!(err.to_string().contains("no partition labeled 'boot-b'"));
+        assert!(host.writes().is_empty());
+    }
+
+    #[test]
+    fn a_created_entry_that_never_appears_is_an_error_and_sets_nothing() {
+        let host = FakeEfiHost::new(vec![R8000_FIRMWARE_ONLY]);
+        let err = apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("created EFI boot entry 'boot-b', but efibootmgr does not list it"),
+            "{err}"
+        );
+        assert_eq!(host.writes(), vec![create_b()]);
+    }
+
+    #[test]
+    fn a_failed_create_stops_before_boot_next() {
+        let mut host = FakeEfiHost::new(vec![R8000_FIRMWARE_ONLY]);
+        host.fail_on = Some("-C");
+        let err = apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b")
+            .unwrap_err();
+        assert!(err.to_string().contains("Read-only file system"), "{err}");
+        assert_eq!(host.writes(), vec![create_b()]);
+    }
+
+    #[test]
+    fn a_failed_boot_next_write_is_reported() {
+        let mut host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        host.fail_on = Some("-n");
+        let err = apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("efibootmgr -n 0000 failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_failed_boot_order_write_fails_the_commit() {
+        let mut host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        host.fail_on = Some("-o");
+        let err = commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("efibootmgr -o 0000,0001,0002 failed"),
+            "{err}"
+        );
+    }
+
+    fn fake_sysblock(disk: &str, parts: &[(&str, u32)]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let disk_dir = tmp.path().join("devices").join(disk);
+        for (name, num) in parts {
+            let dir = disk_dir.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("partition"), format!("{num}\n")).unwrap();
+            std::os::unix::fs::symlink(&dir, tmp.path().join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink(&disk_dir, tmp.path().join(disk)).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn a_partition_resolves_to_its_disk_and_number() {
+        let sys = fake_sysblock("sda", &[("sda1", 1), ("sda2", 2)]);
+        assert_eq!(
+            partition_location(sys.path(), "sda2"),
+            Some(("sda".to_string(), 2))
+        );
+    }
+
+    #[test]
+    fn an_nvme_partition_resolves_to_the_namespace() {
+        let sys = fake_sysblock("nvme0n1", &[("nvme0n1p2", 2)]);
+        assert_eq!(
+            partition_location(sys.path(), "nvme0n1p2"),
+            Some(("nvme0n1".to_string(), 2))
+        );
+    }
+
+    #[test]
+    fn a_whole_disk_is_not_a_partition() {
+        let sys = fake_sysblock("sda", &[("sda1", 1)]);
+        assert_eq!(partition_location(sys.path(), "sda"), None);
     }
 }

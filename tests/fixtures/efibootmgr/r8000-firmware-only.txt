@@ -1,0 +1,5 @@
+BootCurrent: 0003
+Timeout: 1 seconds
+BootOrder: 0002,0003
+Boot0002* UEFI: PXE IPv4 Intel(R) Ethernet Controller I226-IT	PciRoot(0x0)/Pci(0x1,0x3)/Pci(0x0,0x0)/MAC(d063b407746c,1)/IPv4(0.0.0.0,0,DHCP,0.0.0.0,0.0.0.0,0.0.0.0)0000424f
+Boot0003* UEFI OS	HD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001,0x800,0x80000)/\EFI\BOOT\BOOTX64.EFI
