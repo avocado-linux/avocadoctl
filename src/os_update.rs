@@ -528,27 +528,37 @@ fn commit_slot_actions(
     Ok(())
 }
 
-pub fn rollback_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), OsUpdateError> {
-    let mut rollback_err = None;
-    if let Some(ref rollback_actions) = pending.rollback {
-        if verbose {
-            println!("    Rolling back to slot: {}", pending.previous_slot);
-        }
-        if let Err(e) = execute_slot_actions_for(
-            rollback_actions,
-            &pending.previous_slot,
-            pending.new_slot.as_deref(),
-            pending.layout.as_ref(),
-        ) {
-            rollback_err = Some(OsUpdateError::RollbackFailed(e.to_string()));
-        }
-    }
+/// Point the next boot back at the previous slot and clear the pending marker.
+///
+/// Returns `Ok(true)` when rollback actions ran and succeeded, i.e. the next
+/// boot now targets the previous slot, and `Ok(false)` when the update carried
+/// no rollback actions, so nothing changed. The caller reboots only on `true`:
+/// rebooting after `false` would come straight back up on the failed slot.
+pub fn rollback_os_update(pending: &PendingUpdate, verbose: bool) -> Result<bool, OsUpdateError> {
+    let moved = run_rollback_actions(pending, verbose);
     // Always clear pending marker to prevent boot loops
     clear_pending_update()?;
-    if let Some(e) = rollback_err {
-        return Err(e);
+    moved
+}
+
+fn run_rollback_actions(pending: &PendingUpdate, verbose: bool) -> Result<bool, OsUpdateError> {
+    let Some(rollback_actions) = pending.rollback.as_deref() else {
+        return Ok(false);
+    };
+    if rollback_actions.is_empty() {
+        return Ok(false);
     }
-    Ok(())
+    if verbose {
+        println!("    Rolling back to slot: {}", pending.previous_slot);
+    }
+    execute_slot_actions_for(
+        rollback_actions,
+        &pending.previous_slot,
+        pending.new_slot.as_deref(),
+        pending.layout.as_ref(),
+    )
+    .map_err(|e| OsUpdateError::RollbackFailed(e.to_string()))?;
+    Ok(true)
 }
 
 // --- Internal helpers ---
@@ -3345,6 +3355,54 @@ PRETTY_NAME="Avocado Linux 2024.1"
     fn test_pending_update_missing() {
         let path = Path::new("/nonexistent/pending-update.json");
         assert!(read_pending_update_from(path).is_none());
+    }
+
+    fn pending_with_rollback(rollback: Option<Vec<SlotAction>>) -> PendingUpdate {
+        PendingUpdate {
+            os_build_id: "build-123".to_string(),
+            initramfs_build_id: None,
+            verify: None,
+            verify_initramfs: None,
+            rollback,
+            commit: None,
+            new_slot: Some("b".to_string()),
+            previous_slot: "a".to_string(),
+            layout: None,
+            runtime_id: None,
+        }
+    }
+
+    fn command(argv: &[&str]) -> SlotAction {
+        SlotAction::Command {
+            command: argv.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn rollback_actions_that_succeed_report_the_boot_target_moved() {
+        let pending = pending_with_rollback(Some(vec![command(&["true"])]));
+        assert!(run_rollback_actions(&pending, false).unwrap());
+    }
+
+    #[test]
+    fn no_rollback_actions_report_nothing_moved() {
+        let pending = pending_with_rollback(None);
+        assert!(!run_rollback_actions(&pending, false).unwrap());
+    }
+
+    #[test]
+    fn empty_rollback_actions_report_nothing_moved() {
+        let pending = pending_with_rollback(Some(vec![]));
+        assert!(!run_rollback_actions(&pending, false).unwrap());
+    }
+
+    #[test]
+    fn a_failing_rollback_action_is_an_error_not_a_move() {
+        let pending = pending_with_rollback(Some(vec![command(&["false"])]));
+        assert!(matches!(
+            run_rollback_actions(&pending, false),
+            Err(OsUpdateError::RollbackFailed(_))
+        ));
     }
 
     #[test]
