@@ -1878,6 +1878,13 @@ fn apply_efibootmgr_action(
             if promoted != order {
                 host.efibootmgr(&["-o", &promoted.join(",")])?;
             }
+            // BootNext will boot an inactive entry for verification, but the
+            // ordinary BootOrder walk skips one whose LOAD_OPTION_ACTIVE bit
+            // is clear - so a commit that only reorders can leave the update
+            // unable to survive the next reboot on its own.
+            if !is_boot_entry_active(&listing, &boot_num) {
+                host.efibootmgr(&["-b", &boot_num, "-a"])?;
+            }
         }
     }
     Ok(())
@@ -1946,6 +1953,18 @@ fn parse_boot_order(efibootmgr_output: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether `boot_num`'s `LOAD_OPTION_ACTIVE` bit is set in `efibootmgr -v`
+/// output. efibootmgr marks the entry line with `*` right after the number
+/// when the bit is set, and a plain space when it is clear.
+fn is_boot_entry_active(efibootmgr_output: &str, boot_num: &str) -> bool {
+    let prefix = format!("Boot{boot_num}");
+    efibootmgr_output
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c == '*')
 }
 
 /// `order` with `boot_num` first and every other entry kept in its place, so
@@ -3847,6 +3866,25 @@ PRETTY_NAME="Avocado Linux 2024.1"
     }
 
     #[test]
+    fn active_entries_on_the_r8000_listing_report_active() {
+        assert!(is_boot_entry_active(R8000_SLOTS, "0000"));
+        assert!(is_boot_entry_active(R8000_SLOTS, "0001"));
+    }
+
+    #[test]
+    fn an_entry_with_no_asterisk_is_inactive() {
+        assert!(!is_boot_entry_active(
+            "BootCurrent: 0001\nBoot0000  boot-b\tHD(2,GPT,x)\n",
+            "0000"
+        ));
+    }
+
+    #[test]
+    fn a_boot_num_absent_from_the_listing_is_treated_as_inactive() {
+        assert!(!is_boot_entry_active(R8000_FIRMWARE_ONLY, "0000"));
+    }
+
+    #[test]
     fn promoting_moves_the_entry_first_and_keeps_the_rest_in_order() {
         assert_eq!(
             promoted_boot_order(&order("0001,0000,0002"), "0000"),
@@ -3901,6 +3939,49 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let host = FakeEfiHost::new(vec![R8000_SLOTS]);
         commit_slot_actions(&host, &efibootmgr_commit(), "a", None).unwrap();
         assert!(host.writes().is_empty());
+    }
+
+    #[test]
+    fn commit_activates_an_inactive_entry_already_first_in_boot_order() {
+        let host = FakeEfiHost::new(vec![concat!(
+            "BootCurrent: 0001\n",
+            "BootOrder: 0000,0001\n",
+            "Boot0000  boot-b\tHD(2,GPT,x)\n",
+            "Boot0001* boot-a\tHD(1,GPT,y)\n",
+        )]);
+        commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
+        assert_eq!(host.writes(), vec![w(&["-b", "0000", "-a"])]);
+    }
+
+    #[test]
+    fn commit_promotes_and_activates_an_inactive_entry() {
+        let host = FakeEfiHost::new(vec![concat!(
+            "BootCurrent: 0001\n",
+            "BootOrder: 0001,0000\n",
+            "Boot0000  boot-b\tHD(2,GPT,x)\n",
+            "Boot0001* boot-a\tHD(1,GPT,y)\n",
+        )]);
+        commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
+        assert_eq!(
+            host.writes(),
+            vec![w(&["-o", "0000,0001"]), w(&["-b", "0000", "-a"])]
+        );
+    }
+
+    #[test]
+    fn a_failed_activate_write_fails_the_commit() {
+        let mut host = FakeEfiHost::new(vec![concat!(
+            "BootCurrent: 0001\n",
+            "BootOrder: 0000,0001\n",
+            "Boot0000  boot-b\tHD(2,GPT,x)\n",
+            "Boot0001* boot-a\tHD(1,GPT,y)\n",
+        )]);
+        host.fail_on = Some("-a");
+        let err = commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap_err();
+        assert!(
+            err.to_string().contains("efibootmgr -b 0000 -a failed"),
+            "{err}"
+        );
     }
 
     #[test]
