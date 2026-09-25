@@ -380,6 +380,7 @@ pub(crate) fn merge_extensions_internal(
     let base_path = Path::new(&base_dir);
     if let Some(pending) = crate::os_update::read_pending_update() {
         let mut verified = true;
+        let mut rolled_back = false;
 
         // Verify rootfs os-release (/sysroot/etc/os-release when in initrd)
         if let Some(ref verify) = pending.verify {
@@ -483,8 +484,9 @@ pub(crate) fn merge_extensions_internal(
         } else {
             output.error("OS Update", "Pending update verification failed");
             // Rollback boot slot to previous OS
-            if let Err(e) = crate::os_update::rollback_os_update(&pending, false) {
-                output.error("OS Update", &format!("Rollback failed: {e}"));
+            match crate::os_update::rollback_os_update(&pending, false) {
+                Ok(moved) => rolled_back = moved,
+                Err(e) => output.error("OS Update", &format!("Rollback failed: {e}")),
             }
             if pending.runtime_id.is_some() {
                 output.step(
@@ -495,6 +497,19 @@ pub(crate) fn merge_extensions_internal(
         }
         // Always clear pending marker to avoid re-checking on subsequent boots
         crate::os_update::clear_pending_update().ok();
+
+        // The next boot now targets the previous slot, but this boot is still
+        // the failed one: without a reboot it stays up, running the image that
+        // just failed verification, until something else restarts it. Reboot
+        // now, before its extensions are merged. Only after a rollback that
+        // moved the boot target - otherwise the reboot returns to this slot.
+        if rolled_back {
+            output.step("OS Update", "Rebooting into the previous slot");
+            if std::env::var("AVOCADO_TEST_MODE").is_err() {
+                let _ = std::process::Command::new("reboot").status();
+            }
+            return Ok(());
+        }
     }
 
     // Verify rootfs matches what the active runtime expects.
