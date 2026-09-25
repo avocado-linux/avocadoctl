@@ -3,10 +3,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::manifest::DEFAULT_AVOCADO_DIR;
@@ -1790,14 +1791,77 @@ const EFI_REMOVABLE_LOADER: &str = "\\EFI\\BOOT\\BOOTARM.EFI";
 #[cfg(target_arch = "x86")]
 const EFI_REMOVABLE_LOADER: &str = "\\EFI\\BOOT\\BOOTIA32.EFI";
 
+/// A slot's ESP on the disk this system booted from.
+#[derive(Debug, Clone, PartialEq)]
+struct SlotPartition {
+    /// Whole-disk device, e.g. `/dev/sda`.
+    disk: String,
+    /// GPT partition number.
+    number: u32,
+    /// Lower-case PARTUUID, as efibootmgr's HD() device path carries it.
+    partuuid: String,
+}
+
 /// What the efibootmgr slot action needs from the machine. A seam so the
 /// NVRAM writes it issues can be asserted without touching real firmware.
 trait EfiBootHost {
     /// Run efibootmgr with `args`, returning its stdout.
     fn efibootmgr(&self, args: &[&str]) -> Result<String, OsUpdateError>;
-    /// The whole-disk device and GPT partition number of the partition whose
-    /// GPT name is `label`.
-    fn locate_partition(&self, label: &str) -> Result<(String, u32), OsUpdateError>;
+    /// The partition whose GPT name is `label` on the booted disk.
+    fn locate_partition(&self, label: &str) -> Result<SlotPartition, OsUpdateError>;
+    /// Exclusive hold on the Boot#### variables for one read-modify-write.
+    fn lock_nvram(&self) -> Result<NvramLock, OsUpdateError>;
+}
+
+/// Lock file under /run/avocado shared with meta-avocado's
+/// avocado-efi-slot-entries, which repairs the slot entries at boot. Both
+/// list NVRAM and write from that listing, so without one lock an activation
+/// racing the repair acts on an entry number the repair is deleting.
+const EFI_NVRAM_LOCK_NAME: &str = "efi-nvram.lock";
+
+/// How long to wait for the NVRAM lock before going ahead without it. Holders
+/// keep it for a few efibootmgr calls; a holder stuck far longer than that is
+/// wedged, and waiting on it would stall a rollback in the initrd.
+const EFI_NVRAM_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An `flock` on the NVRAM lock file, released when dropped or when the
+/// process dies.
+struct NvramLock(#[allow(dead_code)] fs::File);
+
+impl NvramLock {
+    fn acquire_at(path: &Path, timeout: Duration) -> Result<Self, OsUpdateError> {
+        // 0600 and no symlink following: anyone who can open the file can
+        // flock it, and the directory is under /run.
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| {
+                OsUpdateError::ActivationFailed(format!("cannot open lock {}: {e}", path.display()))
+            })?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(NvramLock(file));
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EWOULDBLOCK) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                Some(libc::EINTR) => {}
+                _ => {
+                    return Err(OsUpdateError::ActivationFailed(format!(
+                        "cannot lock {}: {err}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
 }
 
 struct SystemEfiHost;
@@ -1820,30 +1884,21 @@ impl EfiBootHost for SystemEfiHost {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    fn locate_partition(&self, label: &str) -> Result<(String, u32), OsUpdateError> {
-        // Resolved through /dev/disk/by-partlabel exactly as the artifact
-        // writer resolves its targets, so the entry points at the partition
-        // the update actually wrote. With two disks carrying the same labels
-        // both follow udev's single symlink; neither can pick the other disk.
-        if !is_single_path_component(label) {
-            return Err(OsUpdateError::ActivationFailed(format!(
-                "EFI boot entry label '{label}' is not a partition name"
-            )));
-        }
-        let dev = resolve_partition(label).map_err(|_| {
-            OsUpdateError::ActivationFailed(format!(
-                "no partition labeled '{label}' to create an EFI boot entry for"
-            ))
+    fn locate_partition(&self, label: &str) -> Result<SlotPartition, OsUpdateError> {
+        // The booted disk comes from the ESP systemd-boot was loaded from, not
+        // from /dev/disk/by-partlabel: udev points that single link at
+        // whichever disk carrying the label it saw last, which can be a USB
+        // stick flashed with any Avocado image.
+        let booted = read_loader_device_part_uuid().map_err(|e| {
+            OsUpdateError::ActivationFailed(format!("the booted disk is unknown: {e}"))
         })?;
-        let part = dev.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        let (disk, number) =
-            partition_location(Path::new("/sys/class/block"), part).ok_or_else(|| {
-                OsUpdateError::ActivationFailed(format!(
-                    "cannot find the disk and partition number of {}",
-                    dev.display()
-                ))
-            })?;
-        Ok((format!("/dev/{disk}"), number))
+        slot_partition_on_booted_disk(Path::new("/sys/class/block"), &booted, label)
+            .map_err(OsUpdateError::ActivationFailed)
+    }
+
+    fn lock_nvram(&self) -> Result<NvramLock, OsUpdateError> {
+        let dir = run_avocado_dir().map_err(|e| OsUpdateError::ActivationFailed(e.to_string()))?;
+        NvramLock::acquire_at(&dir.join(EFI_NVRAM_LOCK_NAME), EFI_NVRAM_LOCK_TIMEOUT)
     }
 }
 
@@ -1855,6 +1910,17 @@ impl EfiBootHost for SystemEfiHost {
 /// so an activation that required them to exist would fail on exactly the
 /// boards where recovery matters most. The entry label doubles as the GPT
 /// name of the slot's ESP, which is how the partition to point it at is found.
+///
+/// An entry counts only when its device path names that partition. A label
+/// alone can belong to a stale entry, or to one for a same-named partition on
+/// another disk, and the initrd runs verify/commit/rollback before the boot
+/// oneshot has removed those.
+///
+/// When the partition cannot be found - no LoaderDevicePartUUID, a kernel
+/// before 6.13 that publishes no PARTUUID in its uevents, a cloned disk -
+/// an entry is still matched by label alone, as before, and none is created.
+/// Failing instead would turn a rollback in the initrd into a failed image
+/// left running, which is worse than the stale-entry risk.
 fn apply_efibootmgr_action(
     host: &impl EfiBootHost,
     slot_entries: &HashMap<String, String>,
@@ -1865,17 +1931,30 @@ fn apply_efibootmgr_action(
         OsUpdateError::ActivationFailed(format!("No EFI boot entry label for slot '{slot}'"))
     })?;
 
+    // Also not fatal: a wedged holder must not block a rollback.
+    let _lock = host
+        .lock_nvram()
+        .inspect_err(|e| eprintln!("Warning: editing EFI boot entries unlocked: {e}"))
+        .ok();
+    let part = host.locate_partition(label);
     let mut listing = host.efibootmgr(&["-v"])?;
-    let boot_num = match parse_efi_boot_num(&listing, label) {
-        Some(num) => num,
-        None => {
-            listing = create_efi_boot_entry(host, label)?;
-            parse_efi_boot_num(&listing, label).ok_or_else(|| {
+    let partuuid = part.as_ref().ok().map(|p| p.partuuid.clone());
+    let found = parse_efi_boot_num(&listing, label, partuuid.as_deref());
+    let boot_num = match (found, part) {
+        (Some(num), Ok(_)) => num,
+        (Some(num), Err(e)) => {
+            eprintln!("Warning: EFI boot entry '{label}' matched by label only: {e}");
+            num
+        }
+        (None, Ok(part)) => {
+            listing = create_efi_boot_entry(host, label, &part)?;
+            parse_efi_boot_num(&listing, label, partuuid.as_deref()).ok_or_else(|| {
                 OsUpdateError::ActivationFailed(format!(
                     "created EFI boot entry '{label}', but efibootmgr does not list it:\n{listing}"
                 ))
             })?
         }
+        (None, Err(e)) => return Err(e),
     };
 
     match variable {
@@ -1904,15 +1983,18 @@ fn apply_efibootmgr_action(
 ///
 /// `-C` creates without touching BootOrder. `-c` would prepend the entry,
 /// making an unverified slot the permanent default the moment it is created.
-fn create_efi_boot_entry(host: &impl EfiBootHost, label: &str) -> Result<String, OsUpdateError> {
-    let (disk, partition) = host.locate_partition(label)?;
+fn create_efi_boot_entry(
+    host: &impl EfiBootHost,
+    label: &str,
+    part: &SlotPartition,
+) -> Result<String, OsUpdateError> {
     host.efibootmgr(&[
         "-q",
         "-C",
         "-d",
-        &disk,
+        &part.disk,
         "-p",
-        &partition.to_string(),
+        &part.number.to_string(),
         "-L",
         label,
         "-l",
@@ -1921,10 +2003,24 @@ fn create_efi_boot_entry(host: &impl EfiBootHost, label: &str) -> Result<String,
     host.efibootmgr(&["-v"])
 }
 
-/// Parse efibootmgr -v output to find the boot entry number for a given label.
+/// Parse efibootmgr -v output for the entry labelled `label` whose HD() device
+/// path names the partition `partuuid`, or by label alone when that is `None`.
 /// Lines look like: "Boot0001* boot-a\tHD(1,GPT,<uuid>,...)/File(\EFI\BOOT\BOOTX64.EFI)"
 /// Returns the 4-digit hex number (e.g. "0001").
-fn parse_efi_boot_num(efibootmgr_output: &str, label: &str) -> Option<String> {
+fn parse_efi_boot_num(
+    efibootmgr_output: &str,
+    label: &str,
+    partuuid: Option<&str>,
+) -> Option<String> {
+    let names_partition = |line: &str| match partuuid {
+        None => true,
+        Some(uuid) => {
+            let line = line.to_ascii_lowercase();
+            let field = format!(",gpt,{},", uuid.to_ascii_lowercase());
+            let last = format!(",gpt,{})", uuid.to_ascii_lowercase());
+            line.contains(&field) || line.contains(&last)
+        }
+    };
     for line in efibootmgr_output.lines() {
         // Match lines like "Boot0001* boot-a" or "Boot0001  boot-a"
         if let Some(rest) = line.strip_prefix("Boot") {
@@ -1940,7 +2036,7 @@ fn parse_efi_boot_num(efibootmgr_output: &str, label: &str) -> Option<String> {
                 .trim_start();
             // The description may contain a tab before the device path
             let desc_label = description.split('\t').next().unwrap_or(description).trim();
-            if desc_label == label {
+            if desc_label == label && names_partition(line) {
                 return Some(num.to_string());
             }
         }
@@ -2001,6 +2097,75 @@ fn partition_location(sysblock: &Path, part: &str) -> Option<(String, u32)> {
         .to_str()?
         .to_string();
     Some((disk, number))
+}
+
+/// `key`'s value in the uevent file of `<sysblock>/<dev>`, which is where the
+/// kernel publishes a partition's PARTNAME and (since 6.13) PARTUUID.
+fn uevent_value(dir: &Path, key: &str) -> Option<String> {
+    fs::read_to_string(dir.join("uevent"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
+}
+
+/// The entries of `dir` whose uevent `key` satisfies `matches`, sorted.
+fn devices_where(dir: &Path, key: &str, matches: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| uevent_value(&e.path(), key).is_some_and(|v| matches(&v)))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The one partition carrying `partuuid`, read from each device's uevent
+/// rather than /dev/disk/by-partuuid, which names only one of several. More
+/// than one means a disk flashed from the same image is attached; neither
+/// firmware's HD() path nor udev can tell the copies apart, so nothing may be
+/// pointed at either.
+fn unique_partition_with_partuuid(sysblock: &Path, partuuid: &str) -> Result<String, String> {
+    let mut parts = devices_where(sysblock, "PARTUUID", |u| u.eq_ignore_ascii_case(partuuid));
+    match parts.len() {
+        0 => Err(format!("no partition carries PARTUUID {partuuid}")),
+        1 => Ok(parts.remove(0)),
+        _ => Err(format!(
+            "PARTUUID {partuuid} is carried by more than one partition ({}): a disk cloned \
+             from this image is attached; detach it",
+            parts.join(", ")
+        )),
+    }
+}
+
+/// The partition whose GPT name is `label` on the disk holding the booted ESP
+/// `booted_esp`, the way meta-avocado's avocado-efi-slot-entries finds it.
+fn slot_partition_on_booted_disk(
+    sysblock: &Path,
+    booted_esp: &str,
+    label: &str,
+) -> Result<SlotPartition, String> {
+    let esp = unique_partition_with_partuuid(sysblock, booted_esp)?;
+    let (disk, _) = partition_location(sysblock, &esp)
+        .ok_or_else(|| format!("cannot find the disk holding the booted ESP {esp}"))?;
+    let part = devices_where(&sysblock.join(&disk), "PARTNAME", |n| n == label)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no partition labeled '{label}' on /dev/{disk}"))?;
+    let partuuid = uevent_value(&sysblock.join(&part), "PARTUUID")
+        .filter(|u| u.len() == 36)
+        .ok_or_else(|| format!("{part} has no PARTUUID"))?
+        .to_ascii_lowercase();
+    // A second disk carrying just this partition's copy is refused too.
+    unique_partition_with_partuuid(sysblock, &partuuid)?;
+    let (_, number) = partition_location(sysblock, &part)
+        .ok_or_else(|| format!("cannot find the partition number of {part}"))?;
+    Ok(SlotPartition {
+        disk: format!("/dev/{disk}"),
+        number,
+        partuuid,
+    })
 }
 
 /// Patch the BLS entry on a boot partition to reference the correct rootfs slot.
@@ -3816,14 +3981,36 @@ PRETTY_NAME="Avocado Linux 2024.1"
         ])
     }
 
-    /// Stands in for efibootmgr and the partition lookup. Each `-v` returns the
-    /// next scripted listing (the last one repeats); every call is recorded so
-    /// a test can assert exactly which NVRAM writes were issued. `fail_on`
-    /// makes every call carrying that flag fail.
+    /// PARTUUIDs of the R8000's two ESPs, as the fixtures' HD() paths carry them.
+    const A_UUID: &str = "a2e0a8c1-0003-4b01-a000-000000000001";
+    const B_UUID: &str = "a2e0a8c1-0003-4b01-b000-000000000001";
+    /// Marker the fake records when the NVRAM lock is taken.
+    const LOCK: &str = "<nvram-lock>";
+    /// Prefix the fake puts on an efibootmgr call made without the lock.
+    const UNLOCKED: &str = "<unlocked>";
+
+    fn slot_partition(number: u32, partuuid: &str) -> SlotPartition {
+        SlotPartition {
+            disk: "/dev/sda".to_string(),
+            number,
+            partuuid: partuuid.to_string(),
+        }
+    }
+
+    /// Stands in for efibootmgr, the partition lookup and the NVRAM lock. Each
+    /// `-v` returns the next scripted listing (the last one repeats); every
+    /// call is recorded so a test can assert exactly which NVRAM writes were
+    /// issued. `fail_on` makes every call carrying that flag fail.
+    ///
+    /// The lock is a real `NvramLock` on a scratch file, and every efibootmgr
+    /// call made while it is not held is recorded with an `UNLOCKED` prefix,
+    /// so every test's expected call list also asserts the lock spans them.
     struct FakeEfiHost {
         listings: Vec<&'static str>,
-        partition: Result<(String, u32), String>,
+        partitions: HashMap<&'static str, Result<SlotPartition, String>>,
         fail_on: Option<&'static str>,
+        lock_fails: bool,
+        lock_dir: TempDir,
         calls: std::cell::RefCell<Vec<Vec<String>>>,
         reads: std::cell::Cell<usize>,
     }
@@ -3832,18 +4019,36 @@ PRETTY_NAME="Avocado Linux 2024.1"
         fn new(listings: Vec<&'static str>) -> Self {
             Self {
                 listings,
-                partition: Ok(("/dev/sda".to_string(), 2)),
+                partitions: HashMap::from([
+                    ("boot-a", Ok(slot_partition(1, A_UUID))),
+                    ("boot-b", Ok(slot_partition(2, B_UUID))),
+                ]),
                 fail_on: None,
+                lock_fails: false,
+                lock_dir: TempDir::new().unwrap(),
                 calls: Default::default(),
                 reads: Default::default(),
             }
+        }
+
+        fn lock_path(&self) -> PathBuf {
+            self.lock_dir.path().join(EFI_NVRAM_LOCK_NAME)
+        }
+
+        /// Whether another open of the lock file is refused an flock now.
+        fn lock_is_held(&self) -> bool {
+            let Ok(probe) = fs::OpenOptions::new().read(true).open(self.lock_path()) else {
+                return false;
+            };
+            let rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            rc != 0
         }
 
         fn writes(&self) -> Vec<Vec<String>> {
             self.calls
                 .borrow()
                 .iter()
-                .filter(|c| c.as_slice() != ["-v"])
+                .filter(|c| c.as_slice() != ["-v"] && c.as_slice() != [LOCK])
                 .cloned()
                 .collect()
         }
@@ -3851,9 +4056,11 @@ PRETTY_NAME="Avocado Linux 2024.1"
 
     impl EfiBootHost for FakeEfiHost {
         fn efibootmgr(&self, args: &[&str]) -> Result<String, OsUpdateError> {
-            self.calls
-                .borrow_mut()
-                .push(args.iter().map(|s| s.to_string()).collect());
+            let mut call: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            if !self.lock_fails && !self.lock_is_held() {
+                call.insert(0, UNLOCKED.to_string());
+            }
+            self.calls.borrow_mut().push(call);
             if self.fail_on.is_some_and(|flag| args.contains(&flag)) {
                 return Err(OsUpdateError::ActivationFailed(format!(
                     "efibootmgr {} failed: Read-only file system",
@@ -3868,10 +4075,20 @@ PRETTY_NAME="Avocado Linux 2024.1"
             Ok(String::new())
         }
 
-        fn locate_partition(&self, _label: &str) -> Result<(String, u32), OsUpdateError> {
-            self.partition
-                .clone()
+        fn locate_partition(&self, label: &str) -> Result<SlotPartition, OsUpdateError> {
+            self.partitions
+                .get(label)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no partition labeled '{label}'")))
                 .map_err(OsUpdateError::ActivationFailed)
+        }
+
+        fn lock_nvram(&self) -> Result<NvramLock, OsUpdateError> {
+            self.calls.borrow_mut().push(vec![LOCK.to_string()]);
+            if self.lock_fails {
+                return Err(OsUpdateError::ActivationFailed("lock wedged".into()));
+            }
+            NvramLock::acquire_at(&self.lock_path(), Duration::from_secs(1))
         }
     }
 
@@ -3913,14 +4130,203 @@ PRETTY_NAME="Avocado Linux 2024.1"
     #[test]
     fn slot_labels_resolve_on_the_r8000_listing_despite_dp_lines() {
         assert_eq!(
-            parse_efi_boot_num(R8000_SLOTS, "boot-b").as_deref(),
+            parse_efi_boot_num(R8000_SLOTS, "boot-b", Some(B_UUID)).as_deref(),
             Some("0000")
         );
         assert_eq!(
-            parse_efi_boot_num(R8000_SLOTS, "boot-a").as_deref(),
+            parse_efi_boot_num(R8000_SLOTS, "boot-a", Some(A_UUID)).as_deref(),
             Some("0001")
         );
-        assert_eq!(parse_efi_boot_num(R8000_FIRMWARE_ONLY, "boot-a"), None);
+        assert_eq!(
+            parse_efi_boot_num(R8000_FIRMWARE_ONLY, "boot-a", Some(A_UUID)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_label_pointing_at_another_partition_is_not_the_slot_entry() {
+        assert_eq!(
+            parse_efi_boot_num(R8000_SLOTS, "boot-b", Some(A_UUID)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_partition_pointing_entry_under_another_label_is_not_the_slot_entry() {
+        // The firmware's own `UEFI OS` entry points at boot-a's ESP.
+        assert_eq!(
+            parse_efi_boot_num(R8000_FIRMWARE_ONLY, "boot-a", Some(A_UUID)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_partuuid_matches_whatever_case_efibootmgr_prints() {
+        assert_eq!(
+            parse_efi_boot_num(R8000_SLOTS, "boot-b", Some(&B_UUID.to_uppercase())).as_deref(),
+            Some("0000")
+        );
+    }
+
+    /// Two `boot-b` entries, the first pointing at the same-named partition on
+    /// another disk (a USB stick flashed from a different image).
+    const STALE_B_FIRST: &str = concat!(
+        "BootCurrent: 0001\n",
+        "BootOrder: 0001,0003,0000\n",
+        "Boot0003* boot-b\tHD(2,GPT,5f0c7e11-9d2a-4c55-8f00-00000000beef,0x80800,0x80000)/\\EFI\\BOOT\\BOOTX64.EFI\n",
+        "Boot0000* boot-b\tHD(2,GPT,a2e0a8c1-0003-4b01-b000-000000000001,0x80800,0x80000)/\\EFI\\BOOT\\BOOTX64.EFI\n",
+        "Boot0001* boot-a\tHD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001,0x800,0x80000)/\\EFI\\BOOT\\BOOTX64.EFI\n",
+    );
+
+    #[test]
+    fn activation_sets_boot_next_to_the_entry_on_the_booted_disk_not_the_first_label() {
+        let host = FakeEfiHost::new(vec![STALE_B_FIRST]);
+        apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b").unwrap();
+        assert_eq!(host.writes(), vec![w(&["-n", "0000"])]);
+    }
+
+    #[test]
+    fn commit_promotes_the_entry_on_the_booted_disk_not_the_first_label() {
+        let host = FakeEfiHost::new(vec![STALE_B_FIRST]);
+        commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
+        assert_eq!(host.writes(), vec![w(&["-o", "0000,0001,0003"])]);
+    }
+
+    #[test]
+    fn only_a_stale_label_means_the_slot_entry_is_created() {
+        let only_stale: &'static str = concat!(
+            "BootCurrent: 0001\n",
+            "BootOrder: 0001,0003\n",
+            "Boot0003* boot-b\tHD(2,GPT,5f0c7e11-9d2a-4c55-8f00-00000000beef,0x80800,0x80000)/\\EFI\\BOOT\\BOOTX64.EFI\n",
+            "Boot0001* boot-a\tHD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001,0x800,0x80000)/\\EFI\\BOOT\\BOOTX64.EFI\n",
+        );
+        let host = FakeEfiHost::new(vec![only_stale, STALE_B_FIRST]);
+        apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b").unwrap();
+        assert_eq!(host.writes(), vec![create_b(), w(&["-n", "0000"])]);
+    }
+
+    #[test]
+    fn the_nvram_lock_is_taken_before_the_first_listing() {
+        let host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b").unwrap();
+        assert_eq!(
+            *host.calls.borrow(),
+            vec![w(&[LOCK]), w(&["-v"]), w(&["-n", "0000"])]
+        );
+    }
+
+    #[test]
+    fn a_wedged_lock_does_not_stop_the_action() {
+        let mut host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        host.lock_fails = true;
+        apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b").unwrap();
+        assert_eq!(host.writes(), vec![w(&["-n", "0000"])]);
+    }
+
+    #[test]
+    fn a_held_nvram_lock_excludes_a_second_holder_until_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(EFI_NVRAM_LOCK_NAME);
+        let held = NvramLock::acquire_at(&path, Duration::from_secs(1)).unwrap();
+        let other = fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let try_lock = || unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(
+            try_lock(),
+            -1,
+            "a second holder got the lock while it was held"
+        );
+        drop(held);
+        // A test running in parallel may fork between our open and its exec,
+        // and its child shares the lock's open file description until exec
+        // closes it (O_CLOEXEC), so the release can trail the drop briefly.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while try_lock() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(try_lock(), 0, "the lock was not released on drop");
+    }
+
+    #[test]
+    fn a_lock_held_elsewhere_times_out_instead_of_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(EFI_NVRAM_LOCK_NAME);
+        let _held = NvramLock::acquire_at(&path, Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        let err = NvramLock::acquire_at(&path, Duration::from_millis(300))
+            .err()
+            .expect("a second acquire succeeded while the lock was held");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("cannot lock"), "{err}");
+    }
+
+    #[test]
+    fn the_lock_file_is_created_owner_only() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(EFI_NVRAM_LOCK_NAME);
+        let _held = NvramLock::acquire_at(&path, Duration::from_secs(1)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn the_lock_refuses_to_follow_a_planted_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("victim");
+        let path = tmp.path().join(EFI_NVRAM_LOCK_NAME);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(NvramLock::acquire_at(&path, Duration::from_secs(1)).is_err());
+        assert!(!target.exists(), "the lock created the symlink's target");
+    }
+
+    #[test]
+    fn an_unlocatable_partition_falls_back_to_the_label_for_an_existing_entry() {
+        // No LoaderDevicePartUUID, or a kernel with no PARTUUID in its
+        // uevents: a rollback must still reach the previous slot.
+        let mut host = FakeEfiHost::new(vec![R8000_SLOTS]);
+        host.partitions
+            .insert("boot-a", Err("the booted disk is unknown".to_string()));
+        apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "a").unwrap();
+        assert_eq!(host.writes(), vec![w(&["-n", "0001"])]);
+    }
+
+    #[test]
+    fn an_unlocatable_partition_with_no_entry_fails_without_creating() {
+        let mut host = FakeEfiHost::new(vec![R8000_FIRMWARE_ONLY]);
+        host.partitions
+            .insert("boot-a", Err("the booted disk is unknown".to_string()));
+        let err = apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "a")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("the booted disk is unknown"),
+            "{err}"
+        );
+        assert!(host.writes().is_empty());
+    }
+
+    #[test]
+    fn an_uppercase_guid_in_the_listing_still_matches() {
+        let upper: &'static str = concat!(
+            "BootCurrent: 0001\n",
+            "BootOrder: 0001,0000\n",
+            "Boot0000* boot-b\tHD(2,GPT,A2E0A8C1-0003-4B01-B000-000000000001,0x80800,0x80000)/\\EFI\\BOOT\\BOOTX64.EFI\n",
+        );
+        assert_eq!(
+            parse_efi_boot_num(upper, "boot-b", Some(B_UUID)).as_deref(),
+            Some("0000")
+        );
+    }
+
+    #[test]
+    fn a_partuuid_outside_the_hd_guid_field_does_not_match() {
+        // The GUID appears only in the optional data, not as HD()'s signature.
+        let elsewhere: &'static str = concat!(
+            "BootCurrent: 0001\n",
+            "Boot0003* boot-b\tHD(2,GPT,5f0c7e11-9d2a-4c55-8f00-00000000beef,0x80800,0x80000)/\\EFI\\BOOT\\BOOTX64.EFIa2e0a8c1-0003-4b01-b000-000000000001\n",
+        );
+        assert_eq!(parse_efi_boot_num(elsewhere, "boot-b", Some(B_UUID)), None);
     }
 
     #[test]
@@ -3932,7 +4338,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
     #[test]
     fn an_entry_with_no_asterisk_is_inactive() {
         assert!(!is_boot_entry_active(
-            "BootCurrent: 0001\nBoot0000  boot-b\tHD(2,GPT,x)\n",
+            "BootCurrent: 0001\nBoot0000  boot-b\tHD(2,GPT,a2e0a8c1-0003-4b01-b000-000000000001)\n",
             "0000"
         ));
     }
@@ -4004,8 +4410,8 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let host = FakeEfiHost::new(vec![concat!(
             "BootCurrent: 0001\n",
             "BootOrder: 0000,0001\n",
-            "Boot0000  boot-b\tHD(2,GPT,x)\n",
-            "Boot0001* boot-a\tHD(1,GPT,y)\n",
+            "Boot0000  boot-b\tHD(2,GPT,a2e0a8c1-0003-4b01-b000-000000000001)\n",
+            "Boot0001* boot-a\tHD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001)\n",
         )]);
         commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
         assert_eq!(host.writes(), vec![w(&["-b", "0000", "-a"])]);
@@ -4016,8 +4422,8 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let host = FakeEfiHost::new(vec![concat!(
             "BootCurrent: 0001\n",
             "BootOrder: 0001,0000\n",
-            "Boot0000  boot-b\tHD(2,GPT,x)\n",
-            "Boot0001* boot-a\tHD(1,GPT,y)\n",
+            "Boot0000  boot-b\tHD(2,GPT,a2e0a8c1-0003-4b01-b000-000000000001)\n",
+            "Boot0001* boot-a\tHD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001)\n",
         )]);
         commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
         assert_eq!(
@@ -4031,8 +4437,8 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let mut host = FakeEfiHost::new(vec![concat!(
             "BootCurrent: 0001\n",
             "BootOrder: 0000,0001\n",
-            "Boot0000  boot-b\tHD(2,GPT,x)\n",
-            "Boot0001* boot-a\tHD(1,GPT,y)\n",
+            "Boot0000  boot-b\tHD(2,GPT,a2e0a8c1-0003-4b01-b000-000000000001)\n",
+            "Boot0001* boot-a\tHD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001)\n",
         )]);
         host.fail_on = Some("-a");
         let err = commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap_err();
@@ -4062,8 +4468,8 @@ PRETTY_NAME="Avocado Linux 2024.1"
     #[test]
     fn commit_with_boot_order_unset_writes_just_the_slot() {
         let host = FakeEfiHost::new(vec![
-            "BootCurrent: 0001\nBoot0001* boot-a\tHD(1,GPT,x)\n",
-            "BootCurrent: 0001\nBoot0000* boot-b\tHD(2,GPT,y)\nBoot0001* boot-a\tHD(1,GPT,x)\n",
+            "BootCurrent: 0001\nBoot0001* boot-a\tHD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001)\n",
+            "BootCurrent: 0001\nBoot0000* boot-b\tHD(2,GPT,a2e0a8c1-0003-4b01-b000-000000000001)\nBoot0001* boot-a\tHD(1,GPT,a2e0a8c1-0003-4b01-a000-000000000001)\n",
         ]);
         commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
         assert_eq!(host.writes(), vec![create_b(), w(&["-o", "0000"])]);
@@ -4085,7 +4491,8 @@ PRETTY_NAME="Avocado Linux 2024.1"
     #[test]
     fn a_missing_entry_with_no_partition_fails_without_creating() {
         let mut host = FakeEfiHost::new(vec![R8000_FIRMWARE_ONLY]);
-        host.partition = Err("no partition labeled 'boot-b'".to_string());
+        host.partitions
+            .insert("boot-b", Err("no partition labeled 'boot-b'".to_string()));
         let err = apply_efibootmgr_action(&host, &slot_entries(), EfiBootVariable::BootNext, "b")
             .unwrap_err();
         assert!(err.to_string().contains("no partition labeled 'boot-b'"));
@@ -4174,5 +4581,172 @@ PRETTY_NAME="Avocado Linux 2024.1"
     fn a_whole_disk_is_not_a_partition() {
         let sys = fake_sysblock("sda", &[("sda1", 1)]);
         assert_eq!(partition_location(sys.path(), "sda"), None);
+    }
+
+    /// A sysfs block class with a uevent per partition, the way the kernel
+    /// publishes PARTNAME and PARTUUID. Each disk: (name, [(part, number,
+    /// GPT name, PARTUUID)]).
+    type FakePart<'a> = (&'a str, u32, &'a str, &'a str);
+
+    fn fake_sysblock_uevents(disks: &[(&str, &[FakePart])]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        for (disk, parts) in disks {
+            let disk_dir = tmp.path().join("devices").join(disk);
+            fs::create_dir_all(&disk_dir).unwrap();
+            fs::write(
+                disk_dir.join("uevent"),
+                format!("DEVNAME={disk}\nDEVTYPE=disk\n"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&disk_dir, tmp.path().join(disk)).unwrap();
+            for (name, num, partname, partuuid) in *parts {
+                let dir = disk_dir.join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("partition"), format!("{num}\n")).unwrap();
+                fs::write(
+                    dir.join("uevent"),
+                    format!(
+                        "DEVNAME={name}\nDEVTYPE=partition\nPARTN={num}\nPARTNAME={partname}\nPARTUUID={partuuid}\n"
+                    ),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(&dir, tmp.path().join(name)).unwrap();
+            }
+        }
+        tmp
+    }
+
+    const BOOTED_SDA: (&str, &[FakePart]) = (
+        "sda",
+        &[("sda1", 1, "boot-a", A_UUID), ("sda2", 2, "boot-b", B_UUID)],
+    );
+
+    #[test]
+    fn the_slot_partition_is_found_on_the_booted_disk() {
+        let sys = fake_sysblock_uevents(&[BOOTED_SDA]);
+        assert_eq!(
+            slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b"),
+            Ok(slot_partition(2, B_UUID))
+        );
+    }
+
+    #[test]
+    fn a_same_named_partition_on_another_disk_is_never_chosen() {
+        // The stick sorts first and carries the same GPT names.
+        let stick: (&str, &[FakePart]) = (
+            "sdb",
+            &[
+                ("sdb1", 1, "boot-a", "11111111-0000-4000-8000-000000000001"),
+                ("sdb2", 2, "boot-b", "11111111-0000-4000-8000-000000000002"),
+            ],
+        );
+        let sys = fake_sysblock_uevents(&[stick, BOOTED_SDA]);
+        assert_eq!(
+            slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b"),
+            Ok(slot_partition(2, B_UUID))
+        );
+    }
+
+    #[test]
+    fn the_booted_esp_being_found_on_nvme_names_the_namespace() {
+        let nvme: (&str, &[FakePart]) = (
+            "nvme0n1",
+            &[
+                ("nvme0n1p1", 1, "boot-a", A_UUID),
+                ("nvme0n1p2", 2, "boot-b", B_UUID),
+            ],
+        );
+        let sys = fake_sysblock_uevents(&[nvme]);
+        assert_eq!(
+            slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b"),
+            Ok(SlotPartition {
+                disk: "/dev/nvme0n1".to_string(),
+                number: 2,
+                partuuid: B_UUID.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_disk_cloned_from_the_booted_one_is_refused() {
+        let clone: (&str, &[FakePart]) = (
+            "sdb",
+            &[("sdb1", 1, "boot-a", A_UUID), ("sdb2", 2, "boot-b", B_UUID)],
+        );
+        let sys = fake_sysblock_uevents(&[BOOTED_SDA, clone]);
+        let err = slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b").unwrap_err();
+        assert!(err.contains("sda1") && err.contains("sdb1"), "{err}");
+    }
+
+    #[test]
+    fn a_clone_of_only_the_slot_partition_is_refused() {
+        let partial: (&str, &[FakePart]) = ("sdb", &[("sdb2", 2, "boot-b", B_UUID)]);
+        let sys = fake_sysblock_uevents(&[BOOTED_SDA, partial]);
+        let err = slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b").unwrap_err();
+        assert!(err.contains("sda2") && err.contains("sdb2"), "{err}");
+    }
+
+    #[test]
+    fn a_booted_esp_no_partition_carries_is_an_error() {
+        let sys = fake_sysblock_uevents(&[BOOTED_SDA]);
+        let err = slot_partition_on_booted_disk(
+            sys.path(),
+            "ffffffff-0000-4000-8000-000000000000",
+            "boot-b",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("ffffffff-0000-4000-8000-000000000000"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_label_absent_from_the_booted_disk_is_an_error_even_if_another_disk_has_it() {
+        let only_a: (&str, &[FakePart]) = ("sda", &[("sda1", 1, "boot-a", A_UUID)]);
+        let stick: (&str, &[FakePart]) = (
+            "sdb",
+            &[("sdb2", 2, "boot-b", "11111111-0000-4000-8000-000000000002")],
+        );
+        let sys = fake_sysblock_uevents(&[only_a, stick]);
+        let err = slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b").unwrap_err();
+        assert!(
+            err.contains("no partition labeled 'boot-b' on /dev/sda"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gpt_name_is_matched_exactly_not_as_a_prefix() {
+        let prefixed: (&str, &[FakePart]) = (
+            "sda",
+            &[
+                ("sda1", 1, "boot-a", A_UUID),
+                (
+                    "sda3",
+                    3,
+                    "boot-b-old",
+                    "22222222-0000-4000-8000-000000000003",
+                ),
+            ],
+        );
+        let sys = fake_sysblock_uevents(&[prefixed]);
+        let err = slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b").unwrap_err();
+        assert!(
+            err.contains("no partition labeled 'boot-b' on /dev/sda"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_slot_partition_with_an_empty_partuuid_is_not_located() {
+        // An empty value would otherwise match every HD() path by substring.
+        let empty: (&str, &[FakePart]) = (
+            "sda",
+            &[("sda1", 1, "boot-a", A_UUID), ("sda2", 2, "boot-b", "")],
+        );
+        let sys = fake_sysblock_uevents(&[empty]);
+        let err = slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b").unwrap_err();
+        assert!(err.contains("sda2 has no PARTUUID"), "{err}");
     }
 }
