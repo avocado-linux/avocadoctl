@@ -365,6 +365,43 @@ pub fn merge_extensions(config: &Config, output: &OutputManager) {
         }
     }
 }
+/// What the post-rollback reboot needs from the machine. A seam so a failed
+/// launch or a nonzero exit can be asserted without triggering a real reboot.
+trait RebootHost {
+    fn reboot(&self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+struct SystemReboot;
+
+impl RebootHost for SystemReboot {
+    fn reboot(&self) -> std::io::Result<std::process::ExitStatus> {
+        // Inherits stdio rather than capturing it: an operator watching the
+        // console should see whatever `reboot` itself prints about why it
+        // could not act.
+        std::process::Command::new("reboot").status()
+    }
+}
+
+/// Reboot into the slot the prior rollback just pointed the bootloader at.
+///
+/// The caller returns `Ok(())` right after this without merging any
+/// extensions, so a launch failure or a nonzero exit discarded here would
+/// report a clean merge while the failed image kept running and nothing was
+/// actually merged. Both must fail the merge instead.
+fn reboot_via(host: &impl RebootHost) -> Result<(), SystemdError> {
+    let status = host.reboot().map_err(|e| SystemdError::CommandFailed {
+        command: "reboot".to_string(),
+        source: e,
+    })?;
+    if !status.success() {
+        return Err(SystemdError::CommandExitedWithError {
+            command: "reboot".to_string(),
+            exit_code: status.code(),
+            stderr: String::new(),
+        });
+    }
+    Ok(())
+}
 
 /// Internal merge function that returns a Result
 pub(crate) fn merge_extensions_internal(
@@ -506,7 +543,7 @@ pub(crate) fn merge_extensions_internal(
         if rolled_back {
             output.step("OS Update", "Rebooting into the previous slot");
             if std::env::var("AVOCADO_TEST_MODE").is_err() {
-                let _ = std::process::Command::new("reboot").status();
+                reboot_via(&SystemReboot)?;
             }
             return Ok(());
         }
@@ -4517,6 +4554,50 @@ mod tests {
 
     // Mutex to serialize tests that modify AVOCADO_EXTENSIONS_PATH environment variable
     static ENV_VAR_MUTEX: Mutex<()> = Mutex::new(());
+
+    // --- post-rollback reboot ---
+
+    /// Stands in for the `reboot` binary. `Ok(code)` reports the launch
+    /// succeeded and the process exited with `code`; `Err(())` reports the
+    /// launch itself failing (e.g. no `reboot` on PATH).
+    struct FakeReboot(Result<i32, ()>);
+
+    impl RebootHost for FakeReboot {
+        fn reboot(&self) -> std::io::Result<std::process::ExitStatus> {
+            match self.0 {
+                Ok(code) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    Ok(std::process::ExitStatus::from_raw(code << 8))
+                }
+                Err(()) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No such file or directory",
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn a_successful_reboot_is_not_an_error() {
+        assert!(reboot_via(&FakeReboot(Ok(0))).is_ok());
+    }
+
+    #[test]
+    fn a_reboot_that_fails_to_launch_is_a_merge_error() {
+        let err = reboot_via(&FakeReboot(Err(()))).unwrap_err();
+        assert!(matches!(err, SystemdError::CommandFailed { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_nonzero_reboot_exit_is_a_merge_error() {
+        let err = reboot_via(&FakeReboot(Ok(42))).unwrap_err();
+        match err {
+            SystemdError::CommandExitedWithError { exit_code, .. } => {
+                assert_eq!(exit_code, Some(42))
+            }
+            other => panic!("wrong variant: {other}"),
+        }
+    }
 
     #[test]
     fn test_config_integration() {
