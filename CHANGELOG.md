@@ -10,6 +10,31 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-06
+
+### Changed
+
+- **A rollback reboots straight into the previous slot.** As soon as a pending
+  update fails verification and the marker is cleared, the device reboots,
+  before the failed slot's extensions are merged, so a bad image never reaches
+  userspace. Previously the failed image kept running until something else
+  restarted the device (#36).
+
+### Fixed
+
+- **efibootmgr A/B updates stick.** `commit` moves the verified slot to the head
+  of `BootOrder` instead of only writing `BootNext`, which the firmware honours
+  for a single boot; a committed update no longer reverts to the old slot on the
+  next reboot. A slot entry missing from NVRAM (lost to a firmware
+  setup-defaults reset) is recreated rather than failing the update (#36).
+- `commit` activates a slot entry whose `LOAD_OPTION_ACTIVE` bit is clear, which
+  the firmware's `BootOrder` walk would otherwise skip (#36).
+- A failed reboot after a rollback fails the extension merge instead of
+  reporting success (#36).
+- efibootmgr slot entries are matched by partition on the disk holding the ESP,
+  not by label alone, so a stale or same-labelled entry (a second disk, a
+  reflashed USB stick) can no longer be committed to or rolled back onto (#37).
+
 ## [0.12.0] - 2026-09-15
 
 ### Added
@@ -61,5 +86,6 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 - HITL refresh decodes `/proc/mounts` octal escapes before unmounting, so an
   extension whose name contains a space is actually unmounted.
 
-[Unreleased]: https://github.com/avocado-linux/avocadoctl/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/avocado-linux/avocadoctl/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.11.1...v0.12.0
