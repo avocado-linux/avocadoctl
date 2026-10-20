@@ -1282,6 +1282,14 @@ fn locate_target(
     partition_name: &str,
     layout: Option<&BundleLayout>,
 ) -> Result<WriteTarget, OsUpdateError> {
+    locate_target_in(&running_host(), partition_name, layout)
+}
+
+fn locate_target_in(
+    host: &BlockHost,
+    partition_name: &str,
+    layout: Option<&BundleLayout>,
+) -> Result<WriteTarget, OsUpdateError> {
     // An artifact that exists for one slot only.
     //
     // Every artifact needs a target for the slot being written or the update
@@ -1307,8 +1315,8 @@ fn locate_target(
     // Only a DEFINITELY ABSENT label may fall back. A label entry that exists
     // but cannot be resolved (dangling symlink, EACCES, I/O error) is a real
     // error to surface, not a reason to start writing by computed offset.
-    if !label_absent(partition_name) {
-        return resolve_partition(partition_name).map(WriteTarget::Partition);
+    if !label_absent_in(host, partition_name) {
+        return resolve_partition_in(host, partition_name).map(WriteTarget::Partition);
     }
     match layout {
         // Offsets are only trusted on a disk that carries no labels at all.
@@ -1316,7 +1324,7 @@ fn locate_target(
         // device provisioned before a partition was added), and writing by
         // computed offset there would land on whatever lives at that offset
         // now.
-        Some(layout) if !disk_has_any_label(layout) => Ok(WriteTarget::Offset {
+        Some(layout) if !disk_has_any_label_in(host, layout) => Ok(WriteTarget::Offset {
             device: layout.device.clone(),
             byte_offset: resolve_partition_offset(partition_name, layout)?,
         }),
@@ -1329,13 +1337,47 @@ fn locate_target(
     }
 }
 
+/// The paths label resolution reads: the directory whose device number names
+/// the booted disk, sysfs, and /dev. The running system's in production; a
+/// scratch tree in tests.
+struct BlockHost<'a> {
+    root: &'a Path,
+    sys: &'a Path,
+    dev: &'a Path,
+}
+
+fn running_host() -> BlockHost<'static> {
+    BlockHost {
+        root: Path::new("/"),
+        sys: Path::new("/sys"),
+        dev: Path::new("/dev"),
+    }
+}
+
+impl BlockHost<'_> {
+    fn by_partlabel(&self, label: &str) -> PathBuf {
+        // Formatted rather than joined: joining a label that starts with `/`
+        // would replace the whole path instead of naming a missing link.
+        self.dev.join(format!("disk/by-partlabel/{label}"))
+    }
+}
+
+fn label_absent(partition_name: &str) -> bool {
+    label_absent_in(&running_host(), partition_name)
+}
+
 /// Whether `/dev/disk/by-partlabel/<name>` is definitely absent. Only a clean
 /// NotFound counts: `Path::exists()` also says "no" for a dangling symlink or
 /// a metadata error, and treating those as absent would enable raw offset
 /// writes on a disk that is in fact labeled.
-fn label_absent(partition_name: &str) -> bool {
+///
+/// This deliberately looks at every disk, not just the booted one: it gates the
+/// raw by-offset write, and a label carried by any attached medium must keep
+/// that write refused. Which disk a present label is written on is decided in
+/// resolve_partition.
+fn label_absent_in(host: &BlockHost, partition_name: &str) -> bool {
     matches!(
-        fs::symlink_metadata(format!("/dev/disk/by-partlabel/{partition_name}")),
+        fs::symlink_metadata(host.by_partlabel(partition_name)),
         Err(e) if e.kind() == io::ErrorKind::NotFound
     )
 }
@@ -1349,20 +1391,41 @@ fn not_found(partition_name: &str) -> OsUpdateError {
 /// Whether any partition the bundle's layout names has a PARTLABEL entry here,
 /// i.e. the disk is GPT with labels and offsets are not the way to address it.
 /// Anything short of a definite NotFound counts as evidence of a label.
-fn disk_has_any_label(layout: &BundleLayout) -> bool {
+fn disk_has_any_label_in(host: &BlockHost, layout: &BundleLayout) -> bool {
     layout
         .partitions
         .iter()
         .filter_map(|p| p.name.as_deref())
-        .any(|name| !label_absent(name))
+        .any(|name| !label_absent_in(host, name))
 }
 
 fn resolve_partition(partition_name: &str) -> Result<PathBuf, OsUpdateError> {
-    if label_absent(partition_name) {
+    resolve_partition_in(&running_host(), partition_name)
+}
+
+/// The device a partition label names. by-partlabel decides whether the label
+/// exists at all; which partition carrying it is written is decided on the disk
+/// `/` was booted from, because a board provisioned to two media carries every
+/// slot label twice and udev keeps one by-partlabel link per label, so the link
+/// alone can name the disk the system did not boot from.
+fn resolve_partition_in(host: &BlockHost, partition_name: &str) -> Result<PathBuf, OsUpdateError> {
+    if label_absent_in(host, partition_name) {
         return Err(not_found(partition_name));
     }
+    let root_dev = root_device(host.root).ok_or_else(|| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "cannot stat {} to find the booted disk",
+            host.root.display()
+        ))
+    })?;
+    match resolve_label(host.sys, root_dev, partition_name)
+        .map_err(OsUpdateError::ArtifactWriteFailed)?
+    {
+        LabelTarget::OnBootedDisk(part) => return Ok(host.dev.join(part)),
+        LabelTarget::ByPartlabel => {}
+    }
     // Resolve the symlink to get the actual device
-    fs::canonicalize(format!("/dev/disk/by-partlabel/{partition_name}")).map_err(|e| {
+    fs::canonicalize(host.by_partlabel(partition_name)).map_err(|e| {
         OsUpdateError::ArtifactWriteFailed(format!(
             "Failed to resolve partition {partition_name}: {e}"
         ))
@@ -2109,16 +2172,44 @@ fn uevent_value(dir: &Path, key: &str) -> Option<String> {
 }
 
 /// The entries of `dir` whose uevent `key` satisfies `matches`, sorted.
-fn devices_where(dir: &Path, key: &str, matches: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| uevent_value(&e.path(), key).is_some_and(|v| matches(&v)))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
+///
+/// An entry with no uevent (a plain file such as `size`, or a directory such
+/// as `queue/`) is not a device and is skipped. Any other read failure is an
+/// error: reading it as "no such device" would let an unreadable sysfs pass a
+/// uniqueness check or hide the partition a label names.
+fn devices_where(
+    dir: &Path,
+    key: &str,
+    matches: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
+    let read_err = |path: &Path, e: io::Error| format!("cannot read {}: {e}", path.display());
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| read_err(dir, e))? {
+        let entry = entry.map_err(|e| read_err(dir, e))?;
+        let uevent = entry.path().join("uevent");
+        let text = match fs::read_to_string(&uevent) {
+            Ok(text) => text,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(read_err(&uevent, e)),
+        };
+        let value = text
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='));
+        if value.is_some_and(&matches) {
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
 /// The one partition carrying `partuuid`, read from each device's uevent
@@ -2127,7 +2218,7 @@ fn devices_where(dir: &Path, key: &str, matches: impl Fn(&str) -> bool) -> Vec<S
 /// firmware's HD() path nor udev can tell the copies apart, so nothing may be
 /// pointed at either.
 fn unique_partition_with_partuuid(sysblock: &Path, partuuid: &str) -> Result<String, String> {
-    let mut parts = devices_where(sysblock, "PARTUUID", |u| u.eq_ignore_ascii_case(partuuid));
+    let mut parts = devices_where(sysblock, "PARTUUID", |u| u.eq_ignore_ascii_case(partuuid))?;
     match parts.len() {
         0 => Err(format!("no partition carries PARTUUID {partuuid}")),
         1 => Ok(parts.remove(0)),
@@ -2149,10 +2240,7 @@ fn slot_partition_on_booted_disk(
     let esp = unique_partition_with_partuuid(sysblock, booted_esp)?;
     let (disk, _) = partition_location(sysblock, &esp)
         .ok_or_else(|| format!("cannot find the disk holding the booted ESP {esp}"))?;
-    let part = devices_where(&sysblock.join(&disk), "PARTNAME", |n| n == label)
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("no partition labeled '{label}' on /dev/{disk}"))?;
+    let part = partition_on_disk(sysblock, &disk, label)?;
     let partuuid = uevent_value(&sysblock.join(&part), "PARTUUID")
         .filter(|u| u.len() == 36)
         .ok_or_else(|| format!("{part} has no PARTUUID"))?
@@ -2166,6 +2254,129 @@ fn slot_partition_on_booted_disk(
         number,
         partuuid,
     })
+}
+
+/// The partition `/` is mounted from, and the disk holding it.
+#[derive(Debug, PartialEq)]
+struct BootedPartition {
+    part: String,
+    disk: String,
+}
+
+/// How many stacked device-mapper layers (dm-crypt over dm-verity, say)
+/// booted_partition follows down to a partition.
+const MAX_DM_DEPTH: usize = 8;
+
+/// The partition behind `/`, found from its device number through
+/// `<sys>/dev/block/MAJ:MIN`. A device-mapper root (dm-verity, dm-crypt) is
+/// followed through `slaves/` while it is stacked on exactly one device, so it
+/// anchors to the partition it is built on. `None` when `/` is not a partition
+/// and does not reduce to one: an overlay or tmpfs root has an anonymous device
+/// with no entry there, and a dm device over several devices (a verity hash
+/// tree on a partition of its own) names no single booted partition.
+///
+/// `/` is the evidence because it is what the bootloader actually booted:
+/// Tegra's initrd mounts the APP partition straight onto /sysroot. The `var`
+/// partition's label is as ambiguous as the slot labels on a board provisioned
+/// to two media, and LoaderDevicePartUUID exists only under systemd-boot.
+fn booted_partition(sys: &Path, root_dev: u64) -> Option<BootedPartition> {
+    let sysblock = sys.join("class/block");
+    let mut part = fs::canonicalize(sys.join("dev/block").join(dev_maj_min(root_dev)))
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .to_string();
+    for _ in 0..MAX_DM_DEPTH {
+        if let Some((disk, _)) = partition_location(&sysblock, &part) {
+            return Some(BootedPartition { part, disk });
+        }
+        part = single_slave(&sysblock, &part)?;
+    }
+    None
+}
+
+/// The one device `dev` is stacked on, from `<sysblock>/<dev>/slaves/`. `None`
+/// with none (a disk or partition) or several, where no single device is the
+/// one underneath.
+fn single_slave(sysblock: &Path, dev: &str) -> Option<String> {
+    let mut slaves = fs::read_dir(sysblock.join(dev).join("slaves")).ok()?;
+    let only = slaves.next()?.ok()?;
+    if slaves.next().is_some() {
+        return None;
+    }
+    only.file_name().into_string().ok()
+}
+
+/// The one partition on `disk` whose GPT name is `label`. Zero is an error
+/// that names any other disk carrying the label; more than one is refused,
+/// since nothing tells the copies apart.
+fn partition_on_disk(sysblock: &Path, disk: &str, label: &str) -> Result<String, String> {
+    let mut on_disk = devices_where(&sysblock.join(disk), "PARTNAME", |n| n == label)?;
+    match on_disk.len() {
+        1 => Ok(on_disk.remove(0)),
+        0 => {
+            let elsewhere = devices_where(sysblock, "PARTNAME", |n| n == label)?;
+            let mut err = format!("no partition labeled '{label}' on /dev/{disk}, the booted disk");
+            if !elsewhere.is_empty() {
+                let names: Vec<String> = elsewhere.iter().map(|p| format!("/dev/{p}")).collect();
+                err.push_str(&format!(
+                    "; {} on another disk carries it and is not written",
+                    names.join(", ")
+                ));
+            }
+            Err(err)
+        }
+        _ => Err(format!(
+            "more than one partition on /dev/{disk} is labeled '{label}' ({}); refusing to pick one",
+            on_disk.join(", ")
+        )),
+    }
+}
+
+/// Where a partition label resolves for writing.
+#[derive(Debug, PartialEq)]
+enum LabelTarget {
+    /// The partition device name (under /dev) on the disk `/` was booted from.
+    OnBootedDisk(String),
+    /// `/` reduces to no partition and the label is unique: /dev/disk/by-partlabel
+    /// names the only candidate, as it always has.
+    ByPartlabel,
+}
+
+/// Resolve `label` against the disk `/` (device `root_dev`) lives on, so a
+/// second medium provisioned with the same GPT names is never written. When `/`
+/// does not reduce to a partition (see booted_partition) there is no booted
+/// disk to anchor to, and the label is accepted only when it is unique across
+/// every block device.
+fn resolve_label(sys: &Path, root_dev: u64, label: &str) -> Result<LabelTarget, String> {
+    let sysblock = sys.join("class/block");
+    let Some(root) = booted_partition(sys, root_dev) else {
+        let all = devices_where(&sysblock, "PARTNAME", |n| n == label)?;
+        if all.len() > 1 {
+            return Err(format!(
+                "partition label '{label}' is carried by more than one partition ({}) and / is \
+                 not a partition, so the booted disk cannot be told apart; detach the other \
+                 medium",
+                all.join(", ")
+            ));
+        }
+        return Ok(LabelTarget::ByPartlabel);
+    };
+    let part = partition_on_disk(&sysblock, &root.disk, label)?;
+    if part == root.part {
+        return Err(format!(
+            "refusing to write '{label}': /dev/{part} is the running root filesystem"
+        ));
+    }
+    Ok(LabelTarget::OnBootedDisk(part))
+}
+
+/// The device number of the filesystem holding `root`, for anchoring label
+/// lookups to the booted disk. This is `st_dev`, the device the filesystem is
+/// mounted from; `st_rdev` is only meaningful for a device node and is 0 for a
+/// directory, so it would never name a disk.
+fn root_device(root: &Path) -> Option<u64> {
+    fs::metadata(root).ok().map(|m| m.dev())
 }
 
 /// Patch the BLS entry on a boot partition to reference the correct rootfs slot.
@@ -2899,42 +3110,6 @@ pub fn active_manifest(base_dir: &Path) -> Option<crate::manifest::RuntimeManife
 
 #[cfg(test)]
 mod tests {
-    fn layout_with(name: &str, offset: f64) -> BundleLayout {
-        BundleLayout {
-            device: "/dev/mmcblk1".to_string(),
-            block_size: Some(512),
-            partitions: vec![LayoutPartition {
-                name: Some(name.to_string()),
-                offset: Some(offset),
-                offset_unit: Some("bytes".to_string()),
-                size: 8.0,
-                size_unit: "mebibytes".to_string(),
-                expand: None,
-            }],
-        }
-    }
-
-    /// A label no attached medium can plausibly carry: the test's own pid makes
-    /// it unique per run, so the lookup fails for the right reason.
-    fn no_such_label() -> String {
-        format!("avocadoctl-test-no-such-label-{}", std::process::id())
-    }
-
-    #[test]
-    fn an_unlabeled_partition_falls_back_to_the_layout_offset() {
-        let name = no_such_label();
-        match locate_target(&name, Some(&layout_with(&name, 4096.0))) {
-            Ok(WriteTarget::Offset {
-                device,
-                byte_offset,
-            }) => {
-                assert_eq!(device, "/dev/mmcblk1");
-                assert_eq!(byte_offset, 4096);
-            }
-            other => panic!("expected layout offset, got {:?}", other.map(|_| ())),
-        }
-    }
-
     #[test]
     fn emmc_boot_targets_are_recognised_and_validated() {
         // Not an emmc-boot spec: falls through to the label/layout logic.
@@ -2958,11 +3133,6 @@ mod tests {
             }
             _ => panic!("a disk without boot partitions must be skipped"),
         }
-    }
-
-    #[test]
-    fn an_unlabeled_partition_without_a_layout_is_an_error() {
-        assert!(locate_target(&no_such_label(), None).is_err());
     }
 
     use super::*;
@@ -4590,15 +4760,20 @@ PRETTY_NAME="Avocado Linux 2024.1"
 
     fn fake_sysblock_uevents(disks: &[(&str, &[FakePart])]) -> TempDir {
         let tmp = TempDir::new().unwrap();
+        populate_sysblock(tmp.path(), disks);
+        tmp
+    }
+
+    fn populate_sysblock(sysblock: &Path, disks: &[(&str, &[FakePart])]) {
         for (disk, parts) in disks {
-            let disk_dir = tmp.path().join("devices").join(disk);
+            let disk_dir = sysblock.join("devices").join(disk);
             fs::create_dir_all(&disk_dir).unwrap();
             fs::write(
                 disk_dir.join("uevent"),
                 format!("DEVNAME={disk}\nDEVTYPE=disk\n"),
             )
             .unwrap();
-            std::os::unix::fs::symlink(&disk_dir, tmp.path().join(disk)).unwrap();
+            std::os::unix::fs::symlink(&disk_dir, sysblock.join(disk)).unwrap();
             for (name, num, partname, partuuid) in *parts {
                 let dir = disk_dir.join(name);
                 fs::create_dir_all(&dir).unwrap();
@@ -4610,10 +4785,9 @@ PRETTY_NAME="Avocado Linux 2024.1"
                     ),
                 )
                 .unwrap();
-                std::os::unix::fs::symlink(&dir, tmp.path().join(name)).unwrap();
+                std::os::unix::fs::symlink(&dir, sysblock.join(name)).unwrap();
             }
         }
-        tmp
     }
 
     const BOOTED_SDA: (&str, &[FakePart]) = (
@@ -4748,5 +4922,687 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let sys = fake_sysblock_uevents(&[empty]);
         let err = slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b").unwrap_err();
         assert!(err.contains("sda2 has no PARTUUID"), "{err}");
+    }
+
+    /// A Jetson provisioned to both media: the SD card and the NVMe carry the
+    /// same GPT names, and the SD card sorts first, as in the field report.
+    const SD: (&str, &[FakePart]) = (
+        "mmcblk0",
+        &[
+            (
+                "mmcblk0p1",
+                1,
+                "APP",
+                "51000000-0000-4000-8000-000000000001",
+            ),
+            (
+                "mmcblk0p2",
+                2,
+                "APP_b",
+                "51000000-0000-4000-8000-000000000002",
+            ),
+        ],
+    );
+    const NVME: (&str, &[FakePart]) = (
+        "nvme0n1",
+        &[
+            (
+                "nvme0n1p1",
+                1,
+                "APP",
+                "4e000000-0000-4000-8000-000000000001",
+            ),
+            (
+                "nvme0n1p2",
+                2,
+                "APP_b",
+                "4e000000-0000-4000-8000-000000000002",
+            ),
+        ],
+    );
+
+    /// An overlay or tmpfs root: an anonymous device (major 0) that has no
+    /// dev/block entry.
+    fn anon_dev() -> u64 {
+        libc::makedev(0, 42)
+    }
+
+    /// A scratch system: `sys/` (class/block and dev/block), `dev/` (a file per
+    /// partition plus udev's by-partlabel links) and `root/`, the directory
+    /// standing in for `/`. Every disk and partition gets its own maj:min, as
+    /// the kernel gives them, so a lookup that ignores the device number lands
+    /// on the wrong device. Majors start at 240 (the local/experimental range),
+    /// clear of the anonymous major 0 that root/ itself lives on.
+    struct FakeSys {
+        _dir: TempDir,
+        root: PathBuf,
+        sys: PathBuf,
+        dev: PathBuf,
+        devs: HashMap<String, u64>,
+        next_dm: u32,
+    }
+
+    impl FakeSys {
+        fn new(disks: &[(&str, &[FakePart])]) -> Self {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("root");
+            let sys = dir.path().join("sys");
+            let dev = dir.path().join("dev");
+            fs::create_dir_all(&root).unwrap();
+            fs::create_dir_all(sys.join("class/block")).unwrap();
+            fs::create_dir_all(sys.join("dev/block")).unwrap();
+            fs::create_dir_all(dev.join("disk/by-partlabel")).unwrap();
+            populate_sysblock(&sys.join("class/block"), disks);
+            let mut fake = FakeSys {
+                _dir: dir,
+                root,
+                sys,
+                dev,
+                devs: HashMap::new(),
+                next_dm: 0,
+            };
+            for (i, (disk, parts)) in disks.iter().enumerate() {
+                let major = 240 + i as u32;
+                fake.add_dev(disk, libc::makedev(major, 0));
+                for (name, num, partname, _) in *parts {
+                    fake.add_dev(name, libc::makedev(major, *num));
+                    fs::write(fake.dev.join(name), "").unwrap();
+                    // udev keeps one link per label; the first disk listed wins.
+                    let link = fake.dev.join("disk/by-partlabel").join(partname);
+                    if !partname.is_empty() && fs::symlink_metadata(&link).is_err() {
+                        std::os::unix::fs::symlink(format!("../../{name}"), link).unwrap();
+                    }
+                }
+            }
+            fake
+        }
+
+        fn sysblock(&self) -> PathBuf {
+            self.sys.join("class/block")
+        }
+
+        fn add_dev(&mut self, name: &str, dev: u64) {
+            std::os::unix::fs::symlink(
+                self.sysblock().join(name),
+                self.sys.join("dev/block").join(dev_maj_min(dev)),
+            )
+            .unwrap();
+            self.devs.insert(name.to_string(), dev);
+        }
+
+        /// The device number of `name`, as `/` would report it if mounted
+        /// from it.
+        fn dev(&self, name: &str) -> u64 {
+            self.devs[name]
+        }
+
+        /// A device-mapper device stacked on `slaves`, the way the kernel
+        /// lists a dm device's backing devices under `slaves/`.
+        fn add_dm(&mut self, slaves: &[&str]) -> u64 {
+            let name = format!("dm-{}", self.next_dm);
+            let dir = self.sysblock().join("devices/virtual").join(&name);
+            fs::create_dir_all(dir.join("slaves")).unwrap();
+            fs::write(
+                dir.join("uevent"),
+                format!("DEVNAME={name}\nDEVTYPE=disk\n"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&dir, self.sysblock().join(&name)).unwrap();
+            for slave in slaves {
+                std::os::unix::fs::symlink(
+                    self.sysblock().join(slave),
+                    dir.join("slaves").join(slave),
+                )
+                .unwrap();
+            }
+            let dev = libc::makedev(250, self.next_dm);
+            self.next_dm += 1;
+            self.add_dev(&name, dev);
+            dev
+        }
+
+        /// Make root/ (whose real device number is a tmpfs or disk one) look
+        /// mounted from `part`, by pointing its dev/block entry there.
+        fn boot_from(&self, part: &str) {
+            let dev = fs::metadata(&self.root).unwrap().dev();
+            let link = self.sys.join("dev/block").join(dev_maj_min(dev));
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(self.sysblock().join(part), link).unwrap();
+        }
+
+        /// Make reading `part`'s uevent fail (EISDIR), the way an I/O or
+        /// permission error would.
+        fn break_uevent(&self, part: &str) {
+            let uevent = self.sysblock().join(part).join("uevent");
+            fs::remove_file(&uevent).unwrap();
+            fs::create_dir(&uevent).unwrap();
+        }
+
+        fn host(&self) -> BlockHost<'_> {
+            BlockHost {
+                root: &self.root,
+                sys: &self.sys,
+                dev: &self.dev,
+            }
+        }
+    }
+
+    fn write_failure(r: Result<impl std::fmt::Debug, OsUpdateError>) -> String {
+        match r {
+            Err(OsUpdateError::ArtifactWriteFailed(m)) => m,
+            other => panic!("expected ArtifactWriteFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_booted_partition_and_its_disk_come_from_the_root_device_number() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        for (part, disk) in [
+            ("mmcblk0p1", "mmcblk0"),
+            ("mmcblk0p2", "mmcblk0"),
+            ("nvme0n1p1", "nvme0n1"),
+            ("nvme0n1p2", "nvme0n1"),
+        ] {
+            assert_eq!(
+                booted_partition(&sys.sys, sys.dev(part)),
+                Some(BootedPartition {
+                    part: part.to_string(),
+                    disk: disk.to_string(),
+                }),
+                "root on {part}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overlay_root_has_no_booted_partition() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        assert_eq!(booted_partition(&sys.sys, anon_dev()), None);
+    }
+
+    #[test]
+    fn a_whole_disk_root_has_no_booted_partition() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        assert_eq!(booted_partition(&sys.sys, sys.dev("nvme0n1")), None);
+    }
+
+    #[test]
+    fn a_dm_root_without_backing_devices_has_no_booted_partition() {
+        let mut sys = FakeSys::new(&[NVME]);
+        let dm = sys.add_dm(&[]);
+        assert_eq!(booted_partition(&sys.sys, dm), None);
+    }
+
+    #[test]
+    fn a_dm_root_anchors_to_its_single_backing_partition() {
+        let mut sys = FakeSys::new(&[SD, NVME]);
+        let dm = sys.add_dm(&["nvme0n1p1"]);
+        assert_eq!(
+            booted_partition(&sys.sys, dm),
+            Some(BootedPartition {
+                part: "nvme0n1p1".to_string(),
+                disk: "nvme0n1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_stacked_dm_root_is_followed_to_the_partition_at_the_bottom() {
+        let mut sys = FakeSys::new(&[SD, NVME]);
+        sys.add_dm(&["mmcblk0p1"]); // dm-0, the verity layer
+        let crypt = sys.add_dm(&["dm-0"]);
+        assert_eq!(
+            booted_partition(&sys.sys, crypt),
+            Some(BootedPartition {
+                part: "mmcblk0p1".to_string(),
+                disk: "mmcblk0".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_dm_root_over_several_devices_has_no_booted_partition() {
+        // dm-verity with its hash tree on a partition of its own.
+        let mut sys = FakeSys::new(&[SD, NVME]);
+        let dm = sys.add_dm(&["nvme0n1p1", "nvme0n1p2"]);
+        assert_eq!(booted_partition(&sys.sys, dm), None);
+    }
+
+    #[test]
+    fn a_dm_verity_root_resolves_slots_on_its_backing_disk() {
+        let mut sys = FakeSys::new(&[SD, NVME]);
+        let dm = sys.add_dm(&["nvme0n1p1"]);
+        assert_eq!(
+            resolve_label(&sys.sys, dm, "APP_b"),
+            Ok(LabelTarget::OnBootedDisk("nvme0n1p2".to_string()))
+        );
+        assert_eq!(
+            resolve_label(&sys.sys, dm, "APP"),
+            Err(
+                "refusing to write 'APP': /dev/nvme0n1p1 is the running root filesystem"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn booted_from_nvme_with_the_sd_card_also_labelled_resolves_on_nvme() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("nvme0n1p1"), "APP_b"),
+            Ok(LabelTarget::OnBootedDisk("nvme0n1p2".to_string()))
+        );
+    }
+
+    #[test]
+    fn booted_from_the_sd_card_resolves_on_the_sd_card() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("mmcblk0p1"), "APP_b"),
+            Ok(LabelTarget::OnBootedDisk("mmcblk0p2".to_string()))
+        );
+    }
+
+    #[test]
+    fn booted_from_sda_with_a_labelled_stick_resolves_on_sda() {
+        let stick: (&str, &[FakePart]) = (
+            "sdb",
+            &[
+                (
+                    "sdb1",
+                    1,
+                    "rootfs-a",
+                    "11111111-0000-4000-8000-000000000001",
+                ),
+                (
+                    "sdb2",
+                    2,
+                    "rootfs-b",
+                    "11111111-0000-4000-8000-000000000002",
+                ),
+            ],
+        );
+        let sda: (&str, &[FakePart]) = (
+            "sda",
+            &[
+                ("sda1", 1, "rootfs-a", A_UUID),
+                ("sda2", 2, "rootfs-b", B_UUID),
+            ],
+        );
+        let sys = FakeSys::new(&[stick, sda]);
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("sda1"), "rootfs-b"),
+            Ok(LabelTarget::OnBootedDisk("sda2".to_string()))
+        );
+    }
+
+    const NVME_APP_B_TWICE: (&str, &[FakePart]) = (
+        "nvme0n1",
+        &[
+            (
+                "nvme0n1p1",
+                1,
+                "APP",
+                "4e000000-0000-4000-8000-000000000001",
+            ),
+            (
+                "nvme0n1p2",
+                2,
+                "APP_b",
+                "4e000000-0000-4000-8000-000000000002",
+            ),
+            (
+                "nvme0n1p3",
+                3,
+                "APP_b",
+                "4e000000-0000-4000-8000-000000000003",
+            ),
+        ],
+    );
+
+    #[test]
+    fn two_partitions_with_the_label_on_the_booted_disk_are_refused() {
+        let sys = FakeSys::new(&[NVME_APP_B_TWICE]);
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("nvme0n1p1"), "APP_b"),
+            Err(
+                "more than one partition on /dev/nvme0n1 is labeled 'APP_b' \
+                 (nvme0n1p2, nvme0n1p3); refusing to pick one"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_label_only_on_another_disk_is_an_error_naming_that_disk() {
+        let no_b: (&str, &[FakePart]) = (
+            "nvme0n1",
+            &[(
+                "nvme0n1p1",
+                1,
+                "APP",
+                "4e000000-0000-4000-8000-000000000001",
+            )],
+        );
+        let sys = FakeSys::new(&[SD, no_b]);
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("nvme0n1p1"), "APP_b"),
+            Err(
+                "no partition labeled 'APP_b' on /dev/nvme0n1, the booted disk; \
+                 /dev/mmcblk0p2 on another disk carries it and is not written"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_running_root_partition_is_never_a_write_target() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("nvme0n1p1"), "APP"),
+            Err(
+                "refusing to write 'APP': /dev/nvme0n1p1 is the running root filesystem"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_unique_label_with_a_non_partition_root_falls_back_to_by_partlabel() {
+        let sys = FakeSys::new(&[NVME]);
+        assert_eq!(
+            resolve_label(&sys.sys, anon_dev(), "APP_b"),
+            Ok(LabelTarget::ByPartlabel)
+        );
+    }
+
+    #[test]
+    fn a_unique_label_with_an_unanchored_dm_root_falls_back_to_by_partlabel() {
+        let mut sys = FakeSys::new(&[NVME]);
+        let dm = sys.add_dm(&["nvme0n1p1", "nvme0n1p2"]);
+        assert_eq!(
+            resolve_label(&sys.sys, dm, "APP_b"),
+            Ok(LabelTarget::ByPartlabel)
+        );
+    }
+
+    #[test]
+    fn a_duplicated_label_with_a_non_partition_root_is_refused() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        assert_eq!(
+            resolve_label(&sys.sys, anon_dev(), "APP_b"),
+            Err(
+                "partition label 'APP_b' is carried by more than one partition \
+                 (mmcblk0p2, nvme0n1p2) and / is not a partition, so the booted disk \
+                 cannot be told apart; detach the other medium"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_duplicated_label_with_an_unanchored_dm_root_is_refused() {
+        let mut sys = FakeSys::new(&[SD, NVME]);
+        let dm = sys.add_dm(&["nvme0n1p1", "mmcblk0p1"]);
+        let err = resolve_label(&sys.sys, dm, "APP_b").unwrap_err();
+        assert!(
+            err.starts_with("partition label 'APP_b' is carried by more than one"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_single_disk_resolves_to_the_partition_by_partlabel_names() {
+        // udev's by-partlabel/APP_b on this system is /dev/nvme0n1p2.
+        let sys = FakeSys::new(&[NVME]);
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("nvme0n1p1"), "APP_b"),
+            Ok(LabelTarget::OnBootedDisk("nvme0n1p2".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_sysfs_read_error_on_the_booted_disk_is_an_error_not_a_missing_label() {
+        let sys = FakeSys::new(&[SD, NVME]);
+        sys.break_uevent("nvme0n1p2");
+        let err = resolve_label(&sys.sys, sys.dev("nvme0n1p1"), "APP_b").unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
+        assert!(err.contains("nvme0n1p2/uevent"), "{err}");
+    }
+
+    #[test]
+    fn a_sysfs_read_error_never_passes_the_uniqueness_check() {
+        // Only nvme0n1p2 reads cleanly; the SD card's copy must not vanish.
+        let sys = FakeSys::new(&[SD, NVME]);
+        sys.break_uevent("mmcblk0p2");
+        let err = resolve_label(&sys.sys, anon_dev(), "APP_b").unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
+        assert!(err.contains("mmcblk0p2/uevent"), "{err}");
+    }
+
+    // locate_target and resolve_partition against a whole fake host: root/'s
+    // real device number, sysfs, and /dev with by-partlabel links.
+
+    /// The bundle layout of a platform that lists its partitions (RPi, x86,
+    /// qemu): `device` is the disk the manifest names.
+    fn listed_layout(device: &str, names: &[(&str, f64)]) -> BundleLayout {
+        BundleLayout {
+            device: device.to_string(),
+            block_size: Some(512),
+            partitions: names
+                .iter()
+                .map(|(name, offset)| LayoutPartition {
+                    name: Some(name.to_string()),
+                    offset: Some(*offset),
+                    offset_unit: Some("bytes".to_string()),
+                    size: 8.0,
+                    size_unit: "mebibytes".to_string(),
+                    expand: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Booted from a medium carrying none of the layout's GPT names, with a
+    /// second disk that carries them.
+    fn booted_off_layout() -> FakeSys {
+        let rescue: (&str, &[FakePart]) = (
+            "sda",
+            &[("sda1", 1, "rescue", "33333333-0000-4000-8000-000000000001")],
+        );
+        let labelled: (&str, &[FakePart]) = (
+            "sdb",
+            &[("sdb1", 1, "boot", "44444444-0000-4000-8000-000000000001")],
+        );
+        let sys = FakeSys::new(&[rescue, labelled]);
+        sys.boot_from("sda1");
+        sys
+    }
+
+    #[test]
+    fn a_layout_label_on_another_disk_keeps_the_offset_write_refused() {
+        let sys = booted_off_layout();
+        let layout = listed_layout("/dev/sdb", &[("boot", 1048576.0), ("rootfs-b", 9437184.0)]);
+        let err = write_failure(locate_target_in(&sys.host(), "rootfs-b", Some(&layout)));
+        assert!(
+            err.starts_with(
+                "Partition 'rootfs-b' has no PARTLABEL on this device but its neighbours do"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_target_label_only_on_another_disk_is_refused_not_written_by_offset() {
+        let sys = booted_off_layout();
+        let layout = listed_layout("/dev/sdb", &[("boot", 1048576.0)]);
+        let err = write_failure(locate_target_in(&sys.host(), "boot", Some(&layout)));
+        assert_eq!(
+            err,
+            "no partition labeled 'boot' on /dev/sda, the booted disk; /dev/sdb1 on another \
+             disk carries it and is not written"
+        );
+    }
+
+    #[test]
+    fn a_sysfs_read_error_never_enables_the_offset_write() {
+        let mmc: (&str, &[FakePart]) = (
+            "mmcblk1",
+            &[
+                (
+                    "mmcblk1p1",
+                    1,
+                    "boot",
+                    "55555555-0000-4000-8000-000000000001",
+                ),
+                (
+                    "mmcblk1p2",
+                    2,
+                    "rootfs-a",
+                    "55555555-0000-4000-8000-000000000002",
+                ),
+                (
+                    "mmcblk1p3",
+                    3,
+                    "rootfs-b",
+                    "55555555-0000-4000-8000-000000000003",
+                ),
+            ],
+        );
+        let sys = FakeSys::new(&[mmc]);
+        sys.boot_from("mmcblk1p2");
+        for part in ["mmcblk1p1", "mmcblk1p2", "mmcblk1p3"] {
+            sys.break_uevent(part);
+        }
+        let layout = listed_layout(
+            "/dev/mmcblk1",
+            &[("boot", 1048576.0), ("rootfs-b", 9437184.0)],
+        );
+        let err = write_failure(locate_target_in(&sys.host(), "rootfs-b", Some(&layout)));
+        assert!(err.starts_with("cannot read "), "{err}");
+    }
+
+    #[test]
+    fn an_unlabeled_partition_falls_back_to_the_layout_offset() {
+        // An MBR disk: partitions with no GPT name and no by-partlabel links.
+        let mbr: (&str, &[FakePart]) = ("mmcblk1", &[("mmcblk1p1", 1, "", "")]);
+        let sys = FakeSys::new(&[mbr]);
+        sys.boot_from("mmcblk1p1");
+        let layout = listed_layout("/dev/mmcblk1", &[("rootfs-b", 4096.0)]);
+        match locate_target_in(&sys.host(), "rootfs-b", Some(&layout)) {
+            Ok(WriteTarget::Offset {
+                device,
+                byte_offset,
+            }) => {
+                assert_eq!(device, "/dev/mmcblk1");
+                assert_eq!(byte_offset, 4096);
+            }
+            other => panic!("expected layout offset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unlabeled_partition_without_a_layout_is_not_found() {
+        let sys = FakeSys::new(&[NVME]);
+        sys.boot_from("nvme0n1p1");
+        let err = write_failure(locate_target_in(&sys.host(), "rootfs-b", None));
+        assert_eq!(err, "Partition not found: /dev/disk/by-partlabel/rootfs-b");
+    }
+
+    #[test]
+    fn an_unlabeled_partition_without_a_layout_or_booted_disk_is_not_found() {
+        let sys = FakeSys::new(&[NVME]);
+        let err = write_failure(locate_target_in(&sys.host(), "rootfs-b", None));
+        assert_eq!(err, "Partition not found: /dev/disk/by-partlabel/rootfs-b");
+    }
+
+    #[test]
+    fn resolve_partition_follows_the_booted_disk_not_by_partlabel() {
+        // by-partlabel/APP_b points at the SD card, which sorts first.
+        let sys = FakeSys::new(&[SD, NVME]);
+        sys.boot_from("nvme0n1p1");
+        assert_eq!(
+            fs::canonicalize(sys.host().by_partlabel("APP_b")).unwrap(),
+            fs::canonicalize(sys.dev.join("mmcblk0p2")).unwrap()
+        );
+        assert_eq!(
+            resolve_partition_in(&sys.host(), "APP_b").unwrap(),
+            sys.dev.join("nvme0n1p2")
+        );
+        match locate_target_in(&sys.host(), "APP_b", None) {
+            Ok(WriteTarget::Partition(p)) => assert_eq!(p, sys.dev.join("nvme0n1p2")),
+            other => panic!("expected the NVMe partition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_partition_uses_by_partlabel_when_the_root_is_not_a_partition() {
+        let sys = FakeSys::new(&[NVME]);
+        assert_eq!(
+            resolve_partition_in(&sys.host(), "APP_b").unwrap(),
+            fs::canonicalize(sys.dev.join("nvme0n1p2")).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_partition_requires_the_by_partlabel_link() {
+        // sysfs already lists the partition but udev has not linked it yet:
+        // the label counts as absent, exactly as before.
+        let sys = FakeSys::new(&[NVME]);
+        sys.boot_from("nvme0n1p1");
+        fs::remove_file(sys.dev.join("disk/by-partlabel/APP_b")).unwrap();
+        let err = write_failure(resolve_partition_in(&sys.host(), "APP_b"));
+        assert_eq!(err, "Partition not found: /dev/disk/by-partlabel/APP_b");
+    }
+
+    #[test]
+    fn a_label_starting_with_a_slash_stays_under_by_partlabel() {
+        // Joined, an absolute label would replace the path and find root/.
+        let sys = FakeSys::new(&[NVME]);
+        let label = sys.root.to_str().unwrap().to_string();
+        assert!(label.starts_with('/'));
+        assert!(label_absent_in(&sys.host(), &label));
+    }
+
+    #[test]
+    fn an_unreadable_sysfs_directory_is_an_error() {
+        let sys = FakeSys::new(&[NVME]);
+        let missing = sys.sysblock().join("nvme9n9");
+        let err = devices_where(&missing, "PARTNAME", |_| true).unwrap_err();
+        assert!(
+            err.starts_with(&format!("cannot read {}: ", missing.display())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn root_device_is_the_device_the_root_filesystem_lives_on() {
+        // st_dev of a directory names its filesystem's device; st_rdev of a
+        // directory is 0 and names nothing.
+        let sys = FakeSys::new(&[NVME]);
+        let dev = root_device(&sys.root).unwrap();
+        assert_ne!(dev, 0);
+        assert_eq!(dev, fs::metadata(sys.dev.join("nvme0n1p1")).unwrap().dev());
+    }
+
+    #[test]
+    fn a_duplicated_slot_label_on_the_booted_esp_disk_is_refused() {
+        let twice: (&str, &[FakePart]) = (
+            "sda",
+            &[
+                ("sda1", 1, "boot-a", A_UUID),
+                ("sda2", 2, "boot-b", B_UUID),
+                ("sda3", 3, "boot-b", "22222222-0000-4000-8000-000000000003"),
+            ],
+        );
+        let sys = fake_sysblock_uevents(&[twice]);
+        assert_eq!(
+            slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b"),
+            Err(
+                "more than one partition on /dev/sda is labeled 'boot-b' (sda2, sda3); \
+                 refusing to pick one"
+                    .to_string()
+            )
+        );
     }
 }
