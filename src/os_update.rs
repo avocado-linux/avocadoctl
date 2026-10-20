@@ -223,6 +223,16 @@ pub struct PendingUpdate {
 pub fn apply_os_update(
     aos_path: &Path,
     base_dir: &Path,
+    verbose: bool,
+    target: Option<&crate::manifest::OsBundleRef>,
+) -> Result<bool, OsUpdateError> {
+    apply_os_update_in(&running_host(), aos_path, base_dir, verbose, target)
+}
+
+fn apply_os_update_in(
+    host: &BlockHost,
+    aos_path: &Path,
+    base_dir: &Path,
     _verbose: bool,
     target: Option<&crate::manifest::OsBundleRef>,
 ) -> Result<bool, OsUpdateError> {
@@ -286,6 +296,8 @@ pub fn apply_os_update(
 
     println!("    Current slot: {current_slot}, inactive slot: {inactive_slot}");
 
+    let targets = resolve_slot_targets(host, update, &inactive_slot, bundle.layout.as_ref())?;
+
     // Write the pending-update marker BEFORE any artifact is written. On a
     // sorting loader (systemd-boot picks the highest-versioned UKI) the `file:`
     // artifact write IS the activation -- there is no later pointer flip -- so a
@@ -309,20 +321,15 @@ pub fn apply_os_update(
     write_pending_update(&pending, base_dir)?;
 
     // Write each artifact to the inactive slot's partition
-    for artifact in &update.artifacts {
-        let target = artifact.slot_targets.get(&inactive_slot).ok_or_else(|| {
-            OsUpdateError::ArtifactWriteFailed(format!(
-                "No slot target for slot '{}' in artifact '{}'",
-                inactive_slot, artifact.name
-            ))
-        })?;
+    for (artifact, write_target) in update.artifacts.iter().zip(targets) {
+        let target = slot_target(artifact, &inactive_slot)?;
 
         let source_path = staging_dir.join(&artifact.file);
 
         // Verify SHA256 of source file
         verify_sha256(&source_path, &artifact.sha256, &artifact.name)?;
 
-        match locate_target(&target.partition, bundle.layout.as_ref())? {
+        match write_target {
             WriteTarget::Partition(partition_path) => {
                 println!(
                     "    Writing {} -> {} (partition: {})",
@@ -1278,13 +1285,6 @@ fn write_to_emmc_boot(source: &Path, dev: &Path, artifact_name: &str) -> Result<
 /// disk on i.MX: the manifest's devpath names the eMMC as /dev/mmcblk1, the
 /// running kernel enumerates it as /dev/mmcblk2, and the computed offsets need
 /// not match where the flasher actually placed the partitions.
-fn locate_target(
-    partition_name: &str,
-    layout: Option<&BundleLayout>,
-) -> Result<WriteTarget, OsUpdateError> {
-    locate_target_in(&running_host(), partition_name, layout)
-}
-
 fn locate_target_in(
     host: &BlockHost,
     partition_name: &str,
@@ -1335,6 +1335,45 @@ fn locate_target_in(
         ))),
         None => Err(not_found(partition_name)),
     }
+}
+
+/// `artifact`'s target in `slot`.
+fn slot_target<'a>(artifact: &'a Artifact, slot: &str) -> Result<&'a SlotTarget, OsUpdateError> {
+    artifact.slot_targets.get(slot).ok_or_else(|| {
+        OsUpdateError::ArtifactWriteFailed(format!(
+            "No slot target for slot '{}' in artifact '{}'",
+            slot, artifact.name
+        ))
+    })
+}
+
+/// Every artifact's write target in `slot`, in manifest order, resolved before
+/// the pending marker or any byte is written. Resolution is where a target is
+/// refused (the running root, a label on another disk, a duplicate), and a
+/// refusal halfway through the writes would leave the slot half written behind
+/// a marker. The boot partition sdboot-ab patches after the writes is resolved
+/// here too, for the same reason.
+fn resolve_slot_targets(
+    host: &BlockHost,
+    update: &UpdateConfig,
+    slot: &str,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<WriteTarget>, OsUpdateError> {
+    let mut targets = Vec::with_capacity(update.artifacts.len());
+    for artifact in &update.artifacts {
+        let target = slot_target(artifact, slot)?;
+        targets.push(locate_target_in(host, &target.partition, layout)?);
+    }
+    if update.strategy == "sdboot-ab" {
+        for artifact in update.artifacts.iter().filter(|a| a.name == "boot") {
+            if let Some(target) = artifact.slot_targets.get(slot) {
+                if has_bls_entry(&target.partition) {
+                    resolve_partition_in(host, &target.partition)?;
+                }
+            }
+        }
+    }
+    Ok(targets)
 }
 
 /// The paths label resolution reads: the directory whose device number names
@@ -2144,31 +2183,61 @@ fn promoted_boot_order(order: &[String], boot_num: &str) -> Vec<String> {
         .collect()
 }
 
+/// `cannot read <path>: <e>`, the error every sysfs read below reports.
+fn read_err(path: &Path, e: io::Error) -> String {
+    format!("cannot read {}: {e}", path.display())
+}
+
+/// Whether a sysfs read failed because the attribute is not there, which is
+/// how sysfs says a device is not a partition or not stacked on anything. Any
+/// other failure must stay an error: read as absence it would turn the booted
+/// partition into an unanchored root, or hide a device from a uniqueness check.
+fn is_absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
 /// Whole-disk name and GPT partition number of the partition device `part`
 /// (e.g. `sda2` -> (`sda`, 2)), read from a sysfs block class directory.
 /// `<sysblock>/<part>` links into its disk's directory, so `..` is the disk.
-fn partition_location(sysblock: &Path, part: &str) -> Option<(String, u32)> {
+/// `None` when `part` is not a partition (a disk, a dm device).
+fn partition_location(sysblock: &Path, part: &str) -> Result<Option<(String, u32)>, String> {
     let dir = sysblock.join(part);
-    let number = fs::read_to_string(dir.join("partition"))
-        .ok()?
+    let path = dir.join("partition");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if is_absent(&e) => return Ok(None),
+        Err(e) => return Err(read_err(&path, e)),
+    };
+    let number = text
         .trim()
         .parse()
-        .ok()?;
-    let disk = fs::canonicalize(dir.join(".."))
-        .ok()?
-        .file_name()?
-        .to_str()?
+        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    let parent = dir.join("..");
+    let disk = fs::canonicalize(&parent)
+        .map_err(|e| read_err(&parent, e))?
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("{} names no disk", parent.display()))?
         .to_string();
-    Some((disk, number))
+    Ok(Some((disk, number)))
+}
+
+/// `key`'s value in a uevent file's text.
+fn uevent_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
 }
 
 /// `key`'s value in the uevent file of `<sysblock>/<dev>`, which is where the
-/// kernel publishes a partition's PARTNAME and (since 6.13) PARTUUID.
-fn uevent_value(dir: &Path, key: &str) -> Option<String> {
-    fs::read_to_string(dir.join("uevent"))
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
+/// kernel publishes a partition's PARTNAME and (since 6.13) PARTUUID. Decoded
+/// lossily: a uevent can carry raw device bytes (an MMC card's MMC_NAME), and
+/// the keys looked up here are ASCII either way.
+fn uevent_value(dir: &Path, key: &str) -> io::Result<Option<String>> {
+    let bytes = fs::read(dir.join("uevent"))?;
+    Ok(uevent_field(&String::from_utf8_lossy(&bytes), key).map(str::to_string))
 }
 
 /// The entries of `dir` whose uevent `key` satisfies `matches`, sorted.
@@ -2182,27 +2251,15 @@ fn devices_where(
     key: &str,
     matches: impl Fn(&str) -> bool,
 ) -> Result<Vec<String>, String> {
-    let read_err = |path: &Path, e: io::Error| format!("cannot read {}: {e}", path.display());
     let mut names = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| read_err(dir, e))? {
         let entry = entry.map_err(|e| read_err(dir, e))?;
-        let uevent = entry.path().join("uevent");
-        let text = match fs::read_to_string(&uevent) {
-            Ok(text) => text,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                continue;
-            }
-            Err(e) => return Err(read_err(&uevent, e)),
+        let value = match uevent_value(&entry.path(), key) {
+            Ok(value) => value,
+            Err(e) if is_absent(&e) => continue,
+            Err(e) => return Err(read_err(&entry.path().join("uevent"), e)),
         };
-        let value = text
-            .lines()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='));
-        if value.is_some_and(&matches) {
+        if value.as_deref().is_some_and(&matches) {
             if let Ok(name) = entry.file_name().into_string() {
                 names.push(name);
             }
@@ -2238,16 +2295,18 @@ fn slot_partition_on_booted_disk(
     label: &str,
 ) -> Result<SlotPartition, String> {
     let esp = unique_partition_with_partuuid(sysblock, booted_esp)?;
-    let (disk, _) = partition_location(sysblock, &esp)
+    let (disk, _) = partition_location(sysblock, &esp)?
         .ok_or_else(|| format!("cannot find the disk holding the booted ESP {esp}"))?;
     let part = partition_on_disk(sysblock, &disk, label)?;
-    let partuuid = uevent_value(&sysblock.join(&part), "PARTUUID")
+    let part_dir = sysblock.join(&part);
+    let partuuid = uevent_value(&part_dir, "PARTUUID")
+        .map_err(|e| read_err(&part_dir.join("uevent"), e))?
         .filter(|u| u.len() == 36)
         .ok_or_else(|| format!("{part} has no PARTUUID"))?
         .to_ascii_lowercase();
     // A second disk carrying just this partition's copy is refused too.
     unique_partition_with_partuuid(sysblock, &partuuid)?;
-    let (_, number) = partition_location(sysblock, &part)
+    let (_, number) = partition_location(sysblock, &part)?
         .ok_or_else(|| format!("cannot find the partition number of {part}"))?;
     Ok(SlotPartition {
         disk: format!("/dev/{disk}"),
@@ -2263,12 +2322,26 @@ struct BootedPartition {
     disk: String,
 }
 
-/// How many stacked device-mapper layers (dm-crypt over dm-verity, say)
-/// booted_partition follows down to a partition.
+/// How many stacked device-mapper layers (dm-crypt over dm-verity, say) are
+/// followed down from `/` to the partitions underneath.
 const MAX_DM_DEPTH: usize = 8;
 
-/// The partition behind `/`, found from its device number through
-/// `<sys>/dev/block/MAJ:MIN`. A device-mapper root (dm-verity, dm-crypt) is
+/// The name of the block device `/` is mounted from, found from its device
+/// number through `<sys>/dev/block/MAJ:MIN`. `None` for an anonymous device
+/// (an overlay or tmpfs root), which has no entry there.
+fn root_block_device(sys: &Path, root_dev: u64) -> Result<Option<String>, String> {
+    let link = sys.join("dev/block").join(dev_maj_min(root_dev));
+    match fs::canonicalize(&link) {
+        Ok(path) => Ok(path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)),
+        Err(e) if is_absent(&e) => Ok(None),
+        Err(e) => Err(read_err(&link, e)),
+    }
+}
+
+/// The partition behind `/`. A device-mapper root (dm-verity, dm-crypt) is
 /// followed through `slaves/` while it is stacked on exactly one device, so it
 /// anchors to the partition it is built on. `None` when `/` is not a partition
 /// and does not reduce to one: an overlay or tmpfs root has an anonymous device
@@ -2279,32 +2352,72 @@ const MAX_DM_DEPTH: usize = 8;
 /// Tegra's initrd mounts the APP partition straight onto /sysroot. The `var`
 /// partition's label is as ambiguous as the slot labels on a board provisioned
 /// to two media, and LoaderDevicePartUUID exists only under systemd-boot.
-fn booted_partition(sys: &Path, root_dev: u64) -> Option<BootedPartition> {
+fn booted_partition(sys: &Path, root_dev: u64) -> Result<Option<BootedPartition>, String> {
     let sysblock = sys.join("class/block");
-    let mut part = fs::canonicalize(sys.join("dev/block").join(dev_maj_min(root_dev)))
-        .ok()?
-        .file_name()?
-        .to_str()?
-        .to_string();
+    let Some(mut part) = root_block_device(sys, root_dev)? else {
+        return Ok(None);
+    };
     for _ in 0..MAX_DM_DEPTH {
-        if let Some((disk, _)) = partition_location(&sysblock, &part) {
-            return Some(BootedPartition { part, disk });
+        if let Some((disk, _)) = partition_location(&sysblock, &part)? {
+            return Ok(Some(BootedPartition { part, disk }));
         }
-        part = single_slave(&sysblock, &part)?;
+        let mut below = slaves(&sysblock, &part)?;
+        if below.len() != 1 {
+            return Ok(None);
+        }
+        part = below.remove(0);
     }
-    None
+    Ok(None)
 }
 
-/// The one device `dev` is stacked on, from `<sysblock>/<dev>/slaves/`. `None`
-/// with none (a disk or partition) or several, where no single device is the
-/// one underneath.
-fn single_slave(sysblock: &Path, dev: &str) -> Option<String> {
-    let mut slaves = fs::read_dir(sysblock.join(dev).join("slaves")).ok()?;
-    let only = slaves.next()?.ok()?;
-    if slaves.next().is_some() {
-        return None;
+/// The devices `dev` is stacked on, from `<sysblock>/<dev>/slaves/`, sorted:
+/// none for a disk or partition, several for a dm device spanning more than
+/// one.
+fn slaves(sysblock: &Path, dev: &str) -> Result<Vec<String>, String> {
+    let dir = sysblock.join(dev).join("slaves");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if is_absent(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(read_err(&dir, e)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| read_err(&dir, e))?;
+        if let Ok(name) = entry.file_name().into_string() {
+            names.push(name);
+        }
     }
-    only.file_name().into_string().ok()
+    names.sort();
+    Ok(names)
+}
+
+/// Every device `/` is built from: its own device and everything stacked
+/// beneath it, so a verity root's hash partition counts as much as its data
+/// partition. A stack deeper than MAX_DM_DEPTH is an error rather than a
+/// partial answer, which could leave a running partition writable.
+fn root_stack(sys: &Path, root_dev: u64) -> Result<Vec<String>, String> {
+    let sysblock = sys.join("class/block");
+    let mut stack: Vec<String> = root_block_device(sys, root_dev)?.into_iter().collect();
+    let mut layer = stack.clone();
+    for _ in 0..=MAX_DM_DEPTH {
+        let mut below = Vec::new();
+        for dev in &layer {
+            for slave in slaves(&sysblock, dev)? {
+                if !stack.contains(&slave) {
+                    stack.push(slave.clone());
+                    below.push(slave);
+                }
+            }
+        }
+        if below.is_empty() {
+            return Ok(stack);
+        }
+        layer = below;
+    }
+    Err(format!(
+        "/ is stacked more than {MAX_DM_DEPTH} device-mapper layers deep; cannot tell which \
+         partitions it runs from"
+    ))
 }
 
 /// The one partition on `disk` whose GPT name is `label`. Zero is an error
@@ -2346,18 +2459,32 @@ enum LabelTarget {
 /// Resolve `label` against the disk `/` (device `root_dev`) lives on, so a
 /// second medium provisioned with the same GPT names is never written. When `/`
 /// does not reduce to a partition (see booted_partition) there is no booted
-/// disk to anchor to, and the label is accepted only when it is unique across
-/// every block device.
+/// disk to anchor to, and the label is accepted only when exactly one partition
+/// carries it and that partition is not part of what `/` runs from.
 fn resolve_label(sys: &Path, root_dev: u64, label: &str) -> Result<LabelTarget, String> {
     let sysblock = sys.join("class/block");
-    let Some(root) = booted_partition(sys, root_dev) else {
-        let all = devices_where(&sysblock, "PARTNAME", |n| n == label)?;
-        if all.len() > 1 {
+    let Some(root) = booted_partition(sys, root_dev)? else {
+        let mut all = devices_where(&sysblock, "PARTNAME", |n| n == label)?;
+        let part = match all.len() {
+            1 => all.remove(0),
+            0 => {
+                return Err(format!(
+                    "no partition reports PARTNAME '{label}' in sysfs; cannot verify it is \
+                     unique"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "partition label '{label}' is carried by more than one partition ({}) and / \
+                     is not a partition, so the booted disk cannot be told apart; detach the \
+                     other medium",
+                    all.join(", ")
+                ));
+            }
+        };
+        if root_stack(sys, root_dev)?.contains(&part) {
             return Err(format!(
-                "partition label '{label}' is carried by more than one partition ({}) and / is \
-                 not a partition, so the booted disk cannot be told apart; detach the other \
-                 medium",
-                all.join(", ")
+                "refusing to write '{label}': /dev/{part} backs the running root filesystem"
             ));
         }
         return Ok(LabelTarget::ByPartlabel);
@@ -2488,7 +2615,7 @@ fn maybe_patch_bls_entries(
                 // this medium; passing either to resolve_partition would fail the
                 // update after the file was already written.
                 let p = &target.partition;
-                if p == "skip" || p.starts_with("file:") {
+                if !has_bls_entry(p) {
                     println!("    Boot target {p}: no BLS entry to patch, skipping");
                     continue;
                 }
@@ -2499,6 +2626,11 @@ fn maybe_patch_bls_entries(
     }
 
     Ok(())
+}
+
+/// Whether a boot artifact's target is a partition with a BLS entry to patch.
+fn has_bls_entry(partition: &str) -> bool {
+    partition != "skip" && !partition.starts_with("file:")
 }
 
 pub(crate) fn parse_os_release_field<'a>(contents: &'a str, field: &str) -> Option<&'a str> {
@@ -2670,6 +2802,16 @@ fn stream_to_device_at_offset(
 pub fn apply_os_update_streaming<R: Read>(
     reader: R,
     base_dir: &Path,
+    verbose: bool,
+    target: Option<&crate::manifest::OsBundleRef>,
+) -> Result<bool, OsUpdateError> {
+    apply_os_update_streaming_in(&running_host(), reader, base_dir, verbose, target)
+}
+
+fn apply_os_update_streaming_in<R: Read>(
+    host: &BlockHost,
+    reader: R,
+    base_dir: &Path,
     _verbose: bool,
     target: Option<&crate::manifest::OsBundleRef>,
 ) -> Result<bool, OsUpdateError> {
@@ -2755,6 +2897,8 @@ pub fn apply_os_update_streaming<R: Read>(
 
     println!("    Current slot: {current_slot}, inactive slot: {inactive_slot}");
 
+    let targets = resolve_slot_targets(host, update, &inactive_slot, bundle.layout.as_ref())?;
+
     // Write the pending-update marker BEFORE streaming any artifact, for the
     // same reason as the staged path: on a sorting loader the `file:` write is
     // the activation, so a marker written after the loop leaves a window where a
@@ -2773,11 +2917,12 @@ pub fn apply_os_update_streaming<R: Read>(
     };
     write_pending_update(&pending, base_dir)?;
 
-    // 4. Build lookup: archive path → artifact metadata
-    let artifact_map: HashMap<&str, &Artifact> = update
+    // 4. Build lookup: archive path → artifact metadata and its resolved target
+    let artifact_map: HashMap<&str, (&Artifact, &WriteTarget)> = update
         .artifacts
         .iter()
-        .map(|a| (a.file.as_str(), a))
+        .zip(&targets)
+        .map(|(a, t)| (a.file.as_str(), (a, t)))
         .collect();
 
     let mut seen = std::collections::HashSet::new();
@@ -2798,8 +2943,8 @@ pub fn apply_os_update_streaming<R: Read>(
         let entry_path_str = entry_path.to_string_lossy().to_string();
 
         // Skip entries that aren't in the artifact list (e.g. directories)
-        let artifact = match artifact_map.get(entry_path_str.as_str()) {
-            Some(a) => a,
+        let (artifact, write_target) = match artifact_map.get(entry_path_str.as_str()) {
+            Some(&found) => found,
             None => continue,
         };
 
@@ -2814,26 +2959,16 @@ pub fn apply_os_update_streaming<R: Read>(
             )));
         }
 
-        let target = artifact.slot_targets.get(&inactive_slot).ok_or_else(|| {
-            OsUpdateError::ArtifactWriteFailed(format!(
-                "No slot target for slot '{}' in artifact '{}'",
-                inactive_slot, artifact.name
-            ))
-        })?;
+        let target = slot_target(artifact, &inactive_slot)?;
 
         println!(
             "    Streaming {} -> partition {}",
             artifact.name, target.partition
         );
 
-        match locate_target(&target.partition, bundle.layout.as_ref())? {
+        match write_target {
             WriteTarget::Partition(partition_path) => {
-                stream_to_partition(
-                    &mut entry,
-                    &partition_path,
-                    &artifact.sha256,
-                    &artifact.name,
-                )?;
+                stream_to_partition(&mut entry, partition_path, &artifact.sha256, &artifact.name)?;
             }
             WriteTarget::Offset {
                 device,
@@ -2841,8 +2976,8 @@ pub fn apply_os_update_streaming<R: Read>(
             } => {
                 stream_to_device_at_offset(
                     &mut entry,
-                    &device,
-                    byte_offset,
+                    device,
+                    *byte_offset,
                     &artifact.sha256,
                     &artifact.name,
                 )?;
@@ -2866,7 +3001,7 @@ pub fn apply_os_update_streaming<R: Read>(
                         ))
                     })?;
                     verify_sha256(&tmp, &artifact.sha256, &artifact.name)?;
-                    write_to_emmc_boot(&tmp, &dev, &artifact.name)
+                    write_to_emmc_boot(&tmp, dev, &artifact.name)
                 })();
                 let _ = fs::remove_file(&tmp);
                 spooled?;
@@ -2891,7 +3026,7 @@ pub fn apply_os_update_streaming<R: Read>(
                         ))
                     })?;
                     verify_sha256(&tmp, &artifact.sha256, &artifact.name)?;
-                    write_to_fs_file(&tmp, &label, &rel_path, &artifact.name)
+                    write_to_fs_file(&tmp, label, rel_path, &artifact.name)
                 })();
                 let _ = fs::remove_file(&tmp);
                 spooled?;
@@ -3475,7 +3610,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
     /// and that must not fail the update the way a missing target does.
     #[test]
     fn test_skip_target_is_not_an_error() {
-        match locate_target("skip", None).expect("skip must resolve") {
+        match locate_target_in(&running_host(), "skip", None).expect("skip must resolve") {
             WriteTarget::NotOnThisMedium(reason) => assert!(reason.contains("skip")),
             other => panic!("expected NotOnThisMedium, got {other:?}"),
         }
@@ -4734,7 +4869,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let sys = fake_sysblock("sda", &[("sda1", 1), ("sda2", 2)]);
         assert_eq!(
             partition_location(sys.path(), "sda2"),
-            Some(("sda".to_string(), 2))
+            Ok(Some(("sda".to_string(), 2)))
         );
     }
 
@@ -4743,14 +4878,14 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let sys = fake_sysblock("nvme0n1", &[("nvme0n1p2", 2)]);
         assert_eq!(
             partition_location(sys.path(), "nvme0n1p2"),
-            Some(("nvme0n1".to_string(), 2))
+            Ok(Some(("nvme0n1".to_string(), 2)))
         );
     }
 
     #[test]
     fn a_whole_disk_is_not_a_partition() {
         let sys = fake_sysblock("sda", &[("sda1", 1)]);
-        assert_eq!(partition_location(sys.path(), "sda"), None);
+        assert_eq!(partition_location(sys.path(), "sda"), Ok(None));
     }
 
     /// A sysfs block class with a uevent per partition, the way the kernel
@@ -4850,6 +4985,22 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let sys = fake_sysblock_uevents(&[BOOTED_SDA, clone]);
         let err = slot_partition_on_booted_disk(sys.path(), A_UUID, "boot-b").unwrap_err();
         assert!(err.contains("sda1") && err.contains("sdb1"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_uevent_never_passes_the_partuuid_uniqueness_check() {
+        // Read as "no PARTUUID", the clone's copy would vanish and sda1 pass.
+        let clone: (&str, &[FakePart]) = (
+            "sdb",
+            &[("sdb1", 1, "boot-a", A_UUID), ("sdb2", 2, "boot-b", B_UUID)],
+        );
+        let sys = fake_sysblock_uevents(&[BOOTED_SDA, clone]);
+        let uevent = sys.path().join("sdb1/uevent");
+        fs::remove_file(&uevent).unwrap();
+        fs::create_dir(&uevent).unwrap();
+        let err = unique_partition_with_partuuid(sys.path(), A_UUID).unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
+        assert!(err.contains("sdb1/uevent"), "{err}");
     }
 
     #[test]
@@ -4967,12 +5118,20 @@ PRETTY_NAME="Avocado Linux 2024.1"
         libc::makedev(0, 42)
     }
 
+    /// First minors of the fake disks and dm devices. root/'s real device
+    /// number must never name a fake, or a test would anchor to a fake
+    /// partition by accident. A real block major can be anything (dm, zram and
+    /// virtio-blk take dynamic ones from 254 down), so the fakes use the
+    /// anonymous major 0 with minors far above the ones the kernel hands out to
+    /// tmpfs and btrfs mounts.
+    const FAKE_DISK_MINOR: u32 = 0x8_0000;
+    const FAKE_DM_MINOR: u32 = 0xf_0000;
+
     /// A scratch system: `sys/` (class/block and dev/block), `dev/` (a file per
     /// partition plus udev's by-partlabel links) and `root/`, the directory
     /// standing in for `/`. Every disk and partition gets its own maj:min, as
     /// the kernel gives them, so a lookup that ignores the device number lands
-    /// on the wrong device. Majors start at 240 (the local/experimental range),
-    /// clear of the anonymous major 0 that root/ itself lives on.
+    /// on the wrong device.
     struct FakeSys {
         _dir: TempDir,
         root: PathBuf,
@@ -5002,10 +5161,10 @@ PRETTY_NAME="Avocado Linux 2024.1"
                 next_dm: 0,
             };
             for (i, (disk, parts)) in disks.iter().enumerate() {
-                let major = 240 + i as u32;
-                fake.add_dev(disk, libc::makedev(major, 0));
+                let minor = FAKE_DISK_MINOR + 256 * i as u32;
+                fake.add_dev(disk, libc::makedev(0, minor));
                 for (name, num, partname, _) in *parts {
-                    fake.add_dev(name, libc::makedev(major, *num));
+                    fake.add_dev(name, libc::makedev(0, minor + num));
                     fs::write(fake.dev.join(name), "").unwrap();
                     // udev keeps one link per label; the first disk listed wins.
                     let link = fake.dev.join("disk/by-partlabel").join(partname);
@@ -5055,7 +5214,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
                 )
                 .unwrap();
             }
-            let dev = libc::makedev(250, self.next_dm);
+            let dev = libc::makedev(0, FAKE_DM_MINOR + self.next_dm);
             self.next_dm += 1;
             self.add_dev(&name, dev);
             dev
@@ -5073,9 +5232,14 @@ PRETTY_NAME="Avocado Linux 2024.1"
         /// Make reading `part`'s uevent fail (EISDIR), the way an I/O or
         /// permission error would.
         fn break_uevent(&self, part: &str) {
-            let uevent = self.sysblock().join(part).join("uevent");
-            fs::remove_file(&uevent).unwrap();
-            fs::create_dir(&uevent).unwrap();
+            self.break_attr(part, "uevent");
+        }
+
+        /// Make reading `part`'s sysfs attribute `attr` fail (EISDIR).
+        fn break_attr(&self, part: &str, attr: &str) {
+            let path = self.sysblock().join(part).join(attr);
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
         }
 
         fn host(&self) -> BlockHost<'_> {
@@ -5105,10 +5269,10 @@ PRETTY_NAME="Avocado Linux 2024.1"
         ] {
             assert_eq!(
                 booted_partition(&sys.sys, sys.dev(part)),
-                Some(BootedPartition {
+                Ok(Some(BootedPartition {
                     part: part.to_string(),
                     disk: disk.to_string(),
-                }),
+                })),
                 "root on {part}"
             );
         }
@@ -5117,20 +5281,20 @@ PRETTY_NAME="Avocado Linux 2024.1"
     #[test]
     fn an_overlay_root_has_no_booted_partition() {
         let sys = FakeSys::new(&[SD, NVME]);
-        assert_eq!(booted_partition(&sys.sys, anon_dev()), None);
+        assert_eq!(booted_partition(&sys.sys, anon_dev()), Ok(None));
     }
 
     #[test]
     fn a_whole_disk_root_has_no_booted_partition() {
         let sys = FakeSys::new(&[SD, NVME]);
-        assert_eq!(booted_partition(&sys.sys, sys.dev("nvme0n1")), None);
+        assert_eq!(booted_partition(&sys.sys, sys.dev("nvme0n1")), Ok(None));
     }
 
     #[test]
     fn a_dm_root_without_backing_devices_has_no_booted_partition() {
         let mut sys = FakeSys::new(&[NVME]);
         let dm = sys.add_dm(&[]);
-        assert_eq!(booted_partition(&sys.sys, dm), None);
+        assert_eq!(booted_partition(&sys.sys, dm), Ok(None));
     }
 
     #[test]
@@ -5139,10 +5303,10 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let dm = sys.add_dm(&["nvme0n1p1"]);
         assert_eq!(
             booted_partition(&sys.sys, dm),
-            Some(BootedPartition {
+            Ok(Some(BootedPartition {
                 part: "nvme0n1p1".to_string(),
                 disk: "nvme0n1".to_string(),
-            })
+            }))
         );
     }
 
@@ -5153,10 +5317,10 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let crypt = sys.add_dm(&["dm-0"]);
         assert_eq!(
             booted_partition(&sys.sys, crypt),
-            Some(BootedPartition {
+            Ok(Some(BootedPartition {
                 part: "mmcblk0p1".to_string(),
                 disk: "mmcblk0".to_string(),
-            })
+            }))
         );
     }
 
@@ -5165,7 +5329,20 @@ PRETTY_NAME="Avocado Linux 2024.1"
         // dm-verity with its hash tree on a partition of its own.
         let mut sys = FakeSys::new(&[SD, NVME]);
         let dm = sys.add_dm(&["nvme0n1p1", "nvme0n1p2"]);
-        assert_eq!(booted_partition(&sys.sys, dm), None);
+        assert_eq!(booted_partition(&sys.sys, dm), Ok(None));
+    }
+
+    #[test]
+    fn a_dm_cycle_stops_at_the_depth_limit() {
+        // dm-0 and dm-1 each list the other as a slave.
+        let mut sys = FakeSys::new(&[NVME]);
+        sys.add_dm(&["dm-1"]);
+        let dm = sys.add_dm(&["dm-0"]);
+        assert_eq!(booted_partition(&sys.sys, dm), Ok(None));
+        assert_eq!(
+            resolve_label(&sys.sys, dm, "APP_b"),
+            Ok(LabelTarget::ByPartlabel)
+        );
     }
 
     #[test]
@@ -5316,13 +5493,100 @@ PRETTY_NAME="Avocado Linux 2024.1"
         );
     }
 
+    /// An i.MX eMMC with dm-verity roots: each slot's data and its hash tree
+    /// live on partitions of their own, so `/` never reduces to one partition.
+    const VERITY_MMC: (&str, &[FakePart]) = (
+        "mmcblk2",
+        &[
+            (
+                "mmcblk2p1",
+                1,
+                "rootfs-a",
+                "66666666-0000-4000-8000-000000000001",
+            ),
+            (
+                "mmcblk2p2",
+                2,
+                "rootfs-a-hash",
+                "66666666-0000-4000-8000-000000000002",
+            ),
+            (
+                "mmcblk2p3",
+                3,
+                "rootfs-b",
+                "66666666-0000-4000-8000-000000000003",
+            ),
+            (
+                "mmcblk2p4",
+                4,
+                "rootfs-b-hash",
+                "66666666-0000-4000-8000-000000000004",
+            ),
+        ],
+    );
+
     #[test]
     fn a_unique_label_with_an_unanchored_dm_root_falls_back_to_by_partlabel() {
-        let mut sys = FakeSys::new(&[NVME]);
-        let dm = sys.add_dm(&["nvme0n1p1", "nvme0n1p2"]);
+        let mut sys = FakeSys::new(&[VERITY_MMC]);
+        let dm = sys.add_dm(&["mmcblk2p1", "mmcblk2p2"]);
         assert_eq!(
-            resolve_label(&sys.sys, dm, "APP_b"),
+            resolve_label(&sys.sys, dm, "rootfs-b"),
             Ok(LabelTarget::ByPartlabel)
+        );
+    }
+
+    #[test]
+    fn an_unanchored_dm_root_refuses_the_data_partition_it_runs_from() {
+        let mut sys = FakeSys::new(&[VERITY_MMC]);
+        let dm = sys.add_dm(&["mmcblk2p1", "mmcblk2p2"]);
+        assert_eq!(
+            resolve_label(&sys.sys, dm, "rootfs-a"),
+            Err(
+                "refusing to write 'rootfs-a': /dev/mmcblk2p1 backs the running root filesystem"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn an_unanchored_dm_root_refuses_the_hash_partition_beneath_a_stacked_layer() {
+        let mut sys = FakeSys::new(&[VERITY_MMC]);
+        sys.add_dm(&["mmcblk2p1", "mmcblk2p2"]); // dm-0, the verity layer
+        let crypt = sys.add_dm(&["dm-0"]);
+        assert_eq!(
+            resolve_label(&sys.sys, crypt, "rootfs-a-hash"),
+            Err(
+                "refusing to write 'rootfs-a-hash': /dev/mmcblk2p2 backs the running root \
+                 filesystem"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_by_partlabel_link_no_partition_reports_is_refused() {
+        // udev and sysfs disagree: the link exists, but no uevent carries the
+        // name, so uniqueness cannot be checked.
+        let sys = FakeSys::new(&[NVME]);
+        std::os::unix::fs::symlink("../../nvme0n1p2", sys.dev.join("disk/by-partlabel/ghost"))
+            .unwrap();
+        let err = write_failure(resolve_partition_in(&sys.host(), "ghost"));
+        assert_eq!(
+            err,
+            "no partition reports PARTNAME 'ghost' in sysfs; cannot verify it is unique"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_uevent_beside_the_partitions_does_not_stop_the_lookup() {
+        // An MMC card's device/uevent carries MMC_NAME, raw bytes from the card.
+        let sys = FakeSys::new(&[SD, NVME]);
+        let device = sys.sysblock().join("mmcblk0/device");
+        fs::create_dir(&device).unwrap();
+        fs::write(device.join("uevent"), b"MMC_NAME=\xff\xfe\nMMC_TYPE=SD\n").unwrap();
+        assert_eq!(
+            resolve_label(&sys.sys, sys.dev("mmcblk0p1"), "APP_b"),
+            Ok(LabelTarget::OnBootedDisk("mmcblk0p2".to_string()))
         );
     }
 
@@ -5378,6 +5642,29 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let err = resolve_label(&sys.sys, anon_dev(), "APP_b").unwrap_err();
         assert!(err.starts_with("cannot read "), "{err}");
         assert!(err.contains("mmcblk0p2/uevent"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_partition_number_on_the_root_is_an_error_not_an_unanchored_root() {
+        // Read as "not a partition", the root would fall back to by-partlabel.
+        let sys = FakeSys::new(&[NVME]);
+        sys.break_attr("nvme0n1p1", "partition");
+        let err = resolve_label(&sys.sys, sys.dev("nvme0n1p1"), "APP_b").unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
+        assert!(err.contains("nvme0n1p1/partition"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_slaves_directory_is_an_error_not_an_unanchored_root() {
+        let mut sys = FakeSys::new(&[NVME]);
+        let dm = sys.add_dm(&["nvme0n1p1"]);
+        let slaves = sys.sysblock().join("dm-0/slaves");
+        fs::remove_dir_all(&slaves).unwrap();
+        // ELOOP: neither NotFound nor NotADirectory.
+        std::os::unix::fs::symlink("slaves", &slaves).unwrap();
+        let err = resolve_label(&sys.sys, dm, "APP_b").unwrap_err();
+        assert!(err.starts_with("cannot read "), "{err}");
+        assert!(err.contains("dm-0/slaves"), "{err}");
     }
 
     // locate_target and resolve_partition against a whole fake host: root/'s
@@ -5510,10 +5797,26 @@ PRETTY_NAME="Avocado Linux 2024.1"
     }
 
     #[test]
-    fn an_unlabeled_partition_without_a_layout_or_booted_disk_is_not_found() {
+    fn a_present_label_with_an_anonymous_root_is_written_through_by_partlabel() {
+        // root/ is never pointed at a fake device, so / reduces to no partition.
         let sys = FakeSys::new(&[NVME]);
-        let err = write_failure(locate_target_in(&sys.host(), "rootfs-b", None));
-        assert_eq!(err, "Partition not found: /dev/disk/by-partlabel/rootfs-b");
+        match locate_target_in(&sys.host(), "APP_b", None) {
+            Ok(WriteTarget::Partition(p)) => {
+                assert_eq!(p, fs::canonicalize(sys.dev.join("nvme0n1p2")).unwrap())
+            }
+            other => panic!("expected the by-partlabel partition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unstattable_root_is_an_error_not_an_unanchored_root() {
+        let sys = FakeSys::new(&[NVME]);
+        fs::remove_dir(&sys.root).unwrap();
+        let err = write_failure(resolve_partition_in(&sys.host(), "APP_b"));
+        assert_eq!(
+            err,
+            format!("cannot stat {} to find the booted disk", sys.root.display())
+        );
     }
 
     #[test]
@@ -5603,6 +5906,137 @@ PRETTY_NAME="Avocado Linux 2024.1"
                  refusing to pick one"
                     .to_string()
             )
+        );
+    }
+
+    // Pre-flight: every artifact's target is resolved before the marker or any
+    // byte is written.
+
+    fn append_entry<W: Write>(tar: &mut tar::Builder<W>, path: &str, data: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, data).unwrap();
+    }
+
+    /// An .aos (tar.zst) updating slot b while `echo a` reports slot a running.
+    /// Each artifact: (name, slot b target, bytes).
+    fn slot_b_aos(
+        strategy: &str,
+        layout: Option<&BundleLayout>,
+        artifacts: &[(&str, &str, &[u8])],
+    ) -> Vec<u8> {
+        let entries: Vec<_> = artifacts
+            .iter()
+            .map(|(name, target, data)| {
+                serde_json::json!({
+                    "name": name,
+                    "file": format!("images/{name}.img"),
+                    "sha256": format!("{:x}", Sha256::digest(data)),
+                    "slot_targets": { "b": { "partition": target } },
+                })
+            })
+            .collect();
+        let bundle = serde_json::json!({
+            "format_version": 1,
+            "platform": "test-platform",
+            "architecture": "x86_64",
+            "os_build_id": "test-build-2",
+            "layout": layout,
+            "update": {
+                "strategy": strategy,
+                "slot_detection": { "type": "command", "command": ["echo", "a"] },
+                "artifacts": entries,
+                "activate": [],
+            },
+        });
+        let mut out = Vec::new();
+        let mut tar = tar::Builder::new(zstd::stream::Encoder::new(&mut out, 3).unwrap());
+        append_entry(
+            &mut tar,
+            "bundle.json",
+            &serde_json::to_vec(&bundle).unwrap(),
+        );
+        for (name, _, data) in artifacts {
+            append_entry(&mut tar, &format!("images/{name}.img"), data);
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        out
+    }
+
+    /// Apply `aos` through the staged and the streaming path in turn, each
+    /// with a fresh base directory, and check that neither wrote `untouched`
+    /// or left a pending marker. Returns both errors.
+    fn refused_before_any_write(sys: &FakeSys, aos: &[u8], untouched: &Path) -> [String; 2] {
+        let tmp = TempDir::new().unwrap();
+        let aos_path = tmp.path().join("update.aos");
+        fs::write(&aos_path, aos).unwrap();
+        let staged_base = tmp.path().join("staged");
+        let staged = write_failure(apply_os_update_in(
+            &sys.host(),
+            &aos_path,
+            &staged_base,
+            false,
+            None,
+        ));
+        let streamed_base = tmp.path().join("streamed");
+        fs::create_dir(&streamed_base).unwrap();
+        let streamed = write_failure(apply_os_update_streaming_in(
+            &sys.host(),
+            io::Cursor::new(aos),
+            &streamed_base,
+            false,
+            None,
+        ));
+        for base in [&staged_base, &streamed_base] {
+            assert!(
+                !base.join(PENDING_UPDATE_FILENAME).exists(),
+                "marker left in {}",
+                base.display()
+            );
+        }
+        assert_eq!(
+            fs::read(untouched).unwrap(),
+            b"",
+            "{} was written",
+            untouched.display()
+        );
+        [staged, streamed]
+    }
+
+    #[test]
+    fn a_refused_later_artifact_leaves_the_slot_and_the_marker_untouched() {
+        let sys = FakeSys::new(&[NVME]);
+        sys.boot_from("nvme0n1p1");
+        let aos = slot_b_aos(
+            "uboot-ab",
+            None,
+            &[("first", "APP_b", b"new os"), ("second", "APP", b"x")],
+        );
+        let refusal = "refusing to write 'APP': /dev/nvme0n1p1 is the running root filesystem";
+        assert_eq!(
+            refused_before_any_write(&sys, &aos, &sys.dev.join("nvme0n1p2")),
+            [refusal, refusal]
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_bls_boot_label_is_refused_before_the_boot_artifact_is_written() {
+        // MBR: the boot artifact goes by offset, but the BLS patch that follows
+        // needs a partition label and would fail after the write.
+        let mbr: (&str, &[FakePart]) = ("mmcblk1", &[("mmcblk1p1", 1, "", "")]);
+        let sys = FakeSys::new(&[mbr]);
+        sys.boot_from("mmcblk1p1");
+        let disk = sys.dev.join("mmcblk1");
+        fs::write(&disk, "").unwrap();
+        let layout = listed_layout(disk.to_str().unwrap(), &[("boot-b", 4096.0)]);
+        let aos = slot_b_aos("sdboot-ab", Some(&layout), &[("boot", "boot-b", b"uki")]);
+        let not_found = "Partition not found: /dev/disk/by-partlabel/boot-b";
+        assert_eq!(
+            refused_before_any_write(&sys, &aos, &disk),
+            [not_found, not_found]
         );
     }
 }
