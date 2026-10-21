@@ -3957,7 +3957,13 @@ fn process_post_merge_tasks_for_extensions(
 
     // Phase 3: Reload systemd's unit database now that modules and libraries
     // are available, so units like proc-fs-nfsd.mount can start successfully
-    match std::process::Command::new("systemctl")
+    // Check if we're in test mode and should use mock commands
+    let systemctl = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
+        "mock-systemctl"
+    } else {
+        "systemctl"
+    };
+    match std::process::Command::new(systemctl)
         .arg("daemon-reload")
         .output()
     {

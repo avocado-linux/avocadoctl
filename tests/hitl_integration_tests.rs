@@ -181,6 +181,75 @@ fn test_hitl_mount_with_mocks() {
     // printed; the success line above is what proves the refresh ran.
 }
 
+/// Test mode must never reach the host's systemd. `hitl mount` runs the
+/// post-merge phase, which reloads systemd's unit database; with
+/// AVOCADO_TEST_MODE set that call has to go to a mock, not to the real
+/// `systemctl` on the machine running the tests.
+#[test]
+fn test_hitl_mount_does_not_reload_the_host_systemd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current_dir = std::env::current_dir().expect("Failed to get current directory");
+    let fixtures_path = current_dir.join("tests/fixtures");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let temp_path = temp_dir.path().to_string_lossy();
+
+    // A plain `systemctl` first on PATH that records its arguments. tests/fixtures
+    // only has mock-systemctl, so without this the real binary would run.
+    let shim_dir = temp_dir.path().join("shim");
+    std::fs::create_dir(&shim_dir).expect("Failed to create shim directory");
+    let shim_log = temp_dir.path().join("systemctl.log");
+    let shim = shim_dir.join("systemctl");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\necho \"$*\" >> \"$SYSTEMCTL_SHIM_LOG\"\nexit 0\n",
+    )
+    .expect("Failed to write systemctl shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("Failed to make systemctl shim executable");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!(
+        "{}:{}:{}",
+        shim_dir.to_string_lossy(),
+        fixtures_path.to_string_lossy(),
+        original_path
+    );
+
+    let output = run_avocadoctl_with_env(
+        &[
+            "hitl",
+            "mount",
+            "--server-ip",
+            "192.168.1.10",
+            "--server-port",
+            "12049",
+            "--extension",
+            "foo",
+        ],
+        &[
+            ("AVOCADO_TEST_MODE", "1"),
+            ("PATH", &new_path),
+            ("TMPDIR", &temp_path),
+            ("AVOCADO_EXTENSIONS_PATH", &temp_path),
+            ("SYSTEMCTL_SHIM_LOG", &shim_log.to_string_lossy()),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "Hitl mount should succeed with mocks: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let recorded = std::fs::read_to_string(&shim_log).unwrap_or_default();
+    assert!(
+        !recorded.contains("daemon-reload"),
+        "test mode ran the real `systemctl daemon-reload`; calls recorded:\n{recorded}"
+    );
+}
+
 /// Test hitl mount with short options
 #[test]
 fn test_hitl_mount_short_options() {
