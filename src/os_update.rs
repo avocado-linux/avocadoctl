@@ -827,7 +827,7 @@ fn is_single_path_component(s: &str) -> bool {
 /// leading slash, and `..` is refused outright: a manifest is data that
 /// arrives with an update, and a target that can climb out of the mounted
 /// filesystem is a way to write anywhere on the device.
-fn resolve_fs_file(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
+fn resolve_fs_file(host: &BlockHost, spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
     let Some(rest) = spec.strip_prefix("file:") else {
         return Ok(None);
     };
@@ -859,7 +859,7 @@ fn resolve_fs_file(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
             "slot target '{spec}': path must not contain '..'"
         )));
     }
-    if label_absent(label) {
+    if label_absent_in(host, label) {
         // Unlike an eMMC boot target (the disk decides whether it exists), a
         // file: partlabel is a string the manifest author typed. Silently
         // skipping an absent one turns a typo (file:esp on a board labeled ESP)
@@ -869,6 +869,11 @@ fn resolve_fs_file(spec: &str) -> Result<Option<WriteTarget>, OsUpdateError> {
             "slot target '{spec}': no partition labeled '{label}' on this device"
         )));
     }
+    // The same resolution the write does through with_mounted_partition, run
+    // here so a refusal (the running root, a duplicate label, a label on
+    // another disk) comes before the pending marker and the first artifact
+    // instead of after them.
+    resolve_partition_in(host, label)?;
     Ok(Some(WriteTarget::FsFile {
         label: label.to_string(),
         rel_path: rel_path.to_string(),
@@ -1309,7 +1314,7 @@ fn locate_target_in(
     if let Some(target) = resolve_emmc_boot(partition_name)? {
         return Ok(target);
     }
-    if let Some(target) = resolve_fs_file(partition_name)? {
+    if let Some(target) = resolve_fs_file(host, partition_name)? {
         return Ok(target);
     }
     // Only a DEFINITELY ABSENT label may fall back. A label entry that exists
@@ -1399,10 +1404,6 @@ impl BlockHost<'_> {
         // would replace the whole path instead of naming a missing link.
         self.dev.join(format!("disk/by-partlabel/{label}"))
     }
-}
-
-fn label_absent(partition_name: &str) -> bool {
-    label_absent_in(&running_host(), partition_name)
 }
 
 /// Whether `/dev/disk/by-partlabel/<name>` is definitely absent. Only a clean
@@ -3594,7 +3595,7 @@ PRETTY_NAME="Avocado Linux 2024.1"
     /// error (a typo must not be a silent skip), not NotOnThisMedium.
     #[test]
     fn test_resolve_fs_file_parses_label_and_path() {
-        match resolve_fs_file("file:efi:/EFI/Linux/avocado+3.efi") {
+        match resolve_fs_file(&running_host(), "file:efi:/EFI/Linux/avocado+3.efi") {
             Ok(Some(WriteTarget::FsFile { label, rel_path })) => {
                 assert_eq!(label, "efi");
                 assert_eq!(rel_path, "EFI/Linux/avocado+3.efi");
@@ -3620,24 +3621,28 @@ PRETTY_NAME="Avocado Linux 2024.1"
     /// untouched, or a plain partition name would stop resolving.
     #[test]
     fn test_resolve_fs_file_ignores_other_targets() {
-        assert!(resolve_fs_file("rootfs-a").unwrap().is_none());
-        assert!(resolve_fs_file("emmc-boot:0").unwrap().is_none());
+        assert!(resolve_fs_file(&running_host(), "rootfs-a")
+            .unwrap()
+            .is_none());
+        assert!(resolve_fs_file(&running_host(), "emmc-boot:0")
+            .unwrap()
+            .is_none());
     }
 
     /// A manifest arrives with an update, so a target that can climb out of
     /// the mounted filesystem is a way to write anywhere on the device.
     #[test]
     fn test_resolve_fs_file_refuses_parent_dir_and_empty() {
-        assert!(resolve_fs_file("file:efi:../../etc/shadow").is_err());
-        assert!(resolve_fs_file("file:efi:EFI/../../etc/shadow").is_err());
-        assert!(resolve_fs_file("file:efi:").is_err());
-        assert!(resolve_fs_file("file::/EFI/x.efi").is_err());
-        assert!(resolve_fs_file("file:efi").is_err());
+        assert!(resolve_fs_file(&running_host(), "file:efi:../../etc/shadow").is_err());
+        assert!(resolve_fs_file(&running_host(), "file:efi:EFI/../../etc/shadow").is_err());
+        assert!(resolve_fs_file(&running_host(), "file:efi:").is_err());
+        assert!(resolve_fs_file(&running_host(), "file::/EFI/x.efi").is_err());
+        assert!(resolve_fs_file(&running_host(), "file:efi").is_err());
         // The partlabel is interpolated into /dev/disk/by-partlabel/<label>, so
         // it must be a single component too, not a path that escapes it.
-        assert!(resolve_fs_file("file:x/../../../sda1:/boot/x.efi").is_err());
-        assert!(resolve_fs_file("file:..:/boot/x.efi").is_err());
-        assert!(resolve_fs_file("file:a/b:/boot/x.efi").is_err());
+        assert!(resolve_fs_file(&running_host(), "file:x/../../../sda1:/boot/x.efi").is_err());
+        assert!(resolve_fs_file(&running_host(), "file:..:/boot/x.efi").is_err());
+        assert!(resolve_fs_file(&running_host(), "file:a/b:/boot/x.efi").is_err());
     }
 
     /// The atomic write: a temp file in the destination directory, renamed
@@ -6020,6 +6025,39 @@ PRETTY_NAME="Avocado Linux 2024.1"
             refused_before_any_write(&sys, &aos, &sys.dev.join("nvme0n1p2")),
             [refusal, refusal]
         );
+    }
+
+    #[test]
+    fn a_refused_file_target_is_refused_before_any_write() {
+        // A `file:` target used to be checked only when it was written, so a
+        // refusal there came after the earlier artifacts and the marker.
+        let sys = FakeSys::new(&[NVME]);
+        sys.boot_from("nvme0n1p1");
+        let aos = slot_b_aos(
+            "uboot-ab",
+            None,
+            &[
+                ("first", "APP_b", b"new os"),
+                ("second", "file:APP:/x", b"x"),
+            ],
+        );
+        let refusal = "refusing to write 'APP': /dev/nvme0n1p1 is the running root filesystem";
+        assert_eq!(
+            refused_before_any_write(&sys, &aos, &sys.dev.join("nvme0n1p2")),
+            [refusal, refusal]
+        );
+    }
+
+    #[test]
+    fn a_file_target_on_the_booted_disk_still_resolves() {
+        let sys = FakeSys::new(&[NVME]);
+        sys.boot_from("nvme0n1p1");
+        match resolve_fs_file(&sys.host(), "file:APP_b:/EFI/x.efi") {
+            Ok(Some(WriteTarget::FsFile { label, rel_path })) => {
+                assert_eq!((label.as_str(), rel_path.as_str()), ("APP_b", "EFI/x.efi"));
+            }
+            other => panic!("expected an FsFile target, got {other:?}"),
+        }
     }
 
     #[test]
