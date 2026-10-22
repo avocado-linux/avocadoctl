@@ -145,6 +145,14 @@ fn main() {
 
     let matches = app.get_matches();
 
+    // Rust starts with SIGPIPE ignored, so a write to a closed pipe
+    // (`avocadoctl status | head -1`) makes println! panic. CLI commands get
+    // the default action back and stop quietly, like other Unix tools.
+    if !keeps_sigpipe_ignored(&matches) {
+        // SAFETY: called before any thread starts; SIG_DFL needs no handler.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+
     // Initialize output manager with global verbose and format settings
     let verbose = matches.get_flag("verbose");
     let json_output = matches
@@ -881,6 +889,17 @@ fn handle_direct(matches: &clap::ArgMatches, config: &Config, output: &OutputMan
             );
             println!("Use --help for more information or --version for version details");
         }
+    }
+}
+
+/// Whether this run must keep SIGPIPE ignored. The varlink daemon and the
+/// HITL watchdog run in the background, and a failed write to a pipe there
+/// must give an error, not a signal that kills them.
+fn keeps_sigpipe_ignored(matches: &clap::ArgMatches) -> bool {
+    match matches.subcommand() {
+        Some(("serve", _)) => true,
+        Some(("hitl", hitl_matches)) => hitl_matches.subcommand_name() == Some("watchdog"),
+        _ => false,
     }
 }
 
