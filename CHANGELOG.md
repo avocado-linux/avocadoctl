@@ -10,6 +10,23 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-22
+
+### Fixed
+
+- **OS updates write to the disk the system booted from.** A board with Avocado
+  on two media (e.g. an SD card and an NVMe) carries every slot label twice,
+  and udev's `/dev/disk/by-partlabel` link could point an update at the other
+  disk. Slot partitions are now resolved on the disk holding `/`, followed
+  through dm-verity or dm-crypt to the backing partition. A label carried
+  twice on the booted disk, or only by another disk, is refused, and the
+  partition backing `/` is never written (#41).
+- Every slot target, including `file:` targets and the sdboot-ab boot
+  partition, is resolved before the pending marker or any byte is written, so
+  a refused target no longer leaves a half-written slot behind (#41).
+- The integration tests no longer run the host's `systemctl daemon-reload`
+  (#42).
+
 ## [0.13.0] - 2026-10-06
 
 ### Changed
@@ -86,6 +103,7 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 - HITL refresh decodes `/proc/mounts` octal escapes before unmounting, so an
   extension whose name contains a space is actually unmounted.
 
-[Unreleased]: https://github.com/avocado-linux/avocadoctl/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/avocado-linux/avocadoctl/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.11.1...v0.12.0
