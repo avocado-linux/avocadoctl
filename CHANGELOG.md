@@ -10,6 +10,16 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed extension merge hook now reaches the deploy operator.** When an
+  `on_merge` / `on_unmerge` hook command exits non-zero, the failure was written
+  with `eprintln!` to the device journal alone and never reached the `avocado
+  deploy` operator over varlink. The failure is now reported on the operator
+  channel as an `[ERROR]` line with the command and its non-zero exit. The merge
+  stays non-fatal and the remaining hooks still run, matching today's behavior
+  (ENG-2803).
+
 ### Security
 
 - **`zstd` 0.13 to 0.14 (`zstd-safe` 8.2.0).** Clears RUSTSEC-2026-0391 and

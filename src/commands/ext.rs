@@ -4316,6 +4316,33 @@ fn run_modprobe(modules: &[String], out: &OutputManager) -> Result<(), SystemdEr
     Ok(())
 }
 
+/// Report a post-merge hook command that exited non-zero.
+///
+/// The line goes through `log_error`, so `[ERROR]` reaches the `avocado deploy`
+/// operator over varlink, not only the device journal. Before this, a failed
+/// hook was written with `eprintln!` alone and never reached the operator
+/// channel. The merge stays non-fatal (it matches the modprobe failure path),
+/// so the caller still returns `Ok(())` after this and the remaining hooks run.
+fn report_failed_merge_command(
+    command_str: &str,
+    status: &std::process::ExitStatus,
+    stderr: &str,
+    out: &OutputManager,
+) {
+    let exit = match status.code() {
+        Some(code) => format!("exited {code}"),
+        None => "was terminated by a signal".to_string(),
+    };
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        out.log_error(&format!("post-merge command '{command_str}' {exit}"));
+    } else {
+        out.log_error(&format!(
+            "post-merge command '{command_str}' {exit}: {detail}"
+        ));
+    }
+}
+
 /// Execute a single command with its arguments
 fn execute_single_command(command_str: &str, out: &OutputManager) -> Result<(), SystemdError> {
     // Parse the command string to handle commands with arguments
@@ -4368,9 +4395,9 @@ fn execute_single_command(command_str: &str, out: &OutputManager) -> Result<(), 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("Warning: Command '{command_str}' failed: {stderr}");
-        // Log warning but don't fail the entire operation
-        // This matches the behavior of modprobe failures
+        report_failed_merge_command(command_str, &output.status, &stderr, out);
+        // The merge stays non-fatal, matching the modprobe failure path, so
+        // return Ok and let the remaining hooks run.
     } else {
         out.step("post-merge", &format!("{command_str} ok"));
     }
@@ -4603,6 +4630,40 @@ mod tests {
             }
             other => panic!("wrong variant: {other}"),
         }
+    }
+
+    // --- merge hook failure visibility (ENG-2803) ---
+
+    /// A post-merge hook that exits non-zero must reach the `avocado deploy`
+    /// operator over the varlink channel, not the device journal alone. The
+    /// report records the command and its non-zero exit, and the merge stays
+    /// non-fatal.
+    #[test]
+    fn a_failed_merge_hook_reaches_the_operator_channel() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::mpsc::sync_channel;
+
+        let (tx, rx) = sync_channel(16);
+        let out = OutputManager::new_streaming(tx);
+
+        // Exit code 1, as `networkctl reload` gives when the link is unmanaged.
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        report_failed_merge_command("networkctl reload", &status, "link is unmanaged", &out);
+        drop(out);
+
+        let lines: Vec<String> = rx.try_iter().collect();
+        let error = lines
+            .iter()
+            .find(|line| line.starts_with("[ERROR]"))
+            .expect("a failed hook must send an [ERROR] line to the operator");
+        assert!(
+            error.contains("networkctl reload"),
+            "the operator line must include the command: {error}"
+        );
+        assert!(
+            error.contains("exited 1"),
+            "the operator line must record the non-zero exit: {error}"
+        );
     }
 
     #[test]
