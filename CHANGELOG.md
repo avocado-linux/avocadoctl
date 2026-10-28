@@ -10,6 +10,12 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 
 ## [Unreleased]
 
+### Security
+
+- **`zstd` 0.13 to 0.14 (`zstd-safe` 8.2.0).** Clears RUSTSEC-2026-0391 and
+  RUSTSEC-2026-0395 through RUSTSEC-2026-0406 in `zstd`/`zstd-safe`, and
+  RUSTSEC-2026-0410. The OS update decoder API is unchanged.
+
 ## [0.14.0] - 2026-10-22
 
 ### Fixed
