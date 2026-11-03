@@ -1443,6 +1443,10 @@ pub(crate) fn collect_extension_status(
                 Some(image_id_str)
             };
 
+            let qualifier = available_ext.and_then(|ext| {
+                lookup_kab_qualifier(ext, &ext_name, manifest_extensions, base_path)
+            });
+
             let (name, version) = if let Some(ext) = available_ext {
                 (ext.name.clone(), ext.version.clone())
             } else {
@@ -1461,6 +1465,7 @@ pub(crate) fn collect_extension_status(
                     ImageTypeTag::Kab => Some("kab".to_string()),
                     _ => None,
                 }),
+                qualifier,
             }
         })
         .collect();
@@ -2029,11 +2034,7 @@ fn lookup_extension_short_id(
     ext_name: &str,
     manifest_extensions: &[crate::manifest::ManifestExtension],
 ) -> String {
-    let matched = manifest_extensions.iter().find(|me| {
-        let versioned = format!("{}-{}", me.name, me.version);
-        versioned == ext_name || me.name == ext_name
-    });
-    match matched {
+    match find_manifest_extension(ext_name, manifest_extensions) {
         Some(me) => match &me.image_id {
             Some(id) if id.len() >= 8 => id[..8].to_string(),
             Some(id) => id.clone(),
@@ -2041,6 +2042,29 @@ fn lookup_extension_short_id(
         },
         None => "-".to_string(),
     }
+}
+
+fn find_manifest_extension<'a>(
+    ext_name: &str,
+    manifest_extensions: &'a [crate::manifest::ManifestExtension],
+) -> Option<&'a crate::manifest::ManifestExtension> {
+    manifest_extensions.iter().find(|me| {
+        let versioned = format!("{}-{}", me.name, me.version);
+        versioned == ext_name || me.name == ext_name
+    })
+}
+
+fn lookup_kab_qualifier(
+    ext: &Extension,
+    ext_name: &str,
+    manifest_extensions: &[crate::manifest::ManifestExtension],
+    base_path: &Path,
+) -> Option<String> {
+    if ext.image_type != ImageTypeTag::Kab {
+        return None;
+    }
+    let me = find_manifest_extension(ext_name, manifest_extensions)?;
+    KabAdaptor::read_qualifier(&me.resolve_path(base_path)).ok()
 }
 
 /// Get short extension origin description (for 80-column display)

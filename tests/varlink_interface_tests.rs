@@ -7,7 +7,7 @@
 //!   - Error messages are correct when the daemon is not running
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -36,9 +36,13 @@ struct TestDaemon {
 }
 
 impl TestDaemon {
+    fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
     /// Start a daemon with `AVOCADO_TEST_MODE=1` and the test fixtures on PATH.
     /// Blocks until the socket file appears (up to 5 s) or panics.
-    fn start() -> Self {
+    fn start_with_env(envs: &[(&str, &Path)]) -> Self {
         let temp_dir = TempDir::new().expect("temp dir");
         let socket_path = temp_dir.path().join("avocadoctl-test.sock");
         let socket_address = format!("unix:{}", socket_path.display());
@@ -50,6 +54,7 @@ impl TestDaemon {
             .args(["serve", "--address", &socket_address])
             .env("AVOCADO_TEST_MODE", "1")
             .env("PATH", &test_path)
+            .envs(envs.iter().copied())
             .spawn()
             .expect("Failed to spawn daemon");
 
@@ -215,6 +220,127 @@ fn test_ext_status_via_daemon() {
         "ext status via daemon should succeed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn synthetic_kab(qualifier: &str) -> Vec<u8> {
+    let identifier = b"5f0c2a8e-1d3b-4e6f-8a9b-0c1d2e3f4a5b".as_slice();
+    let kab_type = b"kos.layer".as_slice();
+    let name = b"app".as_slice();
+    let certs = b"".as_slice();
+    let version = b"0.1.0".as_slice();
+    let lens = [
+        identifier.len(),
+        kab_type.len(),
+        qualifier.len(),
+        name.len(),
+        certs.len(),
+        version.len(),
+    ];
+
+    let mut kab = b"KAB\0\x01\x00".to_vec();
+    kab.extend_from_slice(&((36 + lens.iter().sum::<usize>()) as u16).to_be_bytes());
+    for len in lens {
+        kab.extend_from_slice(&(len as u16).to_be_bytes());
+    }
+    kab.extend_from_slice(&[0u8; 16]);
+    for part in [
+        identifier,
+        kab_type,
+        qualifier.as_bytes(),
+        name,
+        version,
+        certs,
+    ] {
+        kab.extend_from_slice(part);
+    }
+
+    let payload = b"layer";
+    let offset = kab.len() as u32;
+    kab.extend_from_slice(payload);
+
+    let mut directory = Vec::new();
+    directory.extend_from_slice(&9u16.to_be_bytes());
+    directory.extend_from_slice(b"layer.img");
+    directory.extend_from_slice(&offset.to_be_bytes());
+    directory.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    directory.extend_from_slice(&[0u8; 7]);
+    kab.extend_from_slice(&directory);
+
+    kab.extend_from_slice(&0u16.to_be_bytes());
+    kab.extend_from_slice(&1u16.to_be_bytes());
+    kab.extend_from_slice(&(directory.len() as u32).to_be_bytes());
+    kab.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+    kab.extend_from_slice(&[0u8; 256]);
+    kab
+}
+
+#[test]
+fn test_status_via_daemon_shows_kab_qualifiers() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let base = temp_dir.path().join("base");
+    let runtime_dir = base.join("runtimes").join("rt-1");
+    let images = base.join("images");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(&images).unwrap();
+
+    let kab_id = "5f0c2a8e-1d3b-4e6f-8a9b-0c1d2e3f4a5b";
+    let raw_id = "0b9d3c4e-2f1a-5b6c-8d7e-9f0a1b2c3d4e";
+    fs::write(
+        images.join(format!("{kab_id}.kab")),
+        synthetic_kab("cm4-arm64"),
+    )
+    .unwrap();
+    fs::write(images.join(format!("{raw_id}.raw")), b"raw").unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 1,
+        "id": "rt-1",
+        "built_at": "2026-11-03T00:00:00Z",
+        "runtime": { "name": "dev", "version": "0.1.0" },
+        "extensions": [
+            { "name": "app", "version": "0.1.0", "image_id": kab_id, "image_type": "kab" },
+            { "name": "plain", "version": "0.1.0", "image_id": raw_id }
+        ]
+    });
+    fs::write(runtime_dir.join("manifest.json"), manifest.to_string()).unwrap();
+    std::os::unix::fs::symlink("runtimes/rt-1", base.join("active")).unwrap();
+
+    let daemon = TestDaemon::start_with_env(&[
+        ("AVOCADO_BASE_DIR", base.as_path()),
+        ("TMPDIR", temp_dir.path()),
+    ]);
+
+    let output = daemon.run(&["status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status via daemon should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let row = |prefix: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} row in:\n{stdout}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(row("Extension")[3], "Qualifier", "{stdout}");
+    assert_eq!(row("app-0.1.0")[3], "cm4-arm64", "{stdout}");
+    assert_eq!(row("plain-0.1.0")[3], "-", "{stdout}");
+
+    let output = daemon.run(&["-o", "json", "ext", "status"]);
+    let list: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ext status -o json prints JSON");
+    let qualifier = |name: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .map(|e| e["qualifier"].clone())
+    };
+    assert_eq!(qualifier("app"), Some(serde_json::json!("cm4-arm64")));
+    assert_eq!(qualifier("plain"), Some(serde_json::Value::Null));
 }
 
 /// Top-level `merge` alias is routed through the daemon.

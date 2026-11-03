@@ -292,14 +292,26 @@ pub fn print_extension_status(extensions: &[vl_ext::ExtensionStatus], output: &O
         .unwrap_or(9)
         .max(9);
 
+    let qualifier_width = extensions
+        .iter()
+        .filter_map(|e| e.qualifier.as_ref().map(|q| q.len()))
+        .max()
+        .unwrap_or(9)
+        .max(9);
+
     println!(
-        "{:<nw$} {:<12} {:<8} Origin",
+        "{:<nw$} {:<12} {:<8} {:<qw$} Origin",
         "Extension",
         "Type",
         "Merged",
-        nw = name_width
+        "Qualifier",
+        nw = name_width,
+        qw = qualifier_width
     );
-    println!("{}", "=".repeat(name_width + 1 + 12 + 1 + 8 + 1 + 20));
+    println!(
+        "{}",
+        "=".repeat(name_width + 1 + 12 + 1 + 8 + 1 + qualifier_width + 1 + 20)
+    );
 
     for ext in extensions {
         let versioned_name = match &ext.version {
@@ -326,9 +338,16 @@ pub fn print_extension_status(extensions: &[vl_ext::ExtensionStatus], output: &O
         };
 
         let merged_str = if ext.isMerged { "yes" } else { "no" };
+        let qualifier = ext
+            .qualifier
+            .as_deref()
+            .filter(|q| !q.is_empty())
+            .unwrap_or("-");
         let origin = ext.origin.as_deref().unwrap_or("-");
 
-        println!("{versioned_name:<name_width$} {type_str:<12} {merged_str:<8} {origin}");
+        println!(
+            "{versioned_name:<name_width$} {type_str:<12} {merged_str:<8} {qualifier:<qualifier_width$} {origin}"
+        );
     }
 
     println!();

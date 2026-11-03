@@ -18,7 +18,8 @@ type ExtensionStatus (
     isMerged: bool,
     origin: ?string,
     imageId: ?string,
-    imageType: ?string
+    imageType: ?string,
+    qualifier: ?string
 )
 
 # List all available extensions in the extensions directory

@@ -1089,6 +1089,8 @@ impl ImageAdaptor for RawAdaptor {
 const KAB_SIGNATURE_LEN: u64 = 256;
 const KAB_FOOTER_LEN: u64 = 12;
 const KAB_DIRECTORY_MARKER: u32 = 0x11223344;
+const KAB_MAGIC: &[u8] = b"KAB\0";
+const KAB_HEADER_FIXED_LEN: usize = 36;
 
 /// Information about an embedded file within a KAB.
 struct KabEntry {
@@ -1233,6 +1235,54 @@ impl KabAdaptor {
                 path.display()
             ),
         })
+    }
+
+    pub(crate) fn read_qualifier(path: &Path) -> Result<String, SystemdError> {
+        use std::io::Read;
+
+        let mut file = fs::File::open(path).map_err(|e| SystemdError::CommandFailed {
+            command: format!("open KAB file {}", path.display()),
+            source: e,
+        })?;
+
+        let mut hdr = [0u8; KAB_HEADER_FIXED_LEN];
+        file.read_exact(&mut hdr)
+            .map_err(|e| SystemdError::CommandFailed {
+                command: "read KAB header".to_string(),
+                source: e,
+            })?;
+
+        if !hdr.starts_with(KAB_MAGIC) || hdr[4] != 1 {
+            return Err(SystemdError::ConfigurationError {
+                message: format!("Not a version 1 KAB header ({})", path.display()),
+            });
+        }
+
+        let field = |at: usize| u16::from_be_bytes([hdr[at], hdr[at + 1]]) as usize;
+        let header_len = field(6);
+        let identifier_len = field(8);
+        let type_len = field(10);
+        let qualifier_len = field(12);
+        let strings_len =
+            identifier_len + type_len + qualifier_len + field(14) + field(16) + field(18);
+
+        if KAB_HEADER_FIXED_LEN + strings_len != header_len {
+            return Err(SystemdError::ConfigurationError {
+                message: format!(
+                    "KAB header length {header_len} does not match its fields ({})",
+                    path.display()
+                ),
+            });
+        }
+
+        let mut strings = vec![0u8; identifier_len + type_len + qualifier_len];
+        file.read_exact(&mut strings)
+            .map_err(|e| SystemdError::CommandFailed {
+                command: "read KAB header strings".to_string(),
+                source: e,
+            })?;
+
+        Ok(String::from_utf8_lossy(&strings[identifier_len + type_len..]).into_owned())
     }
 
     /// Create an offset-based loop device exposing the inner image.
@@ -1961,5 +2011,92 @@ SYSEXT_SCOPE=initrd system
     fn test_image_type_tag_equality() {
         assert_eq!(ImageTypeTag::Directory, ImageTypeTag::Directory);
         assert_ne!(ImageTypeTag::Raw, ImageTypeTag::Kab);
+    }
+
+    fn kab_header(qualifier: &str) -> Vec<u8> {
+        let identifier = b"5f0c2a8e-1d3b-4e6f-8a9b-0c1d2e3f4a5b".as_slice();
+        let kab_type = b"kos.layer".as_slice();
+        let name = b"kos-layer-osconf".as_slice();
+        let certs: &[u8] = &[0x30, 0x00];
+        let version = b"0.0.0-SNAPSHOT".as_slice();
+        let lens = [
+            identifier.len(),
+            kab_type.len(),
+            qualifier.len(),
+            name.len(),
+            certs.len(),
+            version.len(),
+        ];
+        let header_len = KAB_HEADER_FIXED_LEN + lens.iter().sum::<usize>();
+
+        let mut buf = b"KAB\0\x01\x00".to_vec();
+        buf.extend_from_slice(&(header_len as u16).to_be_bytes());
+        for len in lens {
+            buf.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        buf.extend_from_slice(&[0u8; 16]);
+        for part in [
+            identifier,
+            kab_type,
+            qualifier.as_bytes(),
+            name,
+            version,
+            certs,
+        ] {
+            buf.extend_from_slice(part);
+        }
+        buf
+    }
+
+    fn write_kab(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.kab");
+        fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn the_qualifier_is_read_from_the_kab_header() {
+        let (_dir, path) = write_kab(&kab_header("cm4-arm64"));
+        assert_eq!(KabAdaptor::read_qualifier(&path).unwrap(), "cm4-arm64");
+    }
+
+    #[test]
+    fn an_empty_qualifier_reads_as_empty() {
+        let (_dir, path) = write_kab(&kab_header(""));
+        assert_eq!(KabAdaptor::read_qualifier(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn a_file_without_the_kab_magic_has_no_qualifier() {
+        let mut bytes = kab_header("flex");
+        bytes[0] = b'X';
+        let (_dir, path) = write_kab(&bytes);
+        assert!(KabAdaptor::read_qualifier(&path).is_err());
+    }
+
+    #[test]
+    fn an_unknown_kab_header_version_has_no_qualifier() {
+        let mut bytes = kab_header("flex");
+        bytes[4] = 2;
+        let (_dir, path) = write_kab(&bytes);
+        assert!(KabAdaptor::read_qualifier(&path).is_err());
+    }
+
+    #[test]
+    fn a_kab_header_length_that_disagrees_with_its_fields_is_refused() {
+        let mut bytes = kab_header("flex");
+        bytes[7] += 1;
+        let (_dir, path) = write_kab(&bytes);
+        assert!(KabAdaptor::read_qualifier(&path).is_err());
+    }
+
+    #[test]
+    fn a_truncated_kab_header_is_refused() {
+        let bytes = kab_header("raspberrypi4");
+        let (_dir, path) = write_kab(&bytes[..KAB_HEADER_FIXED_LEN - 1]);
+        assert!(KabAdaptor::read_qualifier(&path).is_err());
+        let (_dir, path) = write_kab(&bytes[..KAB_HEADER_FIXED_LEN + 40]);
+        assert!(KabAdaptor::read_qualifier(&path).is_err());
     }
 }
