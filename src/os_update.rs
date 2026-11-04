@@ -3090,6 +3090,21 @@ fn apply_os_update_streaming_in<R: Read>(
 /// must be repaired) and as "no difference" for the initramfs (never reboot on a
 /// guess); see [`active_bundle_matches`] for which way the third one goes.
 pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &Path) -> bool {
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    os_bundle_satisfied_on(os_bundle, base_dir, &cmdline)
+}
+
+fn os_bundle_satisfied_on(
+    os_bundle: &crate::manifest::OsBundleRef,
+    base_dir: &Path,
+    cmdline: &str,
+) -> bool {
+    if is_direct_boot(cmdline) {
+        println!(
+            "  Direct boot (avocado.boot=direct): the host manages the OS, skipping the OS bundle"
+        );
+        return true;
+    }
     let active = active_manifest(base_dir);
     let rootfs_matches = os_bundle.os_build_id.as_ref().is_some_and(|expected| {
         verify_os_release(&VerifyConfig {
@@ -3102,6 +3117,17 @@ pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &
     rootfs_matches
         && !initramfs_differs_from_active(os_bundle, active.as_ref())
         && active_bundle_matches(os_bundle, active.as_ref())
+}
+
+/// A direct-boot guest (a VM started from a host-supplied kernel and disk, such
+/// as an avocado-vm agent VM) has no A/B slots and no bootloader state; its
+/// host replaces the kernel, initramfs and rootfs. The launcher says so with
+/// `avocado.boot=direct` on the kernel command line, and avocadoctl then never
+/// writes or reboots for an OS bundle: there is nowhere to write it.
+fn is_direct_boot(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .any(|arg| arg == "avocado.boot=direct")
 }
 
 /// Whether the active runtime recorded the same OS bundle, compared by the
@@ -3445,6 +3471,32 @@ mod tests {
             !os_bundle_satisfied(&bundle, tmp.path()),
             "an unverifiable bundle must not count as already running"
         );
+    }
+
+    #[test]
+    fn a_direct_boot_guest_never_needs_its_os_bundle() {
+        // A bundle this host cannot be running: unknown rootfs id, no active
+        // runtime. On a slotted device that means "write the OS and reboot".
+        let tmp = TempDir::new().unwrap();
+        let bundle = crate::manifest::OsBundleRef {
+            image_id: "cf136cbe-0000-0000-0000-000000000000".to_string(),
+            sha256: "0".repeat(64),
+            os_build_id: Some("not-this-host".to_string()),
+            initramfs_build_id: None,
+        };
+        let vm = "console=ttyAMA0 root=/dev/vda rw avocado.boot=direct";
+        assert!(os_bundle_satisfied_on(&bundle, tmp.path(), vm));
+        // Without the marker, or with a near miss, the OS is still applied.
+        for cmdline in [
+            "console=ttyAMA0 root=/dev/vda rw",
+            "avocado.boot=directly",
+            "xavocado.boot=direct",
+        ] {
+            assert!(
+                !os_bundle_satisfied_on(&bundle, tmp.path(), cmdline),
+                "{cmdline}"
+            );
+        }
     }
 
     fn bundle_with_sha(sha: &str) -> crate::manifest::OsBundleRef {
