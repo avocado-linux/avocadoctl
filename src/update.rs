@@ -291,6 +291,7 @@ pub fn perform_update(
     let manifest_path = staging_dir.join("manifest.json");
     if manifest_path.exists() {
         if let Ok(content) = fs::read_to_string(&manifest_path) {
+            existing_images.extend(unread_os_images(&content));
             if let Ok(manifest) = serde_json::from_str::<RuntimeManifest>(&content) {
                 if let Some(ref os_bundle) = manifest.os_bundle {
                     let bundle_filename = format!("{}.raw", os_bundle.image_id);
@@ -914,6 +915,29 @@ fn fetch_streaming(
 
 /// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
 /// Range units are case-insensitive (RFC 9110 §14.1).
+/// Target names of the manifest's top-level `rootfs`, `initramfs` and `kernel`
+/// images. The build publishes them for metadata consumers, but the device
+/// takes its OS only from `os_bundle`, so nothing here ever reads them: fetching
+/// them cost every deploy the full OS size and the files were never kept.
+fn unread_os_images(manifest_json: &str) -> Vec<String> {
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(manifest_json) else {
+        return Vec::new();
+    };
+    ["rootfs", "initramfs", "kernel"]
+        .iter()
+        .filter_map(|role| {
+            let entry = manifest.get(role)?;
+            let id = entry.get("image_id")?.as_str()?;
+            let ext = if entry.get("image_type").and_then(|t| t.as_str()) == Some("kab") {
+                "kab"
+            } else {
+                "raw"
+            };
+            Some(format!("{id}.{ext}"))
+        })
+        .collect()
+}
+
 fn content_range_start(value: &str) -> Option<u64> {
     let (unit, range) = value.trim().split_once(' ')?;
     if !unit.eq_ignore_ascii_case("bytes") {
@@ -1541,6 +1565,25 @@ mod tests {
     /// extra headers and `body`, then exits. Returns the URL to hit.
     fn serve_once(status: &'static str, headers: &'static str, body: Vec<u8>) -> String {
         serve_once_then(status, headers, body, || {})
+    }
+
+    #[test]
+    fn the_unread_os_images_are_never_fetched() {
+        let manifest = r#"{
+            "manifest_version": 2,
+            "rootfs": { "image_id": "dbd68a10", "image_type": "raw" },
+            "initramfs": { "image_id": "4fafeec3" },
+            "kernel": { "image_id": "20d357d8", "image_type": "kab" },
+            "extensions": [{ "name": "app", "version": "1", "image_id": "8c65b2b9" }],
+            "os_bundle": { "image_id": "8a73e347", "sha256": "00" }
+        }"#;
+        let unread = unread_os_images(manifest);
+        assert_eq!(unread, ["dbd68a10.raw", "4fafeec3.raw", "20d357d8.kab"]);
+        // Extensions and the OS bundle are still fetched as before.
+        assert!(!unread
+            .iter()
+            .any(|n| n.starts_with("8c65b2b9") || n.starts_with("8a73e347")));
+        assert!(unread_os_images(r#"{"manifest_version": 1}"#).is_empty());
     }
 
     /// Like `serve_once`, but runs `on_request` after the request arrives and
