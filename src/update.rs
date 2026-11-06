@@ -288,10 +288,11 @@ pub fn perform_update(
     // it will be streamed directly to partitions after runtime activation.
     let mut existing_images = existing_images;
     let mut os_bundle_skipped = false;
+    let mut unused_images = std::collections::HashSet::new();
     let manifest_path = staging_dir.join("manifest.json");
     if manifest_path.exists() {
         if let Ok(content) = fs::read_to_string(&manifest_path) {
-            existing_images.extend(unread_os_images(&content));
+            unused_images.extend(unread_os_images(&content));
             if let Ok(manifest) = serde_json::from_str::<RuntimeManifest>(&content) {
                 if let Some(ref os_bundle) = manifest.os_bundle {
                     if let Some(why) = crate::os_update::direct_boot_os_mismatch(os_bundle) {
@@ -334,6 +335,10 @@ pub fn perform_update(
         if name_str == "manifest.json" {
             continue;
         }
+        if unused_images.contains(name_str) {
+            println!("    Not used on this device, skipping download: {name_str}");
+            continue;
+        }
         download_target(
             url,
             name_str,
@@ -348,6 +353,10 @@ pub fn perform_update(
     }
     for (name_str, target_info) in &delegated_targets {
         if name_str == "manifest.json" {
+            continue;
+        }
+        if unused_images.contains(name_str) {
+            println!("    Not used on this device, skipping download: {name_str}");
             continue;
         }
         download_target(
