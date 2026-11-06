@@ -294,6 +294,9 @@ pub fn perform_update(
             existing_images.extend(unread_os_images(&content));
             if let Ok(manifest) = serde_json::from_str::<RuntimeManifest>(&content) {
                 if let Some(ref os_bundle) = manifest.os_bundle {
+                    if let Some(why) = crate::os_update::direct_boot_os_mismatch(os_bundle) {
+                        return Err(UpdateError::StagingFailed(why));
+                    }
                     let bundle_filename = format!("{}.raw", os_bundle.image_id);
 
                     if stream_os_to_partition {
@@ -303,10 +306,14 @@ pub fn perform_update(
 
                     // Rootfs and initramfs both already running: nothing to fetch.
                     if crate::os_update::os_bundle_satisfied(os_bundle, base_dir) {
-                        println!(
-                            "    OS already at target version (AVOCADO_OS_BUILD_ID={}), skipping OS bundle download",
-                            os_bundle.os_build_id.as_deref().unwrap_or("unknown")
-                        );
+                        if crate::os_update::is_direct_boot_host() {
+                            println!("    Direct boot: the host manages the OS, skipping OS bundle download");
+                        } else {
+                            println!(
+                                "    OS already at target version (AVOCADO_OS_BUILD_ID={}), skipping OS bundle download",
+                                os_bundle.os_build_id.as_deref().unwrap_or("unknown")
+                            );
+                        }
                         existing_images.insert(bundle_filename);
                         os_bundle_skipped = true;
                     }
@@ -548,7 +555,9 @@ fn finish_update(
     if let Some(ref os_bundle) = new_manifest.os_bundle {
         let skip = crate::os_update::os_bundle_satisfied(os_bundle, base_dir);
 
-        if skip {
+        if skip && crate::os_update::is_direct_boot_host() {
+            println!("  Direct boot: the host manages the OS, no OS update");
+        } else if skip {
             println!(
                 "  OS already up to date (AVOCADO_OS_BUILD_ID={})",
                 os_bundle.os_build_id.as_deref().unwrap_or("unknown")
@@ -913,8 +922,6 @@ fn fetch_streaming(
     Ok(((create_part()?, response.into_body()), 0))
 }
 
-/// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
-/// Range units are case-insensitive (RFC 9110 §14.1).
 /// Target names of the manifest's top-level `rootfs`, `initramfs` and `kernel`
 /// images. The build publishes them for metadata consumers, but the device
 /// takes its OS only from `os_bundle`, so nothing here ever reads them: fetching
@@ -938,6 +945,8 @@ fn unread_os_images(manifest_json: &str) -> Vec<String> {
         .collect()
 }
 
+/// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
+/// Range units are case-insensitive (RFC 9110 §14.1).
 fn content_range_start(value: &str) -> Option<u64> {
     let (unit, range) = value.trim().split_once(' ')?;
     if !unit.eq_ignore_ascii_case("bytes") {

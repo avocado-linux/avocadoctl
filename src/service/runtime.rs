@@ -384,6 +384,9 @@ fn runtime_requires_os_change(
         Some(b) => b,
         None => return Ok(false),
     };
+    if let Some(reason) = crate::os_update::direct_boot_os_mismatch(os_bundle) {
+        return Err(AvocadoError::StagingFailed { reason });
+    }
     // No early return when the bundle carries no os_build_id: os_bundle_satisfied
     // is the source of truth and treats an unverifiable bundle as not satisfied.
     // Returning "no OS change" here is how an initramfs-only runtime went active
