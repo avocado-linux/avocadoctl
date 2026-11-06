@@ -3090,6 +3090,17 @@ fn apply_os_update_streaming_in<R: Read>(
 /// must be repaired) and as "no difference" for the initramfs (never reboot on a
 /// guess); see [`active_bundle_matches`] for which way the third one goes.
 pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &Path) -> bool {
+    os_bundle_satisfied_on(os_bundle, base_dir, &proc_cmdline())
+}
+
+fn os_bundle_satisfied_on(
+    os_bundle: &crate::manifest::OsBundleRef,
+    base_dir: &Path,
+    cmdline: &str,
+) -> bool {
+    if is_direct_boot(cmdline) {
+        return true;
+    }
     let active = active_manifest(base_dir);
     let rootfs_matches = os_bundle.os_build_id.as_ref().is_some_and(|expected| {
         verify_os_release(&VerifyConfig {
@@ -3102,6 +3113,57 @@ pub fn os_bundle_satisfied(os_bundle: &crate::manifest::OsBundleRef, base_dir: &
     rootfs_matches
         && !initramfs_differs_from_active(os_bundle, active.as_ref())
         && active_bundle_matches(os_bundle, active.as_ref())
+}
+
+/// A direct-boot guest (a VM started from a host-supplied kernel and disk, such
+/// as an avocado-vm agent VM) has no A/B slots and no bootloader state; its
+/// host replaces the kernel, initramfs and rootfs. The launcher says so with
+/// `avocado.boot=direct` on the kernel command line, and avocadoctl then never
+/// writes or reboots for an OS bundle: there is nowhere to write it.
+fn is_direct_boot(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .any(|arg| arg == "avocado.boot=direct")
+}
+
+fn proc_cmdline() -> String {
+    fs::read_to_string("/proc/cmdline").unwrap_or_default()
+}
+
+/// Whether this host is a direct-boot guest (see [`is_direct_boot`]).
+pub fn is_direct_boot_host() -> bool {
+    is_direct_boot(&proc_cmdline())
+}
+
+/// On a direct-boot guest, why a runtime cannot be deployed: it was built for
+/// an OS other than the one the host supplies. avocadoctl cannot change that
+/// OS, and activating the runtime anyway only lets the merge-time fallback
+/// switch back to a runtime matching the running OS, a deploy that reports
+/// success and silently did not happen. `None` when the host is not
+/// direct-boot or either build id is unknown.
+pub fn direct_boot_os_mismatch(os_bundle: &crate::manifest::OsBundleRef) -> Option<String> {
+    let running = fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|c| parse_os_release_field(&c, "AVOCADO_OS_BUILD_ID").map(str::to_string));
+    direct_boot_os_mismatch_on(os_bundle, &proc_cmdline(), running.as_deref())
+}
+
+fn direct_boot_os_mismatch_on(
+    os_bundle: &crate::manifest::OsBundleRef,
+    cmdline: &str,
+    running: Option<&str>,
+) -> Option<String> {
+    if !is_direct_boot(cmdline) {
+        return None;
+    }
+    let (want, have) = (os_bundle.os_build_id.as_deref()?, running?);
+    (want != have).then(|| {
+        format!(
+            "this runtime was built for AVOCADO_OS_BUILD_ID={want}, but this direct-boot guest \
+             runs {have} and its host manages the OS; update the guest's OS image or rebuild \
+             the runtime against it"
+        )
+    })
 }
 
 /// Whether the active runtime recorded the same OS bundle, compared by the
@@ -3444,6 +3506,63 @@ mod tests {
         assert!(
             !os_bundle_satisfied(&bundle, tmp.path()),
             "an unverifiable bundle must not count as already running"
+        );
+    }
+
+    #[test]
+    fn a_direct_boot_guest_never_needs_its_os_bundle() {
+        // A bundle this host cannot be running: unknown rootfs id, no active
+        // runtime. On a slotted device that means "write the OS and reboot".
+        let tmp = TempDir::new().unwrap();
+        let bundle = crate::manifest::OsBundleRef {
+            image_id: "cf136cbe-0000-0000-0000-000000000000".to_string(),
+            sha256: "0".repeat(64),
+            os_build_id: Some("not-this-host".to_string()),
+            initramfs_build_id: None,
+        };
+        let vm = "console=ttyAMA0 root=/dev/vda rw avocado.boot=direct";
+        assert!(os_bundle_satisfied_on(&bundle, tmp.path(), vm));
+        // Without the marker, or with a near miss, the OS is still applied.
+        for cmdline in [
+            "console=ttyAMA0 root=/dev/vda rw",
+            "avocado.boot=directly",
+            "xavocado.boot=direct",
+        ] {
+            assert!(
+                !os_bundle_satisfied_on(&bundle, tmp.path(), cmdline),
+                "{cmdline}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_boot_guest_refuses_a_runtime_for_another_os() {
+        let bundle = crate::manifest::OsBundleRef {
+            image_id: "cf136cbe-0000-0000-0000-000000000000".to_string(),
+            sha256: "0".repeat(64),
+            os_build_id: Some("build-b".to_string()),
+            initramfs_build_id: None,
+        };
+        let vm = "root=/dev/vda avocado.boot=direct";
+        let why = direct_boot_os_mismatch_on(&bundle, vm, Some("build-a")).unwrap();
+        assert!(why.contains("build-b") && why.contains("build-a"), "{why}");
+        // The same OS deploys; a slotted device and unknown ids are not refused.
+        assert_eq!(
+            direct_boot_os_mismatch_on(&bundle, vm, Some("build-b")),
+            None
+        );
+        assert_eq!(
+            direct_boot_os_mismatch_on(&bundle, "root=/dev/vda", Some("build-a")),
+            None
+        );
+        assert_eq!(direct_boot_os_mismatch_on(&bundle, vm, None), None);
+        let unknown = crate::manifest::OsBundleRef {
+            os_build_id: None,
+            ..bundle
+        };
+        assert_eq!(
+            direct_boot_os_mismatch_on(&unknown, vm, Some("build-a")),
+            None
         );
     }
 

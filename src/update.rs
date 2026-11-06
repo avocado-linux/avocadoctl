@@ -288,11 +288,16 @@ pub fn perform_update(
     // it will be streamed directly to partitions after runtime activation.
     let mut existing_images = existing_images;
     let mut os_bundle_skipped = false;
+    let mut unused_images = std::collections::HashSet::new();
     let manifest_path = staging_dir.join("manifest.json");
     if manifest_path.exists() {
         if let Ok(content) = fs::read_to_string(&manifest_path) {
+            unused_images.extend(unread_os_images(&content));
             if let Ok(manifest) = serde_json::from_str::<RuntimeManifest>(&content) {
                 if let Some(ref os_bundle) = manifest.os_bundle {
+                    if let Some(why) = crate::os_update::direct_boot_os_mismatch(os_bundle) {
+                        return Err(UpdateError::StagingFailed(why));
+                    }
                     let bundle_filename = format!("{}.raw", os_bundle.image_id);
 
                     if stream_os_to_partition {
@@ -302,10 +307,14 @@ pub fn perform_update(
 
                     // Rootfs and initramfs both already running: nothing to fetch.
                     if crate::os_update::os_bundle_satisfied(os_bundle, base_dir) {
-                        println!(
-                            "    OS already at target version (AVOCADO_OS_BUILD_ID={}), skipping OS bundle download",
-                            os_bundle.os_build_id.as_deref().unwrap_or("unknown")
-                        );
+                        if crate::os_update::is_direct_boot_host() {
+                            println!("    Direct boot: the host manages the OS, skipping OS bundle download");
+                        } else {
+                            println!(
+                                "    OS already at target version (AVOCADO_OS_BUILD_ID={}), skipping OS bundle download",
+                                os_bundle.os_build_id.as_deref().unwrap_or("unknown")
+                            );
+                        }
                         existing_images.insert(bundle_filename);
                         os_bundle_skipped = true;
                     }
@@ -326,6 +335,10 @@ pub fn perform_update(
         if name_str == "manifest.json" {
             continue;
         }
+        if unused_images.contains(name_str) {
+            println!("    Not used on this device, skipping download: {name_str}");
+            continue;
+        }
         download_target(
             url,
             name_str,
@@ -340,6 +353,10 @@ pub fn perform_update(
     }
     for (name_str, target_info) in &delegated_targets {
         if name_str == "manifest.json" {
+            continue;
+        }
+        if unused_images.contains(name_str) {
+            println!("    Not used on this device, skipping download: {name_str}");
             continue;
         }
         download_target(
@@ -547,7 +564,9 @@ fn finish_update(
     if let Some(ref os_bundle) = new_manifest.os_bundle {
         let skip = crate::os_update::os_bundle_satisfied(os_bundle, base_dir);
 
-        if skip {
+        if skip && crate::os_update::is_direct_boot_host() {
+            println!("  Direct boot: the host manages the OS, no OS update");
+        } else if skip {
             println!(
                 "  OS already up to date (AVOCADO_OS_BUILD_ID={})",
                 os_bundle.os_build_id.as_deref().unwrap_or("unknown")
@@ -910,6 +929,29 @@ fn fetch_streaming(
     // Full download from scratch. Only now is the .part replaced.
     let response = make_request(None).map_err(fetch_failed)?;
     Ok(((create_part()?, response.into_body()), 0))
+}
+
+/// Target names of the manifest's top-level `rootfs`, `initramfs` and `kernel`
+/// images. The build publishes them for metadata consumers, but the device
+/// takes its OS only from `os_bundle`, so nothing here ever reads them: fetching
+/// them cost every deploy the full OS size and the files were never kept.
+fn unread_os_images(manifest_json: &str) -> Vec<String> {
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(manifest_json) else {
+        return Vec::new();
+    };
+    ["rootfs", "initramfs", "kernel"]
+        .iter()
+        .filter_map(|role| {
+            let entry = manifest.get(role)?;
+            let id = entry.get("image_id")?.as_str()?;
+            let ext = if entry.get("image_type").and_then(|t| t.as_str()) == Some("kab") {
+                "kab"
+            } else {
+                "raw"
+            };
+            Some(format!("{id}.{ext}"))
+        })
+        .collect()
 }
 
 /// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
@@ -1541,6 +1583,25 @@ mod tests {
     /// extra headers and `body`, then exits. Returns the URL to hit.
     fn serve_once(status: &'static str, headers: &'static str, body: Vec<u8>) -> String {
         serve_once_then(status, headers, body, || {})
+    }
+
+    #[test]
+    fn the_unread_os_images_are_never_fetched() {
+        let manifest = r#"{
+            "manifest_version": 2,
+            "rootfs": { "image_id": "dbd68a10", "image_type": "raw" },
+            "initramfs": { "image_id": "4fafeec3" },
+            "kernel": { "image_id": "20d357d8", "image_type": "kab" },
+            "extensions": [{ "name": "app", "version": "1", "image_id": "8c65b2b9" }],
+            "os_bundle": { "image_id": "8a73e347", "sha256": "00" }
+        }"#;
+        let unread = unread_os_images(manifest);
+        assert_eq!(unread, ["dbd68a10.raw", "4fafeec3.raw", "20d357d8.kab"]);
+        // Extensions and the OS bundle are still fetched as before.
+        assert!(!unread
+            .iter()
+            .any(|n| n.starts_with("8c65b2b9") || n.starts_with("8a73e347")));
+        assert!(unread_os_images(r#"{"manifest_version": 1}"#).is_empty());
     }
 
     /// Like `serve_once`, but runs `on_request` after the request arrives and
