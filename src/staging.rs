@@ -75,7 +75,7 @@ impl SpotHashCache {
     }
 }
 
-/// Generate spot-check hashes for all extension and OS bundle images in the manifest.
+/// Generate spot-check hashes for all non-KAB extension and OS bundle images in the manifest.
 pub fn generate_spot_hashes(
     manifest: &RuntimeManifest,
     base_dir: &Path,
@@ -85,7 +85,7 @@ pub fn generate_spot_hashes(
 
     for ext in &manifest.extensions {
         let path = ext.resolve_path(base_dir);
-        if path.exists() && !path.is_dir() {
+        if !ext.is_kab() && path.exists() && !path.is_dir() {
             let filename = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -185,7 +185,7 @@ fn verify_with_spot_cache(
 
     for ext in &manifest.extensions {
         let path = ext.resolve_path(base_dir);
-        if !path.exists() || path.is_dir() {
+        if ext.is_kab() || !path.exists() || path.is_dir() {
             continue;
         }
         let filename = path
@@ -253,7 +253,7 @@ fn verify_with_spot_cache(
 }
 
 /// Check that all extension and OS bundle images referenced by the manifest
-/// exist on disk and, when SHA256 hashes are present, match their expected values.
+/// exist on disk and, for non-KAB images with SHA256 hashes, match their expected values.
 pub fn validate_manifest_images(
     manifest: &RuntimeManifest,
     base_dir: &Path,
@@ -282,6 +282,9 @@ pub fn validate_manifest_images(
                 });
                 continue;
             }
+        }
+        if ext.is_kab() {
+            continue;
         }
         if let Some(ref expected_sha) = ext.sha256 {
             let actual = sha256_file(&path).map_err(|e| {
@@ -1211,5 +1214,47 @@ mod tests {
         // No spot cache, falls back to full SHA256, which should fail
         let result = verify_spot_hashes(&manifest, tmp.path(), 4096, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_manifest_images_skips_kab_hash() {
+        let tmp = TempDir::new().unwrap();
+        let kab_file = "a1b2c3d4-e5f6-5789-abcd-ef0123456789.kab";
+        let mut manifest =
+            make_manifest_with_hash("test-id", "dev", "0.1.0", Some("badhash".to_string()));
+        manifest.extensions[0].image_type = Some("kab".to_string());
+
+        let err = validate_manifest_images(&manifest, tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(kab_file), "{err}");
+
+        let images_dir = tmp.path().join("images");
+        fs::create_dir_all(&images_dir).unwrap();
+        fs::write(images_dir.join(kab_file), b"kab data").unwrap();
+        assert!(validate_manifest_images(&manifest, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_spot_hashes_skip_kab() {
+        let tmp = TempDir::new().unwrap();
+        let images_dir = tmp.path().join("images");
+        fs::create_dir_all(&images_dir).unwrap();
+        let kab_file = "a1b2c3d4-e5f6-5789-abcd-ef0123456789.kab";
+        fs::write(images_dir.join(kab_file), b"kab data").unwrap();
+
+        let mut manifest = make_manifest("test-id", "dev", "0.1.0");
+        manifest.extensions[0].image_type = Some("kab".to_string());
+
+        let mut cache = generate_spot_hashes(&manifest, tmp.path(), 4096).unwrap();
+        assert!(cache.hashes.is_empty());
+
+        cache.hashes.insert(kab_file.into(), "stale".into());
+        let runtime_dir = tmp.path().join("runtimes").join("test-id");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        cache.save(&runtime_dir).unwrap();
+        unix_fs::symlink("runtimes/test-id", tmp.path().join("active")).unwrap();
+
+        assert!(verify_spot_hashes(&manifest, tmp.path(), 4096, false).is_ok());
     }
 }
