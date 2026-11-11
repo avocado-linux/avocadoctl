@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// How long one `systemctl` job may take before it is reported as stuck.
+/// How long one `systemctl` call may take before it is reported as stuck.
 const UNIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// An extension that is merged, with the identity used to tell whether it
@@ -196,22 +196,43 @@ fn systemctl() -> &'static str {
     }
 }
 
-/// Run `systemctl <verb> <unit>` for each unit, waiting for each job up to
-/// [`UNIT_TIMEOUT`]. A failure is reported on the operator channel and does not
-/// stop the rest: the extensions are merged either way, and one bad unit must
-/// not keep the others from coming up.
+/// avocadoctl's own units. Stopping or restarting them from inside the daemon
+/// would kill the refresh doing it, so they are never acted on here.
+const OWN_UNITS: &[&str] = &["avocadoctl", "avocadoctl.service", "avocadoctl.socket"];
+
+/// Split `units` into those to act on and avocadoctl's own, which are skipped.
+fn without_own_units(units: &[String]) -> (Vec<String>, Vec<String>) {
+    units
+        .iter()
+        .cloned()
+        .partition(|u| !OWN_UNITS.contains(&u.as_str()))
+}
+
+/// Run `systemctl <verb>` on all of `units` in one call, so systemd queues them
+/// as one transaction and orders the jobs by their `After=`/`Before=`, and wait
+/// up to [`UNIT_TIMEOUT`] for it. A failure is reported on the operator channel
+/// and does not fail the update: the extensions are merged either way.
 pub fn run(verb: &str, units: &[String], output: &OutputManager) {
-    for unit in units {
-        match run_one(verb, unit) {
-            Ok(()) => output.log_info(&format!("Service {verb}: {unit}")),
-            Err(why) => output.log_error(&format!("Service {verb} {unit} {why}")),
-        }
+    let (units, own) = without_own_units(units);
+    for unit in &own {
+        output.log_info(&format!(
+            "Service {verb}: skipping {unit}, avocadoctl does not act on its own unit"
+        ));
+    }
+    if units.is_empty() {
+        return;
+    }
+    let list = units.join(", ");
+    match run_one(verb, &units) {
+        Ok(()) => output.log_info(&format!("Service {verb}: {list}")),
+        Err(why) => output.log_error(&format!("Service {verb} ({list}) {why}")),
     }
 }
 
-fn run_one(verb: &str, unit: &str) -> Result<(), String> {
+fn run_one(verb: &str, units: &[String]) -> Result<(), String> {
     let mut child = Command::new(systemctl())
-        .args([verb, unit])
+        .arg(verb)
+        .args(units)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -439,6 +460,17 @@ mod tests {
             stop_before_unmerge(&before, Some(&new), &Default::default()),
             vec!["dropped.service"]
         );
+    }
+
+    #[test]
+    fn avocadoctl_never_acts_on_its_own_units() {
+        let units: Vec<String> = ["app.service", "avocadoctl.service", "avocadoctl.socket"]
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        let (act, own) = without_own_units(&units);
+        assert_eq!(act, vec!["app.service"]);
+        assert_eq!(own, vec!["avocadoctl.service", "avocadoctl.socket"]);
     }
 
     #[test]
