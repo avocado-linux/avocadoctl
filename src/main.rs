@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 pub mod ext_diff;
+pub mod ext_services;
 pub mod gc;
 pub mod hash;
 pub mod manifest;

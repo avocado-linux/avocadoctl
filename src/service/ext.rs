@@ -261,6 +261,24 @@ fn run_refresh(
         emit_extension_diff(config, previous, output);
     }
 
+    // An update (a previous runtime is known) also carries the services its
+    // extensions declare across the swap; a plain refresh, and boot, leave
+    // them to avocado-ensure-extensions. Read what is merged now, before the
+    // unmerge takes the release files away, and stop the units of extensions
+    // the new runtime drops while their unit files are still there.
+    let dirs = crate::ext_services::merged_release_dirs();
+    let before = previous.map(|p| crate::ext_services::merged_services(p, &dirs));
+    if let Some(before) = &before {
+        let base_dir = config.get_avocado_base_dir();
+        let base_path = Path::new(&base_dir);
+        let new = crate::manifest::RuntimeManifest::load_active(base_path);
+        let overrides = crate::overrides::RuntimeOverrides::load(
+            &base_path.join(crate::manifest::ACTIVE_LINK_NAME),
+        );
+        let stop = crate::ext_services::stop_before_unmerge(before, new.as_ref(), &overrides);
+        crate::ext_services::run("stop", &stop, output);
+    }
+
     // First unmerge (skip depmod since we'll call it after merge, don't unmount loops —
     // the caller may be running from a loop-mounted extension like avocado-connect)
     ext::unmerge_extensions_internal_with_options(false, false, output)
@@ -270,7 +288,20 @@ fn run_refresh(
     ext::invalidate_hitl_caches(output);
 
     // Then merge (this will call depmod via post-merge processing)
-    ext::merge_extensions_internal(config, output).map_err(AvocadoError::from)
+    ext::merge_extensions_internal(config, output).map_err(AvocadoError::from)?;
+
+    if let Some(before) = &before {
+        let base_dir = config.get_avocado_base_dir();
+        if let Some(new) = crate::manifest::RuntimeManifest::load_active(Path::new(&base_dir)) {
+            let after = crate::ext_services::merged_services(&new, &dirs);
+            // Stops already ran; an extension merged before and not after was
+            // either dropped (stopped above) or failed to merge (nothing to run).
+            let plan = crate::ext_services::plan(before, &after);
+            crate::ext_services::run("restart", &plan.restart, output);
+            crate::ext_services::run("start", &plan.start, output);
+        }
+    }
+    Ok(())
 }
 
 /// Load the now-active runtime manifest, diff it against `previous`, and narrate
