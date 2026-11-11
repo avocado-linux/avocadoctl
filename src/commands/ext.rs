@@ -2734,6 +2734,22 @@ fn scan_extensions_from_all_sources_with_verbosity(
 }
 
 /// Scan a single directory for directory-based extensions
+/// Name and version of each HITL-mounted extension. A HITL extension takes
+/// the place of the manifest's extension of the same name, version and all.
+pub(crate) fn hitl_extension_versions() -> std::collections::BTreeMap<String, Option<String>> {
+    let hitl_dir = if std::env::var("AVOCADO_TEST_MODE").is_ok() {
+        let temp_base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{temp_base}/avocado/hitl")
+    } else {
+        "/run/avocado/hitl".to_string()
+    };
+    scan_directory_extensions(&hitl_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.name, e.version))
+        .collect()
+}
+
 fn scan_directory_extensions(dir_path: &str) -> Result<Vec<Extension>, SystemdError> {
     let mut extensions = Vec::new();
 

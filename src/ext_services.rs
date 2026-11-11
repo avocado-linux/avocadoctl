@@ -66,11 +66,14 @@ fn identity(ext: &ManifestExtension) -> String {
 /// `extension-release.<name>-<version>`, optionally with avocadoctl's `NN-`
 /// ordering prefix (two digits at least: the 101st extension is `100-`). Release files of older versions that an image still carries
 /// are not it.
-fn is_release_file_for(file: &str, name: &str, version: &str) -> bool {
+fn is_release_file_for(file: &str, name: &str, version: Option<&str>) -> bool {
     let Some(rest) = file.strip_prefix("extension-release.") else {
         return false;
     };
-    let want = format!("{name}-{version}");
+    let want = match version {
+        Some(v) => format!("{name}-{v}"),
+        None => name.to_string(),
+    };
     if rest == want {
         return true;
     }
@@ -80,12 +83,38 @@ fn is_release_file_for(file: &str, name: &str, version: &str) -> bool {
     }
 }
 
+/// Unit names as systemctl reads them: a name with no unit type is a service.
+/// Keeps `nginx` and `nginx.service` from counting as two units.
+fn normalize_unit(unit: &str) -> String {
+    const TYPES: &[&str] = &[
+        ".service",
+        ".socket",
+        ".target",
+        ".device",
+        ".mount",
+        ".automount",
+        ".swap",
+        ".timer",
+        ".path",
+        ".slice",
+        ".scope",
+    ];
+    if TYPES.iter().any(|t| unit.ends_with(t)) {
+        unit.to_string()
+    } else {
+        format!("{unit}.service")
+    }
+}
+
 /// The merged extensions of `manifest` that declare units, read from the
 /// release files in `dirs`. An extension with no matching release file is not
-/// merged (disabled, or the merge skipped it) and is left out.
+/// merged (disabled, or the merge skipped it) and is left out. `hitl` names
+/// HITL-mounted extensions, which replace the manifest's extension of the same
+/// name with their own version.
 pub fn merged_services(
     manifest: &RuntimeManifest,
     dirs: &[PathBuf],
+    hitl: &BTreeMap<String, Option<String>>,
 ) -> BTreeMap<String, MergedServices> {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     for dir in dirs {
@@ -100,13 +129,21 @@ pub fn merged_services(
     for ext in &manifest.extensions {
         let mut found = false;
         let mut units: Vec<String> = Vec::new();
+        let (version, id) = match hitl.get(&ext.name) {
+            Some(v) => (
+                v.as_deref(),
+                format!("hitl:{}", v.as_deref().unwrap_or("-")),
+            ),
+            None => (Some(ext.version.as_str()), identity(ext)),
+        };
         for (file, path) in &files {
-            if !is_release_file_for(file, &ext.name, &ext.version) {
+            if !is_release_file_for(file, &ext.name, version) {
                 continue;
             }
             found = true;
             if let Ok(content) = std::fs::read_to_string(path) {
                 for unit in crate::commands::ext::parse_avocado_enable_services(&content) {
+                    let unit = normalize_unit(&unit);
                     if !units.contains(&unit) {
                         units.push(unit);
                     }
@@ -117,7 +154,7 @@ pub fn merged_services(
             out.insert(
                 ext.name.clone(),
                 MergedServices {
-                    identity: identity(ext),
+                    identity: id,
                     units,
                 },
             );
@@ -237,31 +274,36 @@ fn run_one(verb: &str, units: &[String]) -> Result<(), String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run systemctl: {e}"))?;
+    // Drained on its own thread so a full pipe can never stall systemctl.
+    let stderr = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut err = String::new();
+            let _ = std::io::Read::read_to_string(&mut s, &mut err);
+            err
+        })
+    });
     let deadline = Instant::now() + UNIT_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                let mut err = String::new();
-                if let Some(mut s) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_string(&mut err);
-                }
-                return Err(format!("failed ({status}): {}", err.trim()));
-            }
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                // The job stays queued in systemd; only the wait ends here.
+                // The jobs stay queued in systemd; only the wait ends here.
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!(
-                    "did not finish within {}s; its job is still queued",
+                    "did not finish within {}s; its jobs are still queued",
                     UNIT_TIMEOUT.as_secs()
                 ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(format!("could not wait for systemctl: {e}")),
         }
+    };
+    if status.success() {
+        return Ok(());
     }
+    let err = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+    Err(format!("failed ({status}): {}", err.trim()))
 }
 
 #[cfg(test)]
@@ -305,44 +347,44 @@ mod tests {
         assert!(is_release_file_for(
             "extension-release.app-1.2",
             "app",
-            "1.2"
+            Some("1.2")
         ));
         assert!(is_release_file_for(
             "extension-release.07-app-1.2",
             "app",
-            "1.2"
+            Some("1.2")
         ));
         assert!(is_release_file_for(
             "extension-release.100-app-1.2",
             "app",
-            "1.2"
+            Some("1.2")
         ));
         assert!(!is_release_file_for(
             "extension-release.7-app-1.2",
             "app",
-            "1.2"
+            Some("1.2")
         ));
         // An older version the image still carries is not this extension.
         assert!(!is_release_file_for(
             "extension-release.app-1.1",
             "app",
-            "1.2"
+            Some("1.2")
         ));
         assert!(!is_release_file_for(
             "extension-release.07-app-1.1",
             "app",
-            "1.2"
+            Some("1.2")
         ));
         // Nor is another extension whose name ends the same way.
         assert!(!is_release_file_for(
             "extension-release.my-app-1.2",
             "app",
-            "1.2"
+            Some("1.2")
         ));
         assert!(!is_release_file_for(
             "extension-release.app-1.2.1",
             "app",
-            "1.2"
+            Some("1.2")
         ));
     }
 
@@ -376,7 +418,7 @@ mod tests {
             ext("lib", "1", None),
             ext("off", "1", None),
         ]);
-        let got = merged_services(&m, &[usr, etc]);
+        let got = merged_services(&m, &[usr, etc], &BTreeMap::new());
 
         assert_eq!(got["app"].units, vec!["app.service", "app.socket"]);
         assert_eq!(got["app"].identity, "image:img-a");
@@ -460,6 +502,34 @@ mod tests {
             stop_before_unmerge(&before, Some(&new), &Default::default()),
             vec!["dropped.service"]
         );
+    }
+
+    #[test]
+    fn a_short_unit_name_is_a_service() {
+        assert_eq!(normalize_unit("nginx"), "nginx.service");
+        assert_eq!(normalize_unit("nginx.service"), "nginx.service");
+        assert_eq!(normalize_unit("sshd.socket"), "sshd.socket");
+        assert_eq!(normalize_unit("wpa@wlan0"), "wpa@wlan0.service");
+    }
+
+    #[test]
+    fn a_hitl_extension_is_read_at_its_own_version() {
+        let tmp = TempDir::new().unwrap();
+        let etc = tmp.path().join("etc/extension-release.d");
+        std::fs::create_dir_all(&etc).unwrap();
+        // The HITL mount carries version 1; the manifest has moved to 2.
+        std::fs::write(
+            etc.join("extension-release.app-1"),
+            "AVOCADO_ENABLE_SERVICES=\"app\"\n",
+        )
+        .unwrap();
+        let m = manifest(vec![ext("app", "2", Some("img-2"))]);
+        let hitl = BTreeMap::from([("app".to_string(), Some("1".to_string()))]);
+
+        let got = merged_services(&m, std::slice::from_ref(&etc), &hitl);
+        assert_eq!(got["app"].units, vec!["app.service"]);
+        assert_eq!(got["app"].identity, "hitl:1");
+        assert!(merged_services(&m, &[etc], &BTreeMap::new()).is_empty());
     }
 
     #[test]
