@@ -64,7 +64,7 @@ fn identity(ext: &ManifestExtension) -> String {
 
 /// Whether `file` is the release file for exactly this extension and version:
 /// `extension-release.<name>-<version>`, optionally with avocadoctl's `NN-`
-/// ordering prefix. Release files of older versions that an image still carries
+/// ordering prefix (two digits at least: the 101st extension is `100-`). Release files of older versions that an image still carries
 /// are not it.
 fn is_release_file_for(file: &str, name: &str, version: &str) -> bool {
     let Some(rest) = file.strip_prefix("extension-release.") else {
@@ -75,7 +75,7 @@ fn is_release_file_for(file: &str, name: &str, version: &str) -> bool {
         return true;
     }
     match rest.split_once('-') {
-        Some((nn, tail)) => nn.len() == 2 && nn.bytes().all(|b| b.is_ascii_digit()) && tail == want,
+        Some((nn, tail)) => nn.len() >= 2 && nn.bytes().all(|b| b.is_ascii_digit()) && tail == want,
         None => false,
     }
 }
@@ -126,24 +126,41 @@ pub fn merged_services(
     out
 }
 
-/// Compare what was merged before the update with what is merged after it.
+/// What to do after the merge, comparing what was merged before the update
+/// with what is merged now. `stopped` is what already ran before the unmerge.
+///
+/// The merge has the last word, not the manifest: it can skip an extension the
+/// manifest keeps, or fall back to another runtime, so the stop pass before the
+/// unmerge was a prediction. Here, any unit no longer declared by anything is
+/// stopped (a skipped extension, a unit a changed extension dropped), and any
+/// unit stopped earlier that is declared again is started (a fallback that
+/// brought its extension back).
 pub fn plan(
     before: &BTreeMap<String, MergedServices>,
     after: &BTreeMap<String, MergedServices>,
+    stopped: &[String],
 ) -> Plan {
     let mut plan = Plan::default();
+    let declared_after: Vec<&String> = after.values().flat_map(|m| &m.units).collect();
     for (name, old) in before {
-        match after.get(name) {
-            None => plan.stop.extend(old.units.iter().cloned()),
-            Some(new) if new.identity != old.identity => {
-                plan.restart.extend(new.units.iter().cloned())
+        for unit in &old.units {
+            if !declared_after.contains(&unit) && !stopped.contains(unit) {
+                plan.stop.push(unit.clone());
             }
-            Some(_) => {}
+        }
+        if let Some(new) = after.get(name) {
+            if new.identity != old.identity {
+                plan.restart
+                    .extend(new.units.iter().filter(|u| !stopped.contains(u)).cloned());
+            }
         }
     }
     for (name, new) in after {
-        if !before.contains_key(name) {
-            plan.start.extend(new.units.iter().cloned());
+        let added = !before.contains_key(name);
+        for unit in &new.units {
+            if (added || stopped.contains(unit)) && !plan.start.contains(unit) {
+                plan.start.push(unit.clone());
+            }
         }
     }
     plan
@@ -274,6 +291,16 @@ mod tests {
             "app",
             "1.2"
         ));
+        assert!(is_release_file_for(
+            "extension-release.100-app-1.2",
+            "app",
+            "1.2"
+        ));
+        assert!(!is_release_file_for(
+            "extension-release.7-app-1.2",
+            "app",
+            "1.2"
+        ));
         // An older version the image still carries is not this extension.
         assert!(!is_release_file_for(
             "extension-release.app-1.1",
@@ -349,13 +376,44 @@ mod tests {
             ("new", "image:5", &["new.service"]),
         ]);
         assert_eq!(
-            plan(&before, &after),
+            plan(&before, &after, &[]),
             Plan {
                 stop: vec!["gone.service".into()],
                 restart: vec!["bumped.service".into(), "bumped.timer".into()],
                 start: vec!["new.service".into()],
             }
         );
+    }
+
+    #[test]
+    fn a_unit_a_changed_extension_drops_is_stopped() {
+        let before = merged(&[("app", "image:1", &["app.service", "old.service"])]);
+        let after = merged(&[("app", "image:2", &["app.service"])]);
+        let p = plan(&before, &after, &[]);
+        assert_eq!(p.stop, vec!["old.service"]);
+        assert_eq!(p.restart, vec!["app.service"]);
+    }
+
+    #[test]
+    fn an_extension_the_merge_skipped_has_its_units_stopped_after() {
+        // Kept by the new manifest, so not stopped before the unmerge, but
+        // the merge left it out.
+        let before = merged(&[("app", "image:1", &["app.service"])]);
+        assert_eq!(plan(&before, &merged(&[]), &[]).stop, vec!["app.service"]);
+    }
+
+    #[test]
+    fn a_unit_stopped_before_a_fallback_merge_is_started_again() {
+        // The new runtime dropped `app`, so it was stopped before the unmerge,
+        // but the merge fell back to a runtime that still has it.
+        let before = merged(&[("app", "image:1", &["app.service"])]);
+        let after = merged(&[("app", "image:1", &["app.service"])]);
+        let stopped = vec!["app.service".to_string()];
+        let p = plan(&before, &after, &stopped);
+        assert_eq!(p.start, vec!["app.service"]);
+        assert!(p.stop.is_empty() && p.restart.is_empty());
+        // Stopped already and gone for good: not stopped twice.
+        assert!(plan(&before, &merged(&[]), &stopped).stop.is_empty());
     }
 
     #[test]

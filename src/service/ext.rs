@@ -268,6 +268,7 @@ fn run_refresh(
     // the new runtime drops while their unit files are still there.
     let dirs = crate::ext_services::merged_release_dirs();
     let before = previous.map(|p| crate::ext_services::merged_services(p, &dirs));
+    let mut stopped = Vec::new();
     if let Some(before) = &before {
         let base_dir = config.get_avocado_base_dir();
         let base_path = Path::new(&base_dir);
@@ -275,8 +276,8 @@ fn run_refresh(
         let overrides = crate::overrides::RuntimeOverrides::load(
             &base_path.join(crate::manifest::ACTIVE_LINK_NAME),
         );
-        let stop = crate::ext_services::stop_before_unmerge(before, new.as_ref(), &overrides);
-        crate::ext_services::run("stop", &stop, output);
+        stopped = crate::ext_services::stop_before_unmerge(before, new.as_ref(), &overrides);
+        crate::ext_services::run("stop", &stopped, output);
     }
 
     // First unmerge (skip depmod since we'll call it after merge, don't unmount loops —
@@ -294,9 +295,8 @@ fn run_refresh(
         let base_dir = config.get_avocado_base_dir();
         if let Some(new) = crate::manifest::RuntimeManifest::load_active(Path::new(&base_dir)) {
             let after = crate::ext_services::merged_services(&new, &dirs);
-            // Stops already ran; an extension merged before and not after was
-            // either dropped (stopped above) or failed to merge (nothing to run).
-            let plan = crate::ext_services::plan(before, &after);
+            let plan = crate::ext_services::plan(before, &after, &stopped);
+            crate::ext_services::run("stop", &plan.stop, output);
             crate::ext_services::run("restart", &plan.restart, output);
             crate::ext_services::run("start", &plan.start, output);
         }
