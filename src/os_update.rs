@@ -380,16 +380,13 @@ fn apply_os_update_in(
     // Activate the new slot. The marker is already on disk (written before the
     // write loop above).
     println!("    Activating slot: {inactive_slot}");
-    if let Err(e) = execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref()) {
-        // Only a pointer loader can safely clear here: the flip is its sole
-        // activation, so a failed flip means nothing changed. On a sorting
-        // loader (sdboot-ab) the `file:` write already activated, so the marker
-        // must persist for the next boot to verify and roll back.
-        if update.strategy != "sdboot-ab" {
-            let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
-        }
-        return Err(e);
-    }
+    activate_slot(
+        update,
+        &current_slot,
+        &inactive_slot,
+        bundle.layout.as_ref(),
+        &base_dir.join(PENDING_UPDATE_FILENAME),
+    )?;
 
     // Clean up staging
     let _ = fs::remove_dir_all(&staging_dir);
@@ -400,6 +397,37 @@ fn apply_os_update_in(
     );
 
     Ok(true)
+}
+
+/// Run the activate actions. If one fails on a pointer loader, point the boot
+/// back at the running slot and drop the marker: an earlier action may already
+/// have flipped the pointer (a U-Boot env var set before a later command
+/// failed), and with the marker gone nothing would ever flip it back, so the
+/// next reboot would land on a slot no update finished activating.
+///
+/// On a sorting loader (sdboot-ab) the `file:` write already activated, so the
+/// marker stays for the next boot to verify and roll back.
+fn activate_slot(
+    update: &UpdateConfig,
+    current_slot: &str,
+    inactive_slot: &str,
+    layout: Option<&BundleLayout>,
+    marker: &Path,
+) -> Result<(), OsUpdateError> {
+    let Err(e) = execute_slot_actions(&update.activate, inactive_slot, layout) else {
+        return Ok(());
+    };
+    if update.strategy != "sdboot-ab" {
+        if let Some(rollback) = update.rollback.as_deref() {
+            if let Err(re) =
+                execute_slot_actions_for(rollback, current_slot, Some(inactive_slot), layout)
+            {
+                eprintln!("    Restoring slot {current_slot} after the failed activation also failed: {re}");
+            }
+        }
+        let _ = clear_pending_update_at(marker);
+    }
+    Err(e)
 }
 
 /// Read the pending-update marker if it exists.
@@ -3063,15 +3091,13 @@ fn apply_os_update_streaming_in<R: Read>(
     // 9. Activate the new slot. The marker is already on disk (written before
     // the stream loop above).
     println!("    Activating slot: {inactive_slot}");
-    if let Err(e) = execute_slot_actions(&update.activate, &inactive_slot, bundle.layout.as_ref()) {
-        // Only a pointer loader can safely clear: the flip is its sole
-        // activation. On a sorting loader (sdboot-ab) the `file:` write already
-        // activated, so the marker must persist for next-boot verify/rollback.
-        if update.strategy != "sdboot-ab" {
-            let _ = clear_pending_update_at(&base_dir.join(PENDING_UPDATE_FILENAME));
-        }
-        return Err(e);
-    }
+    activate_slot(
+        update,
+        &current_slot,
+        &inactive_slot,
+        bundle.layout.as_ref(),
+        &base_dir.join(PENDING_UPDATE_FILENAME),
+    )?;
 
     println!(
         "  OS update streamed to partitions (build_id: {}). Reboot required.",
@@ -3295,6 +3321,34 @@ mod tests {
             !marker.with_extension("json.new").exists(),
             "the temp file was left behind"
         );
+    }
+
+    #[test]
+    fn a_failed_activation_points_the_boot_back_at_the_running_slot() {
+        // The env flip succeeds, the next activate command fails: the env must
+        // not be left pointing at the slot that never finished activating.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("env");
+        let set = |slot: &str| {
+            format!(
+                r#"{{"type":"command","command":["sh","-c","echo {slot} > {}"]}}"#,
+                log.display()
+            )
+        };
+        let update: UpdateConfig = serde_json::from_str(&format!(
+            r#"{{"strategy":"uboot-ab","slot_detection":{{"type":"uboot-env","var":"s"}},"artifacts":[],
+                "activate":[{},{{"type":"command","command":["false"]}}],
+                "rollback":[{}]}}"#,
+            set("{inactive_slot}"),
+            set("{previous_slot}")
+        ))
+        .unwrap();
+        let marker = tmp.path().join(PENDING_UPDATE_FILENAME);
+        fs::write(&marker, "{}").unwrap();
+
+        assert!(activate_slot(&update, "a", "b", None, &marker).is_err());
+        assert_eq!(fs::read_to_string(&log).unwrap().trim(), "a");
+        assert!(!marker.exists());
     }
 
     #[test]
