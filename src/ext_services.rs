@@ -125,19 +125,25 @@ pub fn merged_services(
         }
     }
 
-    let mut out = BTreeMap::new();
+    // What the merge takes: every HITL mount, in place of the manifest's
+    // extension of the same name or on its own, and the manifest's others.
+    let hitl_id = |v: &Option<String>| format!("hitl:{}", v.as_deref().unwrap_or("-"));
+    let mut candidates: Vec<(&str, Option<&str>, String)> = hitl
+        .iter()
+        .map(|(name, v)| (name.as_str(), v.as_deref(), hitl_id(v)))
+        .collect();
     for ext in &manifest.extensions {
+        if !hitl.contains_key(&ext.name) {
+            candidates.push((&ext.name, Some(&ext.version), identity(ext)));
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    for (name, version, id) in candidates {
         let mut found = false;
         let mut units: Vec<String> = Vec::new();
-        let (version, id) = match hitl.get(&ext.name) {
-            Some(v) => (
-                v.as_deref(),
-                format!("hitl:{}", v.as_deref().unwrap_or("-")),
-            ),
-            None => (Some(ext.version.as_str()), identity(ext)),
-        };
         for (file, path) in &files {
-            if !is_release_file_for(file, &ext.name, version) {
+            if !is_release_file_for(file, name, version) {
                 continue;
             }
             found = true;
@@ -152,7 +158,7 @@ pub fn merged_services(
         }
         if found {
             out.insert(
-                ext.name.clone(),
+                name.to_string(),
                 MergedServices {
                     identity: id,
                     units,
@@ -210,13 +216,16 @@ pub fn stop_before_unmerge(
     before: &BTreeMap<String, MergedServices>,
     new: Option<&RuntimeManifest>,
     overrides: &crate::overrides::RuntimeOverrides,
+    hitl: &BTreeMap<String, Option<String>>,
 ) -> Vec<String> {
+    // A HITL mount is merged whatever the manifest says.
     let kept = |name: &str| {
-        new.is_some_and(|m| {
-            m.extensions
-                .iter()
-                .any(|e| e.name == name && crate::overrides::effective_enabled(e, overrides))
-        })
+        hitl.contains_key(name)
+            || new.is_some_and(|m| {
+                m.extensions
+                    .iter()
+                    .any(|e| e.name == name && crate::overrides::effective_enabled(e, overrides))
+            })
     };
     before
         .iter()
@@ -495,11 +504,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            stop_before_unmerge(&before, Some(&new), &overrides),
+            stop_before_unmerge(&before, Some(&new), &overrides, &BTreeMap::new()),
             vec!["disabled.service", "dropped.service"]
         );
         assert_eq!(
-            stop_before_unmerge(&before, Some(&new), &Default::default()),
+            stop_before_unmerge(&before, Some(&new), &Default::default(), &BTreeMap::new()),
             vec!["dropped.service"]
         );
     }
@@ -529,7 +538,22 @@ mod tests {
         let got = merged_services(&m, std::slice::from_ref(&etc), &hitl);
         assert_eq!(got["app"].units, vec!["app.service"]);
         assert_eq!(got["app"].identity, "hitl:1");
-        assert!(merged_services(&m, &[etc], &BTreeMap::new()).is_empty());
+        assert!(merged_services(&m, std::slice::from_ref(&etc), &BTreeMap::new()).is_empty());
+
+        // A HITL mount the manifest does not list is merged all the same.
+        let none = manifest(vec![]);
+        let got = merged_services(&none, &[etc], &hitl);
+        assert_eq!(got["app"].units, vec!["app.service"]);
+    }
+
+    #[test]
+    fn a_hitl_extension_is_never_stopped_before_the_unmerge() {
+        let before = merged(&[("app", "hitl:1", &["app.service"])]);
+        let dropped_it = manifest(vec![]);
+        let hitl = BTreeMap::from([("app".to_string(), Some("1".to_string()))]);
+        assert!(
+            stop_before_unmerge(&before, Some(&dropped_it), &Default::default(), &hitl).is_empty()
+        );
     }
 
     #[test]

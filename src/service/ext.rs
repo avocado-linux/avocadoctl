@@ -277,7 +277,7 @@ fn run_refresh(
         let overrides = crate::overrides::RuntimeOverrides::load(
             &base_path.join(crate::manifest::ACTIVE_LINK_NAME),
         );
-        stopped = crate::ext_services::stop_before_unmerge(before, new.as_ref(), &overrides);
+        stopped = crate::ext_services::stop_before_unmerge(before, new.as_ref(), &overrides, &hitl);
         crate::ext_services::run("stop", &stopped, output);
     }
 
