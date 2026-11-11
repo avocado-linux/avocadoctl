@@ -297,8 +297,15 @@ fn run_refresh(
             let after = crate::ext_services::merged_services(&new, &dirs);
             let plan = crate::ext_services::plan(before, &after, &stopped);
             crate::ext_services::run("stop", &plan.stop, output);
-            crate::ext_services::run("restart", &plan.restart, output);
-            crate::ext_services::run("start", &plan.start, output);
+            // One transaction for everything coming up, so systemd orders it:
+            // `restart` starts a unit that is not running.
+            let mut up = plan.restart;
+            for unit in plan.start {
+                if !up.contains(&unit) {
+                    up.push(unit);
+                }
+            }
+            crate::ext_services::run("restart", &up, output);
         }
     }
     Ok(())
