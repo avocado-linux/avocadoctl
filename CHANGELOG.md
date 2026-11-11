@@ -10,8 +10,37 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-11
+
+### Added
+
+- **Extension services follow a runtime update.** Units an extension declares
+  with `enable_services` (recorded as `AVOCADO_ENABLE_SERVICES`) are now
+  managed across an update: units of removed extensions are stopped before the
+  unmerge, and after the merge units of changed extensions are restarted and
+  units of added extensions started. The result is reconciled with what
+  actually merged (skipped extensions, a fallback runtime, HITL mounts). Each
+  phase is one `systemctl` transaction, bounded at 60 s; failures are reported
+  on the operator channel and do not fail the update. Boot, plain
+  `merge`/`refresh` and hooks are unchanged (#49).
+- **Direct-boot guests.** A guest booted with `avocado.boot=direct` on its
+  kernel command line (the host owns its kernel and disk, no A/B slots) treats
+  its OS bundle as satisfied, so an update deploys the runtime and extensions
+  without an OS write or reboot. A runtime built for a different
+  `AVOCADO_OS_BUILD_ID` than the guest runs is refused (#47).
+
 ### Fixed
 
+- **A failed slot activation restores the running slot.** When a later
+  activate action failed after an earlier one had already pointed the boot at
+  the new slot (e.g. a U-Boot env variable), the pointer was left on a slot no
+  update finished activating. On pointer loaders the manifest's rollback
+  actions now run against the running slot before the pending marker is
+  cleared (#48).
+- **Unused OS images are no longer downloaded.** Manifest version 2 lists the
+  rootfs, initramfs and kernel as their own targets; the device takes its OS
+  from `os_bundle` only, so these are now skipped and logged as "Not used on
+  this device" (#47).
 - **A failed extension merge hook now reaches the deploy operator.** When an
   `on_merge` / `on_unmerge` hook command exits non-zero, the failure was written
   with `eprintln!` to the device journal alone and never reached the `avocado
@@ -119,7 +148,8 @@ Started at 0.12.0. For 0.11.1 and earlier, see the annotated tags and `git log`.
 - HITL refresh decodes `/proc/mounts` octal escapes before unmounting, so an
   extension whose name contains a space is actually unmounted.
 
-[Unreleased]: https://github.com/avocado-linux/avocadoctl/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/avocado-linux/avocadoctl/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/avocado-linux/avocadoctl/compare/v0.11.1...v0.12.0
