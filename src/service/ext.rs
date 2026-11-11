@@ -267,7 +267,8 @@ fn run_refresh(
     // unmerge takes the release files away, and stop the units of extensions
     // the new runtime drops while their unit files are still there.
     let dirs = crate::ext_services::merged_release_dirs();
-    let before = previous.map(|p| crate::ext_services::merged_services(p, &dirs));
+    let hitl = ext::hitl_extension_versions();
+    let before = previous.map(|p| crate::ext_services::merged_services(p, &dirs, &hitl));
     let mut stopped = Vec::new();
     if let Some(before) = &before {
         let base_dir = config.get_avocado_base_dir();
@@ -294,7 +295,8 @@ fn run_refresh(
     if let Some(before) = &before {
         let base_dir = config.get_avocado_base_dir();
         if let Some(new) = crate::manifest::RuntimeManifest::load_active(Path::new(&base_dir)) {
-            let after = crate::ext_services::merged_services(&new, &dirs);
+            let hitl = ext::hitl_extension_versions();
+            let after = crate::ext_services::merged_services(&new, &dirs, &hitl);
             let plan = crate::ext_services::plan(before, &after, &stopped);
             crate::ext_services::run("stop", &plan.stop, output);
             // One transaction for everything coming up, so systemd orders it:
