@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -872,7 +873,7 @@ fn fetch_streaming(
     auth_token: Option<&str>,
 ) -> Result<((File, ureq::Body), u64), UpdateError> {
     let make_request = |range_from: Option<u64>| {
-        let mut req = ureq::get(url);
+        let mut req = agent().get(url);
         if let Some(token) = auth_token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
@@ -1186,8 +1187,50 @@ fn extract_signed_canonical(raw_json: &str) -> Result<String, String> {
     serde_json::to_string(signed).map_err(|e| format!("Failed to serialize: {e}"))
 }
 
+/// The one HTTP agent every fetch (TUF metadata and targets) goes through,
+/// built once per process.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let native = rustls_native_certs::load_native_certs();
+        for e in &native.errors {
+            eprintln!("Warning: system CA store: {e}");
+        }
+        eprintln!(
+            "TLS trust: {} bundled roots + {} from the system store",
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len(),
+            native.certs.len()
+        );
+        build_agent(&native.certs)
+    })
+}
+
+/// Trust the bundled Mozilla roots plus `system`, so an image can add a
+/// private CA (ca-certificates, or `SSL_CERT_FILE` / `SSL_CERT_DIR`) without a
+/// rebuild. A missing or broken system store costs nothing: the bundled roots
+/// are always there, and ureq skips certificates it cannot parse.
+fn build_agent<C: AsRef<[u8]>>(system: &[C]) -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::new_with_certs(&trust_roots(system)))
+        .build();
+    ureq::Agent::config_builder()
+        .tls_config(tls)
+        .build()
+        .new_agent()
+}
+
+fn trust_roots<C: AsRef<[u8]>>(system: &[C]) -> Vec<ureq::tls::Certificate<'static>> {
+    let bundled = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|c| c.as_ref());
+    bundled
+        .chain(system.iter().map(|c| c.as_ref()))
+        .map(|der| ureq::tls::Certificate::from_der(der).to_owned())
+        .collect()
+}
+
 fn fetch_url(url: &str, auth_token: Option<&str>) -> Result<String, UpdateError> {
-    let req = ureq::get(url);
+    let req = agent().get(url);
     let response = match auth_token {
         Some(token) => req.header("Authorization", format!("Bearer {token}")),
         None => req,
@@ -1206,7 +1249,7 @@ fn fetch_url(url: &str, auth_token: Option<&str>) -> Result<String, UpdateError>
 }
 
 fn fetch_url_bytes(url: &str, auth_token: Option<&str>) -> Result<Vec<u8>, UpdateError> {
-    let req = ureq::get(url);
+    let req = agent().get(url);
     let response = match auth_token {
         Some(token) => req.header("Authorization", format!("Bearer {token}")),
         None => req,
@@ -1226,7 +1269,7 @@ fn fetch_url_bytes(url: &str, auth_token: Option<&str>) -> Result<Vec<u8>, Updat
 
 /// Fetch a URL and return the response body for streaming.
 fn fetch_url_response(url: &str, auth_token: Option<&str>) -> Result<ureq::Body, UpdateError> {
-    let req = ureq::get(url);
+    let req = agent().get(url);
     let response = match auth_token {
         Some(token) => req.header("Authorization", format!("Bearer {token}")),
         None => req,
@@ -1602,6 +1645,78 @@ mod tests {
             .iter()
             .any(|n| n.starts_with("8c65b2b9") || n.starts_with("8a73e347")));
         assert!(unread_os_images(r#"{"manifest_version": 1}"#).is_empty());
+    }
+
+    /// Serves one HTTPS request on 127.0.0.1 with a `localhost` certificate
+    /// signed by the throwaway CA in tests/fixtures/tls. Returns the URL.
+    fn serve_tls_once() -> String {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use std::net::TcpListener;
+        let chain = vec![CertificateDer::from_pem_slice(include_bytes!(
+            "../tests/fixtures/tls/server.pem"
+        ))
+        .unwrap()];
+        let key = PrivateKeyDer::from_pem_slice(include_bytes!("../tests/fixtures/tls/server.key"))
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "https://localhost:{}/t",
+            listener.local_addr().unwrap().port()
+        );
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, sock);
+            let mut req = [0u8; 4096];
+            // A client that rejects the certificate ends the handshake here.
+            if tls.read(&mut req).is_ok() {
+                let _ = tls.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        url
+    }
+
+    fn fetch_tls(
+        system: &[rustls::pki_types::CertificateDer<'static>],
+    ) -> Result<String, ureq::Error> {
+        let url = serve_tls_once();
+        build_agent(system)
+            .get(&url)
+            .call()?
+            .into_body()
+            .read_to_string()
+    }
+
+    #[test]
+    fn a_private_ca_from_the_system_store_is_trusted() {
+        use rustls::pki_types::pem::PemObject;
+        let ca = rustls::pki_types::CertificateDer::from_pem_slice(include_bytes!(
+            "../tests/fixtures/tls/ca.pem"
+        ))
+        .unwrap();
+        let junk = rustls::pki_types::CertificateDer::from(vec![0u8; 16]);
+
+        // Without the CA the server is untrusted: the bundled roots alone
+        // never vouch for a private CA.
+        assert!(fetch_tls(&[]).is_err());
+        // The CA from the system store makes it trusted, and an unparsable
+        // certificate next to it is skipped, not fatal.
+        assert_eq!(fetch_tls(&[junk, ca]).unwrap(), "ok");
+        // The bundled roots are always offered alongside the system store.
+        let bundled = webpki_root_certs::TLS_SERVER_ROOT_CERTS.len();
+        assert_eq!(trust_roots::<Vec<u8>>(&[]).len(), bundled);
+        assert_eq!(trust_roots(&[vec![0u8; 16]]).len(), bundled + 1);
     }
 
     /// Like `serve_once`, but runs `on_request` after the request arrives and
