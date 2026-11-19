@@ -1215,6 +1215,10 @@ fn build_agent<C: AsRef<[u8]>>(system: &[C]) -> ureq::Agent {
         .build();
     ureq::Agent::config_builder()
         .tls_config(tls)
+        // One connection per fetch, as before the agent was shared. ureq 3.2
+        // never expires pooled connections (algesten/ureq#1172), so a socket
+        // idle for hours behind a NAT would be reused and hang.
+        .max_idle_connections(0)
         .build()
         .new_agent()
 }
@@ -1709,7 +1713,20 @@ mod tests {
 
         // Without the CA the server is untrusted: the bundled roots alone
         // never vouch for a private CA.
-        assert!(fetch_tls(&[]).is_err());
+        // ureq 3.2 surfaces the handshake failure as an io::Error wrapping
+        // the rustls error.
+        let e = fetch_tls(&[]).unwrap_err();
+        let rejected = match &e {
+            ureq::Error::Io(io) => io.get_ref().and_then(|r| r.downcast_ref::<rustls::Error>()),
+            _ => None,
+        };
+        assert_eq!(
+            rejected,
+            Some(&rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            )),
+            "{e:?}"
+        );
         // The CA from the system store makes it trusted, and an unparsable
         // certificate next to it is skipped, not fatal.
         assert_eq!(fetch_tls(&[junk, ca]).unwrap(), "ok");
