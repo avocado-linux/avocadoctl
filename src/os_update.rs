@@ -554,21 +554,29 @@ fn commit_or_undo(
     slot: &str,
     pending: &PendingUpdate,
 ) -> Result<(), OsUpdateError> {
-    let result = commit_slot_actions(host, actions, slot, pending.layout.as_ref());
-    if result.is_err() {
-        let promotions: Vec<SlotAction> = actions
-            .iter()
-            .filter(|a| matches!(a, SlotAction::Efibootmgr { .. }))
-            .cloned()
-            .collect();
-        let _ = commit_slot_actions(
-            host,
-            &promotions,
-            &pending.previous_slot,
-            pending.layout.as_ref(),
-        );
+    let Err(e) = commit_slot_actions(host, actions, slot, pending.layout.as_ref()) else {
+        return Ok(());
+    };
+    let promotions: Vec<SlotAction> = actions
+        .iter()
+        .filter(|a| matches!(a, SlotAction::Efibootmgr { .. }))
+        .cloned()
+        .collect();
+    match commit_slot_actions(
+        host,
+        &promotions,
+        &pending.previous_slot,
+        pending.layout.as_ref(),
+    ) {
+        Ok(()) => Err(e),
+        // Reported, not retried: the same write just succeeded for the new
+        // slot, so this is a double fault, and the error tells the operator
+        // BootOrder may still name the uncommitted slot.
+        Err(undo) => Err(OsUpdateError::UpdateFailed(format!(
+            "{e}; restoring BootOrder to slot {} also failed: {undo}",
+            pending.previous_slot
+        ))),
     }
-    result
 }
 
 /// Run commit actions for `slot`. An efibootmgr action commits by moving the
