@@ -2740,3 +2740,64 @@ fn test_ext_refresh_executes_on_unmerge_before_unmerge() {
     // Verify that both pre-unmerge and post-merge commands are executed in order
     // Pre-unmerge commands should appear before unmerge, post-merge should appear after merge
 }
+
+/// A commit that fails is a failed update, not a warning. Every loader we
+/// drive reverts an uncommitted slot on its own (a systemd-boot try counter
+/// running out, a u-boot bootcount, a one-shot BootNext), so an uncommitted
+/// boot that activates the new runtime ends up with the old OS running the new
+/// runtime's extensions. Seen on an RB3 Gen 2: commit failed, three reboots
+/// later the board was back on the old slot with the new runtime active.
+#[test]
+fn a_failed_commit_rolls_back_and_keeps_the_current_runtime() {
+    let base = TempDir::new().expect("Failed to create temp dir");
+    let rolled_back = base.path().join("rolled-back");
+    let marker = base.path().join("pending-update.json");
+    let pending = serde_json::json!({
+        "os_build_id": "new",
+        "verify": null,
+        "previous_slot": "a",
+        "new_slot": "b",
+        "commit": [{ "type": "command", "command": ["false"] }],
+        "rollback": [{
+            "type": "command",
+            "command": ["touch", rolled_back.to_str().unwrap()]
+        }],
+        "runtime_id": "new-runtime"
+    });
+    fs::write(&marker, pending.to_string()).unwrap();
+
+    // Two valid runtimes, the current one active, so an activation that is
+    // wrongly reached would succeed and move the link.
+    for id in ["current-runtime", "new-runtime"] {
+        let dir = base.path().join("runtimes").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "manifest_version": 2,
+            "id": id,
+            "built_at": "2026-01-01T00:00:00Z",
+            "runtime": { "name": "dev", "version": "0.1.0" },
+            "extensions": []
+        });
+        fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+    }
+    let active = base.path().join("active");
+    std::os::unix::fs::symlink("runtimes/current-runtime", &active).unwrap();
+
+    let (output, _tmp) = run_avocadoctl_with_isolated_env(
+        &["ext", "merge"],
+        &[("AVOCADO_BASE_DIR", base.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        rolled_back.exists(),
+        "a failed commit must run the rollback actions\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_link(&active).unwrap(),
+        PathBuf::from("runtimes/current-runtime"),
+        "a failed commit must not activate the pending runtime\nstdout:\n{stdout}"
+    );
+    assert!(!marker.exists(), "the marker is cleared either way");
+}

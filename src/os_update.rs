@@ -525,12 +525,11 @@ pub fn verify_os_release_from(
 
 /// Run the update's commit actions after the new OS has booted and verified.
 ///
-/// Best-effort by design: the OS is already up and confirmed at this point, so
-/// a failing commit action must not be turned into a failed boot. It is
-/// reported and the marker is cleared regardless -- the cost of a missed
-/// commit is a loader that retries an entry that actually works, which the
-/// next successful update clears anyway. The cost of treating it as fatal
-/// would be a rollback away from a good OS.
+/// An error fails the update: the caller rolls back and keeps the current
+/// runtime. A missed commit is not cosmetic: every loader reverts an
+/// uncommitted slot by itself within a few boots, so the only choice is
+/// whether that happens now, with the runtime kept consistent, or later,
+/// behind avocadoctl's back.
 pub fn commit_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), OsUpdateError> {
     let Some(actions) = pending.commit.as_ref() else {
         return Ok(());
@@ -542,7 +541,42 @@ pub fn commit_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), Os
     if verbose {
         println!("    Committing slot: {slot}");
     }
-    commit_slot_actions(&SystemEfiHost, actions, slot, pending.layout.as_ref())
+    commit_or_undo(&SystemEfiHost, actions, slot, pending)
+}
+
+/// [`commit_slot_actions`], undone on failure. A rollback only sets the
+/// one-shot BootNext, so a BootOrder promotion made by an earlier action
+/// would bring the uncommitted slot back on the boot after next: put the
+/// previous slot first again before reporting the error.
+fn commit_or_undo(
+    host: &impl EfiBootHost,
+    actions: &[SlotAction],
+    slot: &str,
+    pending: &PendingUpdate,
+) -> Result<(), OsUpdateError> {
+    let Err(e) = commit_slot_actions(host, actions, slot, pending.layout.as_ref()) else {
+        return Ok(());
+    };
+    let promotions: Vec<SlotAction> = actions
+        .iter()
+        .filter(|a| matches!(a, SlotAction::Efibootmgr { .. }))
+        .cloned()
+        .collect();
+    match commit_slot_actions(
+        host,
+        &promotions,
+        &pending.previous_slot,
+        pending.layout.as_ref(),
+    ) {
+        Ok(()) => Err(e),
+        // Reported, not retried: the same write just succeeded for the new
+        // slot, so this is a double fault, and the error tells the operator
+        // BootOrder may still name the uncommitted slot.
+        Err(undo) => Err(OsUpdateError::UpdateFailed(format!(
+            "{e}; restoring BootOrder to slot {} also failed: {undo}",
+            pending.previous_slot
+        ))),
+    }
 }
 
 /// Run commit actions for `slot`. An efibootmgr action commits by moving the
@@ -4879,6 +4913,29 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let host = FakeEfiHost::new(vec![R8000_SLOTS]);
         commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
         assert_eq!(host.writes(), vec![w(&["-o", "0000,0001,0002"])]);
+    }
+
+    #[test]
+    fn a_commit_that_fails_after_promoting_puts_the_previous_slot_back_first() {
+        // The second listing is NVRAM after the promotion: b first.
+        let promoted: &'static str = Box::leak(
+            R8000_SLOTS
+                .replace("BootOrder: 0001,0000,0002", "BootOrder: 0000,0001,0002")
+                .into_boxed_str(),
+        );
+        let host = FakeEfiHost::new(vec![R8000_SLOTS, promoted]);
+        let mut actions = efibootmgr_commit();
+        actions.push(SlotAction::Command {
+            command: vec!["false".to_string()],
+        });
+        let mut pending = pending_with_rollback(None);
+        pending.previous_slot = "a".to_string();
+        pending.new_slot = Some("b".to_string());
+        assert!(commit_or_undo(&host, &actions, "b", &pending).is_err());
+        assert_eq!(
+            host.writes(),
+            vec![w(&["-o", "0000,0001,0002"]), w(&["-o", "0001,0000,0002"])]
+        );
     }
 
     #[test]
