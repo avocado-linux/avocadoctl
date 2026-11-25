@@ -233,6 +233,23 @@ fn apply_os_update_in(
     host: &BlockHost,
     aos_path: &Path,
     base_dir: &Path,
+    verbose: bool,
+    target: Option<&crate::manifest::OsBundleRef>,
+) -> Result<bool, OsUpdateError> {
+    let result = stage_and_apply_os_update(host, aos_path, base_dir, verbose, target);
+    // A failure leaves a partly unpacked bundle behind (hundreds of MB on a
+    // small /var, where ENOSPC is the likeliest failure): drop it now rather
+    // than at the start of the next attempt.
+    if result.is_err() {
+        let _ = fs::remove_dir_all(base_dir.join(OS_UPDATE_STAGING_DIR));
+    }
+    result
+}
+
+fn stage_and_apply_os_update(
+    host: &BlockHost,
+    aos_path: &Path,
+    base_dir: &Path,
     _verbose: bool,
     target: Option<&crate::manifest::OsBundleRef>,
 ) -> Result<bool, OsUpdateError> {
@@ -6175,6 +6192,12 @@ PRETTY_NAME="Avocado Linux 2024.1"
                 base.display()
             );
         }
+        // A refused update leaves no unpacked bundle behind on /var.
+        assert!(
+            !staged_base.join(OS_UPDATE_STAGING_DIR).exists(),
+            "staging left in {}",
+            staged_base.display()
+        );
         assert_eq!(
             fs::read(untouched).unwrap(),
             b"",
