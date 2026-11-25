@@ -476,15 +476,22 @@ pub(crate) fn merge_extensions_internal(
             }
         }
 
+        // Tell the boot path this slot is good, before anything else: the
+        // runtime activation below can fail on its own merits. A commit that
+        // fails fails the update. Every loader reverts an uncommitted slot on
+        // its own (a systemd-boot try counter running out, a u-boot
+        // bootcount, a one-shot BootNext), so activating the new runtime here
+        // would leave the old OS, a few boots later, running the new
+        // runtime's extensions. Roll back now instead, with the runtime kept.
         if verified {
-            output.step("OS Update", "Verification passed, clearing pending marker");
-            // Tell the boot path this slot is good, before anything else: the
-            // runtime activation below can fail on its own merits, and a
-            // loader still counting down retries on an OS that demonstrably
-            // booted is the one failure here that gets worse with time.
             if let Err(e) = crate::os_update::commit_os_update(&pending, false) {
                 output.error("OS Update", &format!("Commit action failed: {e}"));
+                verified = false;
             }
+        }
+
+        if verified {
+            output.step("OS Update", "Verification passed, clearing pending marker");
             // Promote pending runtime to active if one is set
             if let Some(ref runtime_id) = pending.runtime_id {
                 // Refuse before activation, not after: a manifest this build
@@ -519,7 +526,7 @@ pub(crate) fn merge_extensions_internal(
                 }
             }
         } else {
-            output.error("OS Update", "Pending update verification failed");
+            output.error("OS Update", "Pending update failed, rolling back");
             // Rollback boot slot to previous OS
             match crate::os_update::rollback_os_update(&pending, false) {
                 Ok(moved) => rolled_back = moved,

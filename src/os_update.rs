@@ -525,12 +525,11 @@ pub fn verify_os_release_from(
 
 /// Run the update's commit actions after the new OS has booted and verified.
 ///
-/// Best-effort by design: the OS is already up and confirmed at this point, so
-/// a failing commit action must not be turned into a failed boot. It is
-/// reported and the marker is cleared regardless -- the cost of a missed
-/// commit is a loader that retries an entry that actually works, which the
-/// next successful update clears anyway. The cost of treating it as fatal
-/// would be a rollback away from a good OS.
+/// An error fails the update: the caller rolls back and keeps the current
+/// runtime. A missed commit is not cosmetic: every loader reverts an
+/// uncommitted slot by itself within a few boots, so the only choice is
+/// whether that happens now, with the runtime kept consistent, or later,
+/// behind avocadoctl's back.
 pub fn commit_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), OsUpdateError> {
     let Some(actions) = pending.commit.as_ref() else {
         return Ok(());
