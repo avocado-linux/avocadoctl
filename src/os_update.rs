@@ -541,7 +541,34 @@ pub fn commit_os_update(pending: &PendingUpdate, verbose: bool) -> Result<(), Os
     if verbose {
         println!("    Committing slot: {slot}");
     }
-    commit_slot_actions(&SystemEfiHost, actions, slot, pending.layout.as_ref())
+    commit_or_undo(&SystemEfiHost, actions, slot, pending)
+}
+
+/// [`commit_slot_actions`], undone on failure. A rollback only sets the
+/// one-shot BootNext, so a BootOrder promotion made by an earlier action
+/// would bring the uncommitted slot back on the boot after next: put the
+/// previous slot first again before reporting the error.
+fn commit_or_undo(
+    host: &impl EfiBootHost,
+    actions: &[SlotAction],
+    slot: &str,
+    pending: &PendingUpdate,
+) -> Result<(), OsUpdateError> {
+    let result = commit_slot_actions(host, actions, slot, pending.layout.as_ref());
+    if result.is_err() {
+        let promotions: Vec<SlotAction> = actions
+            .iter()
+            .filter(|a| matches!(a, SlotAction::Efibootmgr { .. }))
+            .cloned()
+            .collect();
+        let _ = commit_slot_actions(
+            host,
+            &promotions,
+            &pending.previous_slot,
+            pending.layout.as_ref(),
+        );
+    }
+    result
 }
 
 /// Run commit actions for `slot`. An efibootmgr action commits by moving the
@@ -4878,6 +4905,29 @@ PRETTY_NAME="Avocado Linux 2024.1"
         let host = FakeEfiHost::new(vec![R8000_SLOTS]);
         commit_slot_actions(&host, &efibootmgr_commit(), "b", None).unwrap();
         assert_eq!(host.writes(), vec![w(&["-o", "0000,0001,0002"])]);
+    }
+
+    #[test]
+    fn a_commit_that_fails_after_promoting_puts_the_previous_slot_back_first() {
+        // The second listing is NVRAM after the promotion: b first.
+        let promoted: &'static str = Box::leak(
+            R8000_SLOTS
+                .replace("BootOrder: 0001,0000,0002", "BootOrder: 0000,0001,0002")
+                .into_boxed_str(),
+        );
+        let host = FakeEfiHost::new(vec![R8000_SLOTS, promoted]);
+        let mut actions = efibootmgr_commit();
+        actions.push(SlotAction::Command {
+            command: vec!["false".to_string()],
+        });
+        let mut pending = pending_with_rollback(None);
+        pending.previous_slot = "a".to_string();
+        pending.new_slot = Some("b".to_string());
+        assert!(commit_or_undo(&host, &actions, "b", &pending).is_err());
+        assert_eq!(
+            host.writes(),
+            vec![w(&["-o", "0000,0001,0002"]), w(&["-o", "0001,0000,0002"])]
+        );
     }
 
     #[test]
